@@ -28,8 +28,8 @@ pub use broadcast::Broadcaster;
 pub use build::SpendBuilder;
 pub use events::EventSink;
 pub use signer::RemoteSigner;
-pub use state::WalletStore;
-pub use sync::SyncConfig;
+pub use state::{CoinChange, InMemoryWalletStore, WalletStore};
+pub use sync::{order_dial_candidates, ChainFallback, PeerCoinSource, SyncConfig, SyncEngine};
 
 use crate::types::Network;
 
