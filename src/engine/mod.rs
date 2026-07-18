@@ -20,13 +20,17 @@
 pub mod broadcast;
 pub mod build;
 pub mod events;
+pub mod selection;
 pub mod signer;
 pub mod state;
 pub mod sync;
 
-pub use broadcast::Broadcaster;
-pub use build::SpendBuilder;
+pub use broadcast::{Broadcaster, MempoolBroadcaster, MempoolClient, MempoolStatus};
+pub use build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
 pub use events::EventSink;
+pub use selection::{
+    select_for_consolidation, select_for_spend, SelectionOutcome, DEFAULT_COIN_CAP,
+};
 pub use signer::RemoteSigner;
 pub use state::{CoinChange, InMemoryWalletStore, WalletStore};
 pub use sync::{order_dial_candidates, ChainFallback, PeerCoinSource, SyncConfig, SyncEngine};

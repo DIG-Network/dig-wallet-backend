@@ -166,9 +166,26 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
 - **`engine::build::SpendBuilder`** — `build_send_xch`, `build_send_cat`, … each returning an
   `UnsignedSpend`. Spends MUST be built with chia-wallet-sdk driver constructors (never hand-rolled
   CLVM), MUST be deterministic given the same inputs + coin set, and MUST be validated fail-closed
-  before they can broadcast. The builder MUST NOT sign.
+  before they can broadcast. The builder MUST NOT sign. `SdkSpendBuilder` is the concrete
+  implementation: it selects coins (§ selection), constructs the unsigned `CoinSpend`s via
+  `StandardLayer`/`Cat`/`Conditions`/`SpendContext`, extracts the key-free `required_signatures`
+  via chia-wallet-sdk's `RequiredSignature::from_coin_spends`, and validates fail-closed (value
+  conservation, and a spend that requires no signatures or produces no coin spends is rejected).
+  The PUBLIC spend inputs (full input coins with parent, the synthetic PUBLIC key per puzzle
+  hash, the change puzzle hash) are supplied by the injected `SpendInputs` provider — NEVER a
+  secret key (SPEC §1.4).
+- **`engine::selection`** — capped, high-value-first coin selection: `select_for_spend(coins,
+  target, cap) -> SelectionOutcome` (`Selected { coins, total, change }` /
+  `NeedsConsolidation { .. }` / `InsufficientFunds { .. }`), `select_for_consolidation(coins,
+  cap)`, and `DEFAULT_COIN_CAP`. Deterministic (descending amount, tie-broken by coin id) and
+  pure. `NeedsConsolidation` (enough value, too fragmented to reach the target within `cap`) is
+  never conflated with `InsufficientFunds` (genuine shortfall). Mirrors the ecosystem selection
+  contract (`digstore-chain::selection`).
 - **`engine::broadcast::Broadcaster::submit(SignedBundle)`** — relays an ALREADY-signed bundle. MUST
-  NOT sign.
+  NOT sign. `MempoolBroadcaster` is the concrete implementation over an injected `MempoolClient`
+  (the peer `send_transaction` / mempool): a `MempoolStatus::Accepted`/`AlreadyInMempool` is
+  success, a `Rejected { reason }` is a fail-closed `spend_validation_failed`, and a transport
+  failure propagates as `transport`.
 - **`engine::events::EventSink`** (THE EMITTER) — `publish(WalletEvent) -> Cursor` (stamps a
   monotonic cursor, best-effort fan-out), `subscribe()`, `subscriber_count()`. §5.
 - **`engine::signer::RemoteSigner::sign(UnsignedSpend) -> SignedBundle`** — the callback the engine
@@ -318,8 +335,14 @@ All of the following live behind the `client` seam and NEVER in the engine:
 - **Key isolation (security):** the engine + shared-`types` source names no secret identifier
   (primary gate); the engine seam builds standalone without the client/signing feature (corroborating
   gate). §1.4.
-- **Determinism:** a spend build is deterministic given identical inputs + coin set (specified with
-  the build lane; validated fail-closed before broadcast).
+- **Determinism:** a spend build is deterministic given identical inputs + coin set (a build test
+  asserts identical inputs yield an identical `UnsignedSpend`; validated fail-closed — value
+  conservation + a non-empty required-signature set — before broadcast).
+- **Coin selection:** high-value-first, tie-broken by coin id; `NeedsConsolidation` is
+  distinguished from `InsufficientFunds`; boundary + one-over-cap vectors are tested.
+- **Unsigned-only:** an `UnsignedSpend` carries `required_signatures` (public key + message
+  descriptors), never a produced signature — the engine build never signs (key-isolation test +
+  build-seam tests).
 - **HD derivation:** master-seed → profile key golden vectors (specified with the custody lane).
 
 Future lanes (state/sync, build/broadcast, custody, consumer migration) extend §3–§8 with concrete

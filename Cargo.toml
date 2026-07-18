@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet-backend"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.81"
 description = "Canonical event-driven Chia wallet backend for the DIG Network. Exports two carefully-partitioned seams: an `engine` seam (imported by dig-node — the single running wallet instance: state, sync, unsigned-spend construction, event emission; identity-parameterized, never holds a private key) and a `client` seam (used by dig-app — the event subscriber, spend review/decode, the signing interface + identity provider that hold the key). Clean-room, chia-wallet-sdk-based. Replaces dig-l1-wallet."
@@ -18,7 +18,13 @@ default = ["engine", "client"]
 # The engine seam: the running instance imported by dig-node-service. Pulls the
 # async runtime for the event emitter + sync loop. NEVER pulls a secret-key crate
 # (the key-isolation invariant — see SPEC §1, tests/key_isolation.rs).
-engine = ["dep:tokio", "dep:tokio-stream", "dep:futures-core"]
+engine = [
+    "dep:tokio",
+    "dep:tokio-stream",
+    "dep:futures-core",
+    "dep:chia-wallet-sdk",
+    "dep:clvmr",
+]
 # The client seam: used by dig-app. The ONLY place secret material (SecretKey, mnemonic)
 # is compiled in — the LocalSigner + master-HD key derivation that hold the key live here,
 # behind this feature. `zeroize` wipes in-memory key material on drop (custody, SPEC §1.4/§8).
@@ -50,6 +56,13 @@ tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 futures-core = { version = "0.3", optional = true }
 # Wipes master-seed + derived-key bytes on drop (client seam only — the key-custody boundary).
 zeroize = { version = "1", optional = true }
+# The CANONICAL Chia spend-driver constructors (StandardLayer, Cat, SpendContext, Conditions)
+# + the key-free RequiredSignature extractor. The engine builds every unsigned spend through
+# these (§4.1: never hand-rolled CLVM) and NEVER touches the sdk's `SecretKey` path. Default
+# features off so no peer-networking/TLS stack is pulled into the engine build.
+chia-wallet-sdk = { version = "0.30", default-features = false, optional = true }
+# The CLVM allocator RequiredSignature::from_coin_spends threads its parse through.
+clvmr = { version = "0.14", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
