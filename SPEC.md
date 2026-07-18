@@ -154,6 +154,12 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
 - **`EngineConfig { network, db_path, sync: SyncConfig }`**.
 - **`engine::state::WalletStore`** (read surface, all scoped to an `IdentityRef`): `balance`, `coins`,
   `cats`, `nfts`, `dids`, `history`, `sync_status`. MUST NOT accept or return secret material.
+  `InMemoryWalletStore` is the concrete backing (coins/CATs/NFTs/DIDs/history indexed per
+  `WalletId`, balance derived from unspent coins, reorg rollback to a fork height). Its mutation
+  surface (`apply_coin_state` → `CoinChange`, `rollback_to`, `set_peak`, `set_sync_status`,
+  `upsert_*`, `record_transaction`) is engine-internal — the sync loop drives it; the client seam
+  sees only the read trait over IPC. A persistent (SQLite) backing is a later drop-in over the same
+  surface.
 - **`engine::sync::SyncConfig { ipv6_first, coin_cap, fallback_endpoints }`** — the peer sync loop.
   Peer dialing MUST be IPv6-first with IPv4 fallback (§5.2 ecosystem rule). Fallback point-read
   endpoints are used only while syncing / for out-of-DB reads.
@@ -260,6 +266,13 @@ contract. #979 Subscription adopts this exact pattern.
   first.
 - A fallback point-read source (chia-query / coinset) is used only while syncing or for reads not yet
   in the local store; it is engine-internal and never exposed on the client seam.
+- Implemented by `engine::sync::SyncEngine` over injected transports: `PeerCoinSource` (the primary
+  peer stream) and `ChainFallback` (the point-read source). `ingest` applies coin-state deltas and
+  emits a `WalletEvent` per change (`FundsReceived` on a new inbound coin, `CoinStateChanged`
+  otherwise); `handle_reorg` rolls the store back and emits the reverted state; `resolve_coin` reads
+  local-first and falls to the point-read source for out-of-DB reads; `sync_with_fallback` prefers
+  the peer and routes to the fallback only on a `transport` failure. `order_dial_candidates` orders a
+  peer's candidate addresses IPv6-first (§5.2).
 
 ---
 
