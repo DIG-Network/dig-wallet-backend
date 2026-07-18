@@ -1,0 +1,57 @@
+[package]
+name = "dig-wallet-backend"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "Canonical event-driven Chia wallet backend for the DIG Network. Exports two carefully-partitioned seams: an `engine` seam (imported by dig-node — the single running wallet instance: state, sync, unsigned-spend construction, event emission; identity-parameterized, never holds a private key) and a `client` seam (used by dig-app — the event subscriber, spend review/decode, the signing interface + identity provider that hold the key). Clean-room, chia-wallet-sdk-based. Replaces dig-l1-wallet."
+license = "GPL-2.0-only"
+repository = "https://github.com/DIG-Network/dig-wallet-backend"
+readme = "README.md"
+keywords = ["chia", "wallet", "dig", "blockchain", "event-driven"]
+categories = ["cryptography::cryptocurrencies"]
+
+[features]
+# `types` is always compiled (both seams import it); it is not a toggle.
+# `engine` and `client` gate the heavier, seam-specific code + deps so each consumer
+# compiles only the half it needs. Default = both, for docs/tests/`--all-features` CI.
+default = ["engine", "client"]
+# The engine seam: the running instance imported by dig-node-service. Pulls the
+# async runtime for the event emitter + sync loop. NEVER pulls a secret-key crate
+# (the key-isolation invariant — see SPEC §1, tests/key_isolation.rs).
+engine = ["dep:tokio", "dep:tokio-stream", "dep:futures-core"]
+# The client seam: used by dig-app. The ONLY place secret material (SecretKey, mnemonic)
+# is compiled in — the LocalSigner that holds the key lives here, behind this feature.
+client = ["dep:tokio", "dep:tokio-stream", "dep:futures-core"]
+
+[dependencies]
+# Chia protocol + BLS crypto types the wire contract is expressed in (Coin, CoinSpend,
+# SpendBundle, Bytes32, PublicKey, Signature). The single source of these types across
+# the ecosystem — never re-newtyped here (§4.1). SecretKey from this crate is used ONLY
+# behind the `client` feature (the LocalSigner), never in the engine seam.
+chia = "0.26"
+# serde is the wire contract for every shared type crossing the seam IPC boundary.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Structured, catalogued errors (SPEC §2 error-code table).
+thiserror = "2"
+# Hex encoding for the machine-facing string forms of ids/addresses.
+hex = "0.4"
+# EnumSet powers the event-subscription FILTER (subscribe to a subset of WalletEvent kinds).
+enumset = { version = "1", features = ["serde"] }
+# async traits for the signing + broadcast callbacks (RemoteSigner::sign is async).
+async-trait = "0.1"
+
+# --- seam-gated (async runtime for the event emitter + subscriber + sync loop) ---
+# `sync` = the broadcast channel the EventSink fans events out over. `rt`/`macros`/`time`
+# are test-only conveniences pulled in via dev-deps below; the library needs only `sync`.
+tokio = { version = "1", features = ["sync"], optional = true }
+tokio-stream = { version = "0.1", features = ["sync"], optional = true }
+futures-core = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+
+[package.metadata.docs.rs]
+all-features = true

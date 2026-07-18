@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least-privilege default token: CI only reads the checkout (§2.4a; pre-empts the GHAS
+# default-token-permissions finding).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # nextest runs each test as its own process and natively detects+reports
+      # flaky tests (failed-then-passed-on-retry) instead of silently hiding
+      # them. `--test-threads=1` mirrors the prior serial run (some integration
+      # tests assume serial execution).
+      - name: Run tests (nextest, flaky-aware)
+        run: cargo nextest run --all-features --retries 2 --test-threads=1
+
+      - name: Check documentation
+        run: cargo doc --no-deps --all-features
+
+  seam-isolation:
+    name: Engine seam builds standalone (no client/signing code)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # Supports the key-isolation invariant (SPEC §1.4) by proving the engine seam builds
+      # WITHOUT the client/signing feature — so no client-side signing/custody CODE is compiled into an
+      # engine-only build. This is a COMPLEMENTARY signal, not an independent compile-proof: the
+      # `chia` crate that defines `SecretKey` is a non-optional dependency and is always linked, so
+      # feature-gating cannot prove "no secret type is reachable". The REAL API-isolation enforcer
+      # is tests/key_isolation.rs, which asserts the engine + shared-types SOURCE names no secret
+      # identifier.
+      - name: Build engine seam standalone (no client/signing feature)
+        run: cargo build --no-default-features --features engine
+
+      - name: Build client seam standalone
+        run: cargo build --no-default-features --features client
+
+  coverage:
+    name: Coverage (>=80% lines, gated)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Measure line coverage and FAIL the build if it drops below 80%.
+      # `cargo llvm-cov nextest` runs the flaky-aware nextest runner under
+      # coverage instrumentation so coverage is still collected (running
+      # `cargo nextest run` and `cargo llvm-cov` as separate steps collects
+      # zero coverage and always fails the gate). `--test-threads 1` mirrors
+      # the serial run used by the test suite (some integration tests assume
+      # serial execution) — passed as a native nextest flag, NOT after `--`
+      # (nextest rejects `--test-threads=1` forwarded to the test binary). A
+      # summary report is printed; the gate is enforced by
+      # `--fail-under-lines 80`.
+      - name: Run coverage with 80% line gate
+        run: cargo llvm-cov nextest --all-features --workspace --fail-under-lines 80 --retries 2 --test-threads 1
