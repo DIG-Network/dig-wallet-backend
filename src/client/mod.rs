@@ -1,25 +1,31 @@
 //! The `client` seam — used by dig-app (SPEC §4).
 //!
-//! The dig-app-side of the wallet: a [`WalletClient`] handle that proxies reads + spend-intent
-//! to the engine over the control IPC, the event [`subscribe`]r, spend [`review`]/decode, the
-//! [`signer`] (which HOLDS the key), the [`identity`] provider, and the local [`addressbook`].
+//! The dig-app-side of the wallet: a [`WalletClient`] handle (concrete impl [`transport::
+//! IpcWalletClient`]) that proxies reads + spend-intent to the engine over the control IPC, the
+//! event [`subscribe`]r, spend [`review`]/decode, the [`signer`] (which HOLDS the key), the master-
+//! HD key derivation ([`hd`]), the [`identity`] provider, and the local [`addressbook`].
 //!
 //! # Key isolation
-//! The private key lives ONLY here (behind [`signer::LocalSigner`]). The client seam sends the engine
-//! public [`crate::types::IdentityRef`]s and receives [`crate::types::UnsignedSpend`]s to sign; it
-//! returns [`crate::types::SignedBundle`]s. No secret crosses to the engine (SPEC §1d).
+//! The private key lives ONLY here (behind [`signer::LocalSigner`] + [`hd::MasterKey`]). The client
+//! seam sends the engine public [`crate::types::IdentityRef`]s and receives
+//! [`crate::types::UnsignedSpend`]s to sign; it returns [`crate::types::SignedBundle`]s. No secret
+//! crosses to the engine (SPEC §1.4).
 
 pub mod addressbook;
+pub mod hd;
 pub mod identity;
 pub mod review;
 pub mod signer;
 pub mod subscribe;
+pub mod transport;
 
 pub use addressbook::AddressBook;
-pub use identity::IdentityProvider;
+pub use hd::{MasterKey, MasterKeySource};
+pub use identity::{HdIdentity, IdentityProvider};
 pub use review::{decode, HumanReadableSummary};
 pub use signer::{IdentitySigner, LocalSigner};
 pub use subscribe::{filter_events, CatchUp};
+pub use transport::{ControlTransport, IpcWalletClient};
 
 use async_trait::async_trait;
 

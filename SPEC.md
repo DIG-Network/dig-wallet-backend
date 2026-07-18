@@ -250,6 +250,10 @@ contract. #979 Subscription adopts this exact pattern.
   seam is the server; the client seam is the client.
 - Over IPC: read/build/broadcast are request/response; the event stream is bridged as server-push
   (SSE/WS on the dual transport). In-process (DIG-Browser cdylib) the raw broadcast receiver is used.
+- The client side is `client::transport::IpcWalletClient<T: ControlTransport>`: it marshals each
+  read / spend-intent as a named JSON request over an injected `ControlTransport`. The stable,
+  append-only method names are `wallet.balance`, `wallet.coins`, `wallet.cats`, `wallet.history`,
+  `wallet.sync_status`, `wallet.request_send_xch`, `wallet.request_send_cat`.
 - **Key-isolation invariant on the wire:** the only messages crossing INTO the engine carry
   `IdentityRef` (public) or `SignedBundle` (post-sign). No IPC message carries a secret key, mnemonic,
   or seed. §1.4.
@@ -285,8 +289,23 @@ All of the following live behind the `client` seam and NEVER in the engine:
 - **At-rest encryption:** the seed/keystore is encrypted at rest (app-data location per the ecosystem
   data-location rule). Concrete scheme specified when the custody lane lands.
 - **BIP-39** mnemonic import/export.
+- **Master-key derivation (#997):** the master seed derives per-profile keys via the hardened path
+  `m/44'/8444'/{profile_ix}'` (BIP-32/44 hardened, Chia coin type 8444); a profile's receive/signing
+  keys are unhardened children of that account node. This lives in `client::hd::MasterKey`
+  (`Zeroizing` seed, wiped on drop; no `Debug`/`Serialize`/`Clone` exposing the secret).
+- **Master-key source seam:** the unlocked `MasterKey` is produced by a `MasterKeySource`
+  implementation. At-rest encryption is NOT re-implemented here — `dig-keystore`
+  (`Keystore<L1WalletBls>`, DIGLW1 / AES-256-GCM / Argon2id) is the canonical keystore and provides
+  the `MasterKeySource`. Implementations MUST fail-closed on a locked/absent/corrupt store.
 - **Signing:** `LocalSigner` matches each `RequiredSignature.public_key` to a derived key, signs the
-  `message`, and aggregates into the `SignedBundle`.
+  `message` with augmented BLS, and aggregates into the `SignedBundle`.
+- **Custody controls (fail-closed).** The signer MUST refuse to produce a signature unless (a) the
+  message is bound to the network — it ends with the network's AGG_SIG_ME additional data (genesis
+  challenge), which rejects unbound `AGG_SIG_UNSAFE` messages that could be replayed against another
+  coin — and (b) it can reproduce the required public key from its own derivation. Application-level
+  identity signatures (e.g. auth challenges, `client::identity::HdIdentity`) MUST be domain-separated
+  with a `DIGNET-<domain>-v1` framing and NEVER computed over raw caller-supplied bytes, so an
+  identity signature can never collide with a spend signature.
 
 ---
 
