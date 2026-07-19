@@ -54,6 +54,14 @@ impl EventSink {
     }
 }
 
+/// [`EventSink`] IS the engine's `dig-events-protocol` emitter — the trait the protocol crate
+/// fixes so a second engine implementation stays interchangeable (#1072).
+impl dig_events_protocol::EventEmitter for EventSink {
+    fn publish(&self, event: WalletEvent) -> Cursor {
+        EventSink::publish(self, event)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

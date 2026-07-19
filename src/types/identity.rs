@@ -5,21 +5,13 @@
 //! public material (a master-key fingerprint, an optional DID, a profile index). No
 //! secret key, mnemonic, or seed appears here — those live behind the client seam's signer
 //! (SPEC §1d, the key-isolation invariant).
+//!
+//! [`WalletId`] itself is the canonical `dig-events-protocol` newtype (re-exported via
+//! `crate::types`, see `mod.rs`) — the same identifier the engine stamps on emitted events.
 
 use serde::{Deserialize, Serialize};
 
-/// A wallet identifier: the BLS master public-key fingerprint (u32).
-///
-/// Stable across derivations of the same seed; used to scope state, events, and history
-/// to one identity. This is public material — it identifies, it does not authorize.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct WalletId(pub u32);
-
-impl std::fmt::Display for WalletId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+use super::WalletId;
 
 /// A Chia Decentralized Identifier (the DID singleton's launcher id), in `did:chia:` bech32m
 /// text form. Stored as text so the client seam can display it without decoding.

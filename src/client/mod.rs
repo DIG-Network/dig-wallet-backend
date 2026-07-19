@@ -24,8 +24,12 @@ pub use hd::{MasterKey, MasterKeySource};
 pub use identity::{HdIdentity, IdentityProvider};
 pub use review::{decode, HumanReadableSummary};
 pub use signer::{IdentitySigner, LocalSigner};
-pub use subscribe::{filter_events, CatchUp};
 pub use transport::{ControlTransport, IpcWalletClient};
+
+// The subscription shape contract itself — `CatchUp` + `filter_events` — is the canonical
+// `dig-events-protocol` trait/fn (re-exported via `crate::types`); re-export here too so
+// `client::{CatchUp, filter_events}` keeps working for existing callers of this seam.
+pub use crate::types::{filter_events, CatchUp};
 
 use async_trait::async_trait;
 

@@ -99,12 +99,13 @@ this layer.**
 
 ### 2.2 Values + records
 
-- `Amount(u64)` — a quantity in the smallest unit (mojos / CAT base units). **JS-safe serialization
-  (normative):** serialize as a JSON number when `≤ MAX_JS_SAFE_INTEGER` (2^53 − 1 = 9007199254740991),
-  otherwise as a decimal string. Deserialization MUST accept both forms. This prevents silent
-  precision loss in a JavaScript/TypeScript consumer.
-- `Address(String)`, `Puzzlehash(String)` (lowercase hex, no `0x`), `AssetId(String)` (CAT tail hash;
-  absence = native XCH).
+- `Amount(u64)` / `AssetId(String)` — the canonical `dig-events-protocol` newtypes (re-exported, not
+  redefined here — #1067/#1072). **Wire form (normative):** `Amount` serializes ALWAYS as a decimal
+  string, so a JavaScript/TypeScript consumer maps it to a single `bigint` via `BigInt(str)` — one
+  code path, never a silent precision loss past `Number.MAX_SAFE_INTEGER`. Deserialization is lenient:
+  it also accepts a bare JSON number, for legacy/hand-written JSON. `AssetId` is the CAT tail hash
+  hex string; absence = native XCH.
+- `Address(String)`, `Puzzlehash(String)` (lowercase hex, no `0x`).
 - `Network` ∈ { `mainnet`, `testnet`, `simulator` }.
 - `CoinRecord`, `CatRecord`, `NftRecord`, `DidRecord`, `Balance { confirmed, spendable }`.
 - `TransactionSummary { outputs: Vec<SpendOutput>, fee: Amount }`,
@@ -232,6 +233,14 @@ reads via `WalletClient` over IPC).
 
 The engine EMITS; dig-app SUBSCRIBES to a FILTERED view. Event-driven, poll ONLY on a gap.
 
+The wire types (`WalletEvent`, `EventKind`, `Cursor`, `EmittedEvent`, `SyncLifecycle`, `SyncStatus`)
+and the `WalletId`/`Amount`/`AssetId` payload newtypes are defined ONCE, in the `dig-events-protocol`
+crate, and re-exported here (`crate::types`) — the ONE ecosystem definition so a second implementation
+can never drift from this one (#1067/#1072). `EventSink` implements that crate's `EventEmitter` trait;
+a subscriber's backfill implements its `CatchUp` trait. This crate owns only the machinery that
+produces, persists, and streams events — the bus (`engine::events::EventSink`), the persisted-delta
+catch-up store (a later lane), and the live subscription wrapper (`client::subscribe::Subscription`).
+
 ### 5.1 Taxonomy
 
 `WalletEvent` is serde-tagged by `type` in snake_case (`{"type":"funds_received",…}`) so a machine
@@ -328,9 +337,11 @@ All of the following live behind the `client` seam and NEVER in the engine:
 
 ## 9. Conformance + golden vectors; security properties
 
-- **Amount JS-safe boundary:** round-trip vectors at `0`, `1`, `MAX_JS_SAFE_INTEGER`,
-  `MAX_JS_SAFE_INTEGER + 1`, `u64::MAX` (number below the threshold, string above).
-- **Event serialization:** every `WalletEvent` variant round-trips through its snake_case tagged form.
+- **Amount always-string wire form:** round-trip vectors at `0`, `1`, `MAX_JS_SAFE_INTEGER`,
+  `MAX_JS_SAFE_INTEGER + 1`, `u64::MAX` — every value serializes as a decimal string; a bare JSON
+  number still deserializes (lenient). Owned + KAT-tested in `dig-events-protocol`.
+- **Event serialization:** every `WalletEvent` variant round-trips through its snake_case tagged form
+  (KAT-tested in `dig-events-protocol`, the canonical source of the event taxonomy).
 - **Filter semantics:** `filter_events` and the live subscription apply identical inclusion rules.
 - **Key isolation (security):** the engine + shared-`types` source names no secret identifier
   (primary gate); the engine seam builds standalone without the client/signing feature (corroborating
