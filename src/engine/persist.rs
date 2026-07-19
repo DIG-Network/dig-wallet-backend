@@ -513,7 +513,9 @@ impl WalletStore for SqliteWalletStore {
                 .map_err(storage_err)?
                 .iter()
                 .map(|a| a.parse::<u64>().map_err(storage_err))
-                .sum::<WalletResult<u64>>()?;
+                // Saturate the fold: a corrupted/adversarial store could hold amounts whose sum
+                // exceeds u64, which must never debug-panic or release-wrap the reported balance.
+                .try_fold(0u64, |acc, amount| Ok(acc.saturating_add(amount?)))?;
             Ok(Balance {
                 confirmed: Amount(total),
                 spendable: Amount(total),
