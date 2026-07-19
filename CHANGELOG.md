@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.6.1] - 2026-07-19
+
+### Refactor
+- **signer:** Source AGG_SIG_ME from dig-constants (signer==engine) (#8)
+
 ## [0.6.0] - 2026-07-19
 
 ### Features
