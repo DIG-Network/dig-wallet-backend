@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet-backend"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.81"
 description = "Canonical event-driven Chia wallet backend for the DIG Network. Exports two carefully-partitioned seams: an `engine` seam (imported by dig-node — the single running wallet instance: state, sync, unsigned-spend construction, event emission; identity-parameterized, never holds a private key) and a `client` seam (used by dig-app — the event subscriber, spend review/decode, the signing interface + identity provider that hold the key). Clean-room, chia-wallet-sdk-based. Replaces dig-l1-wallet."
@@ -52,6 +52,12 @@ async-trait = "0.1"
 # emitted wire shape and dig-app's subscriber never drift apart (#1067, #1072). Re-exported from
 # `crate::types`; the bus/store/subscription machinery that PRODUCES these stays here.
 dig-events-protocol = "0.1.2"
+# The canonical home for the Chia-L1 AGG_SIG_ME additional data (genesis challenge) both the
+# client signer and the engine build bind every mainnet/testnet11 spend signature to. Sourcing
+# BOTH seams from this ONE constant makes signer == engine by construction — no drift, no
+# custody-break from a hand-copied hex diverging. `CHIA_L1_*` (Chia L1) is deliberately distinct
+# from `DIG_MAINNET`/`DIG_TESTNET` (the DIG L2 genesis), which MUST NOT be used for L1 signing.
+dig-constants = "0.5.1"
 
 # --- seam-gated (async runtime for the event emitter + subscriber + sync loop) ---
 # `sync` = the broadcast channel the EventSink fans events out over. `rt`/`macros`/`time`

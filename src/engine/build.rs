@@ -25,7 +25,7 @@ use chia::protocol::{Bytes32, Coin, CoinSpend};
 use chia::puzzles::Memos;
 use chia_wallet_sdk::driver::{Cat, CatSpend, SpendContext, SpendWithConditions, StandardLayer};
 use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature as SdkRequiredSignature};
-use chia_wallet_sdk::types::{Conditions, MAINNET_CONSTANTS, TESTNET11_CONSTANTS};
+use chia_wallet_sdk::types::Conditions;
 use chia_wallet_sdk::utils::Address as Bech32Address;
 use clvmr::Allocator;
 
@@ -92,10 +92,16 @@ impl SdkSpendBuilder {
     /// The aggregate-signature domain for the builder's network (the AGG_SIG_ME additional data
     /// each required signature is bound to).
     fn agg_sig_constants(&self) -> AggSigConstants {
+        // Sourced from `dig-constants` — the SAME constant the client signer binds to
+        // (`crate::client::signer`), so the message the engine builds and the message the signer
+        // will accept are byte-identical by construction (no hand-copied hex to drift). The
+        // `CHIA_L1_*` values are the Chia L1 genesis, NOT the DIG L2 genesis.
         let agg_sig_me = match self.network {
-            Network::Mainnet => MAINNET_CONSTANTS.agg_sig_me_additional_data,
+            Network::Mainnet => Bytes32::new(dig_constants::CHIA_L1_MAINNET_AGG_SIG_ME),
             // Testnet11 + the simulator share the testnet aggregate-signature domain.
-            Network::Testnet | Network::Simulator => TESTNET11_CONSTANTS.agg_sig_me_additional_data,
+            Network::Testnet | Network::Simulator => {
+                Bytes32::new(dig_constants::CHIA_L1_TESTNET11_AGG_SIG_ME)
+            }
         };
         AggSigConstants::new(agg_sig_me)
     }
@@ -535,6 +541,16 @@ mod tests {
         cats: Vec<Cat>,
     }
 
+    impl TestInputs {
+        /// An input provider with no coins — for tests that only exercise the network domain.
+        fn empty() -> Self {
+            TestInputs {
+                xch: vec![],
+                cats: vec![],
+            }
+        }
+    }
+
     impl SpendInputs for TestInputs {
         fn spendable_xch(&self, _: &IdentityRef) -> WalletResult<Vec<Coin>> {
             Ok(self.xch.clone())
@@ -780,5 +796,46 @@ mod tests {
     fn conservation_rejects_a_mismatch() {
         assert!(assert_conserved(100, 90, 5).is_err());
         assert!(assert_conserved(100, 90, 10).is_ok());
+    }
+
+    /// signer == engine byte-KAT (engine half). The whole point of #1101: the AGG_SIG_ME suffix the
+    /// engine binds into REAL mainnet unsigned-spend messages MUST be byte-identical to what the
+    /// client signer requires — else every mainnet spend the engine builds would be rejected by the
+    /// signer (custody deadlock). This half proves the engine binds exactly
+    /// `dig_constants::CHIA_L1_MAINNET_AGG_SIG_ME` into a real message; the signer half
+    /// (`signer_requires_the_dig_constants_agg_sig_me`, src/client/signer.rs) proves the signer
+    /// requires that SAME constant. Both anchored to one source ⇒ signer == engine. Key-free, so it
+    /// respects the SPEC §1.4 engine key-isolation invariant (tests/key_isolation.rs).
+    #[tokio::test]
+    async fn engine_binds_the_dig_constants_mainnet_agg_sig_me() {
+        let unsigned = builder(vec![wallet_coin(1000, 1)])
+            .build_send_xch(xch_request(600, 10))
+            .await
+            .unwrap();
+        assert!(!unsigned.required_signatures.is_empty());
+        for req in &unsigned.required_signatures {
+            assert!(
+                req.message
+                    .ends_with(&dig_constants::CHIA_L1_MAINNET_AGG_SIG_ME),
+                "engine-built message not bound to the dig-constants Chia-L1 mainnet AGG_SIG_ME",
+            );
+        }
+    }
+
+    /// The engine's aggregate-signature domain for each network is byte-identical to the
+    /// `dig-constants` Chia-L1 value the client signer requires (mainnet + testnet11) — the same
+    /// SSOT both seams read, so no drift can desync signer and engine.
+    #[test]
+    fn engine_agg_sig_me_matches_dig_constants_per_network() {
+        let mainnet = SdkSpendBuilder::new(Arc::new(TestInputs::empty()), Network::Mainnet, 500);
+        let testnet = SdkSpendBuilder::new(Arc::new(TestInputs::empty()), Network::Testnet, 500);
+        assert_eq!(
+            mainnet.agg_sig_constants().me(),
+            Bytes32::new(dig_constants::CHIA_L1_MAINNET_AGG_SIG_ME),
+        );
+        assert_eq!(
+            testnet.agg_sig_constants().me(),
+            Bytes32::new(dig_constants::CHIA_L1_TESTNET11_AGG_SIG_ME),
+        );
     }
 }
