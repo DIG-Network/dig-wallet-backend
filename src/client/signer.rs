@@ -32,32 +32,15 @@ use crate::types::{
 use super::hd::{MasterKey, DEFAULT_ADDRESS_GAP};
 
 /// The Chia mainnet genesis challenge — the AGG_SIG_ME additional data every mainnet spend
-/// signature is bound to. Canonical, byte-identical across the ecosystem.
-const MAINNET_AGG_SIG_ME_EXTRA_DATA: [u8; 32] =
-    hex_literal(b"ccd5bb71183532bff220ba46c268991a3ff07eb358e8255a65c30a2dce0e5fbb");
+/// signature is bound to. Sourced from `dig-constants` (the ecosystem's single source of truth for
+/// the Chia-L1 domain), so the signer binds byte-identically to what [`crate::engine::build`]
+/// binds — signer == engine by construction (see the `signer_binds_the_same_agg_sig_me_as_engine`
+/// KAT). `CHIA_L1_*` is the Chia L1 genesis, deliberately distinct from the DIG L2 genesis.
+const MAINNET_AGG_SIG_ME_EXTRA_DATA: [u8; 32] = dig_constants::CHIA_L1_MAINNET_AGG_SIG_ME;
 
-/// The Chia testnet11 genesis challenge — the AGG_SIG_ME additional data on testnet11.
-const TESTNET11_AGG_SIG_ME_EXTRA_DATA: [u8; 32] =
-    hex_literal(b"37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615");
-
-/// Decode a 64-char lowercase-hex ASCII literal into 32 bytes at compile time. Panics during const
-/// evaluation on a malformed literal, so a typo fails the build rather than at runtime.
-const fn hex_literal(hex: &[u8; 64]) -> [u8; 32] {
-    const fn nibble(c: u8) -> u8 {
-        match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'f' => c - b'a' + 10,
-            _ => panic!("non-hex character in genesis-challenge literal"),
-        }
-    }
-    let mut out = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        out[i] = (nibble(hex[i * 2]) << 4) | nibble(hex[i * 2 + 1]);
-        i += 1;
-    }
-    out
-}
+/// The Chia testnet11 genesis challenge — the AGG_SIG_ME additional data on testnet11, likewise
+/// sourced from `dig-constants` so signer and engine cannot drift.
+const TESTNET11_AGG_SIG_ME_EXTRA_DATA: [u8; 32] = dig_constants::CHIA_L1_TESTNET11_AGG_SIG_ME;
 
 /// The client-side signing contract: sign an unsigned spend for a specific identity.
 ///
@@ -135,6 +118,14 @@ impl LocalSigner {
     /// The public key of the active profile's account node. Public material — safe to expose.
     pub fn public_key(&self) -> PublicKey {
         self.master.profile_public_key(self.identity.profile_ix)
+    }
+
+    /// The AGG_SIG_ME additional data (network genesis challenge) this signer requires every
+    /// message to be bound to. Public, non-secret material — exposed so the engine seam can prove,
+    /// in a KAT, that it builds messages bound to the exact bytes this signer will accept
+    /// (signer == engine). Never secret key material.
+    pub fn agg_sig_me_extra_data(&self) -> [u8; 32] {
+        self.agg_sig_me_extra_data
     }
 
     /// Find the secret key matching `target` among the active profile's derived address keys,
@@ -463,11 +454,38 @@ mod tests {
         ));
     }
 
+    /// signer == engine byte-KAT (signer half). The signer requires every message to be bound to
+    /// exactly the `dig-constants` Chia-L1 AGG_SIG_ME value, for mainnet and testnet11. The engine
+    /// half (`engine_binds_the_dig_constants_mainnet_agg_sig_me`, src/engine/build.rs) proves the
+    /// engine binds that SAME constant into real messages. One SSOT ⇒ signer == engine, no drift.
     #[test]
-    fn genesis_challenge_literal_decodes() {
+    fn signer_requires_the_dig_constants_agg_sig_me() {
+        let mainnet =
+            LocalSigner::new(IdentityRef::new(WalletId(1)), master("m"), Network::Mainnet).unwrap();
+        let testnet =
+            LocalSigner::new(IdentityRef::new(WalletId(1)), master("t"), Network::Testnet).unwrap();
+        assert_eq!(
+            mainnet.agg_sig_me_extra_data(),
+            dig_constants::CHIA_L1_MAINNET_AGG_SIG_ME,
+        );
+        assert_eq!(
+            testnet.agg_sig_me_extra_data(),
+            dig_constants::CHIA_L1_TESTNET11_AGG_SIG_ME,
+        );
+    }
+
+    /// Genesis-challenge pin: the dig-constants-sourced AGG_SIG_ME values the signer binds to MUST
+    /// equal the known Chia L1 genesis challenges. Guards against dig-constants ever drifting these
+    /// custody-critical bytes (dig-constants also KATs them against chia-sdk-types independently).
+    #[test]
+    fn agg_sig_me_extra_data_pins_the_chia_l1_genesis_challenges() {
         assert_eq!(
             hex::encode(MAINNET_AGG_SIG_ME_EXTRA_DATA),
             "ccd5bb71183532bff220ba46c268991a3ff07eb358e8255a65c30a2dce0e5fbb",
+        );
+        assert_eq!(
+            hex::encode(TESTNET11_AGG_SIG_ME_EXTRA_DATA),
+            "37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615",
         );
     }
 }
