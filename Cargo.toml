@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet-backend"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.81"
 description = "Canonical event-driven Chia wallet backend for the DIG Network. Exports two carefully-partitioned seams: an `engine` seam (imported by dig-node — the single running wallet instance: state, sync, unsigned-spend construction, event emission; identity-parameterized, never holds a private key) and a `client` seam (used by dig-app — the event subscriber, spend review/decode, the signing interface + identity provider that hold the key). Clean-room, chia-wallet-sdk-based. Replaces dig-l1-wallet."
@@ -24,6 +24,7 @@ engine = [
     "dep:futures-core",
     "dep:chia-wallet-sdk",
     "dep:clvmr",
+    "dep:rusqlite",
 ]
 # The client seam: used by dig-app. The ONLY place secret material (SecretKey, mnemonic)
 # is compiled in — the LocalSigner + master-HD key derivation that hold the key live here,
@@ -74,6 +75,10 @@ zeroize = { version = "1", optional = true }
 chia-wallet-sdk = { version = "0.30", default-features = false, optional = true }
 # The CLVM allocator RequiredSignature::from_coin_spends threads its parse through.
 clvmr = { version = "0.14", optional = true }
+# The persistent (SQLite) backing for the engine state store + event delta log (#1118). `bundled`
+# statically links a vendored SQLite so no system library is needed. Engine-seam only; it stores
+# PUBLIC coin/asset/tx/event state — NEVER key material (the key-isolation invariant, SPEC §1.4).
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
