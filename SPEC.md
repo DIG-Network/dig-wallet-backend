@@ -210,6 +210,14 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
 - **`engine::signer::RemoteSigner::sign(UnsignedSpend) -> SignedBundle`** — the callback the engine
   invokes. The engine holds `Arc<dyn RemoteSigner>`, never a key. In dig-node-service the concrete
   impl is the IPC proxy to dig-app.
+- **`engine::signer::RemoteSigner::dh([u8;48]) -> [u8;48]`** — the recipient DECAP callback: the
+  key holder performs the G1-ECDH `dh(identity_sk, peer_g1)` with the held dig-identity key and
+  returns the 48-byte compressed shared G1 point for the dig-message KEM/KDF. A DH operation, NOT a
+  signature — the one identity key does both, on group-separated primitives (sign = BLS G2, DH = G1).
+  The default trait method fail-closes (a signer without an identity key refuses); key holders
+  override it. `peer_g1` MUST be subgroup- and non-identity-checked BEFORE the scalar multiplication
+  (invalid-curve / small-subgroup key-recovery defense); only the shared secret is returned, never
+  the scalar. Neither the argument nor the return carries secret key material.
 
 **NOT in the engine seam:** key custody, mnemonic generation, a `sign()` implementation (only the
 trait it calls), any HD seed.
@@ -232,13 +240,16 @@ Used by dig-app. The subscriber + identity provider + signer.
   and required-signature counts) for the native-confirm UI. The user reviews; they do not trust
   blindly.
 - **`client::signer`** — `IdentitySigner { identity(), sign(UnsignedSpend) -> SignedBundle }` and
-  `LocalSigner` (holds a `chia::bls::SecretKey`, exposes only `public_key()` + `identity()`).
-  `LocalSigner` also implements the engine's `RemoteSigner`, registered over IPC. **This is the ONLY
-  module that touches secret material, compiled only under `client`.** The HD/keystore/mnemonic
-  primitives (#997 master-HD → profile derivation, at-rest encryption, BIP-39) live behind this seam
-  (§8).
+  `LocalSigner` (holds a `chia::bls::SecretKey`, exposes only `public_key()` + `identity()` +
+  `identity_public_key_bytes()` + `decap(peer_g1)`). `LocalSigner` also implements the engine's
+  `RemoteSigner` (both `sign` and `dh`), registered over IPC. **This is the ONLY module that touches
+  secret material, compiled only under `client`.** The HD/keystore/mnemonic primitives (#997
+  master-HD → profile derivation, the dig-identity key at `m/12381'/8444'/9'/0'`, at-rest encryption,
+  BIP-39) live behind this seam (§8).
 - **`client::identity::IdentityProvider`** — `active_identity()`, `tracked_public_keys()`. Supplies the
-  engine public material only.
+  engine public material only. `HdIdentity` additionally exposes `identity_public_key_bytes()` (the
+  48-byte G1 identity key published to slot `0x0010`) and `decap(peer_g1)` (the dig-message recipient
+  open — G1-ECDH against the held identity key), alongside its domain-separated `sign_identity_message`.
 - **`client::addressbook::AddressBook`** — local label → address contacts (`set`/`get`/`label_for`/
   `remove`/`entries`). No network, no keys.
 
@@ -354,6 +365,16 @@ All of the following live behind the `client` seam and NEVER in the engine:
   the `MasterKeySource`. Implementations MUST fail-closed on a locked/absent/corrupt store.
 - **Signing:** `LocalSigner` matches each `RequiredSignature.public_key` to a derived key, signs the
   `message` with augmented BLS, and aggregates into the `SignedBundle`.
+- **Identity key + G1-ECDH decap:** a SINGLE per-wallet dig-identity key derives at the hardened path
+  `m/12381'/8444'/9'/0'` (dig-identity SPEC §6a.1) — DISTINCT from the Chia wallet keys; it secures no
+  coins. Its 48-byte compressed G1 public key is the value published to slot `0x0010`. The recipient
+  DECAP of a dig-message seal is the G1-ECDH `dh(identity_sk, peer_g1) = identity_sk · peer_g1`
+  (`MasterKey::identity_dh`, surfaced as `LocalSigner::decap` / `HdIdentity::decap` /
+  `RemoteSigner::dh`), returning the 48-byte compressed shared G1 point for the KEM/KDF. The curve
+  arithmetic + subgroup checks are reused from `dig-identity` `g1_dh` (never re-rolled). **Custody:**
+  `peer_g1` is subgroup- and non-identity-checked BEFORE the scalar multiplication (invalid-curve /
+  small-subgroup key-recovery defense); only the shared secret is returned, never the scalar. The one
+  key does both sign (G2) and DH (G1) on group-separated, path-disjoint primitives.
 - **Custody controls (fail-closed).** The signer MUST refuse to produce a signature unless (a) the
   message is bound to the network — it ends with the network's AGG_SIG_ME additional data (genesis
   challenge), which rejects unbound `AGG_SIG_UNSAFE` messages that could be replayed against another
@@ -384,6 +405,12 @@ All of the following live behind the `client` seam and NEVER in the engine:
   descriptors), never a produced signature — the engine build never signs (key-isolation test +
   build-seam tests).
 - **HD derivation:** master-seed → profile key golden vectors (specified with the custody lane).
+- **G1-ECDH decap (security):** the decap round-trip is symmetric (`dh(our_sk, peer_pub) ==
+  dh(peer_sk, our_pub)`, matching dig-identity's `g1_dh` KAT); a malformed / off-curve / small-subgroup
+  / identity peer point is rejected fail-closed BEFORE the scalar multiplication; self-decap
+  (sender == recipient) is valid; the decap output is the shared secret only (not public material, no
+  scalar leak); the sign path is unchanged alongside decap; the identity key is distinct from the
+  wallet coin keys.
 
 Future lanes (state/sync, build/broadcast, custody, consumer migration) extend §3–§8 with concrete
 implementations and their conformance vectors; the seam boundary and the key-isolation invariant

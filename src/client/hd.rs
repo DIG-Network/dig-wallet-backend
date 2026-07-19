@@ -25,7 +25,7 @@
 use chia::bls::{DerivableKey, PublicKey, SecretKey};
 use zeroize::Zeroizing;
 
-use crate::types::WalletResult;
+use crate::types::{WalletError, WalletResult};
 
 /// BIP-44 purpose index for the DIG profile derivation path (#997: `m/44'/8444'/…`).
 const PURPOSE: u32 = 44;
@@ -88,6 +88,46 @@ impl MasterKey {
     /// The public key of a profile's receive address at `address_ix`.
     pub fn address_public_key(&self, profile_ix: u32, address_ix: u32) -> PublicKey {
         self.address_key(profile_ix, address_ix).public_key()
+    }
+
+    /// The dig-identity secret key at the canonical hardened path `m/12381'/8444'/9'/0'`
+    /// (dig-identity SPEC §6a.1). This is a SINGLE per-wallet key — DISTINCT from the Chia wallet
+    /// keys ([`address_key`](MasterKey::address_key), coin index `2`): it secures no coins, only the
+    /// identity. Its G1 public key is the 48-byte value published to slot `0x0010`.
+    ///
+    /// Kept module-private: the raw scalar never escapes this crate. Callers reach it only through
+    /// [`identity_public_key_bytes`](MasterKey::identity_public_key_bytes) (public material) or
+    /// [`identity_dh`](MasterKey::identity_dh) (the DECAP, which returns the shared secret, never the
+    /// scalar). Derived transiently per call so no long-lived copy of the key is held.
+    fn identity_secret_key(&self) -> SecretKey {
+        let master = dig_identity::master_secret_key_from_seed(&self.seed);
+        dig_identity::derive_identity_sk(&master)
+    }
+
+    /// The 48-byte compressed BLS12-381 **G1** identity public key (the value published to slot
+    /// `0x0010`). Public material — safe to advertise. This is the key a sender seals a dig-message
+    /// to, and the key this holder DECAPs against in [`identity_dh`](MasterKey::identity_dh).
+    pub fn identity_public_key_bytes(&self) -> [u8; 48] {
+        dig_identity::public_key_bytes(&self.identity_secret_key())
+    }
+
+    /// The recipient DECAP of a dig-message seal: the G1-ECDH `dh(identity_sk, peer_g1) =
+    /// identity_sk · peer_g1`, returning the 48-byte compressed shared G1 point for the KEM/KDF
+    /// (dig-identity SPEC §6a.2). This is a DH operation, NOT a signature — the ONE identity key does
+    /// both, on path-disjoint, group-separated primitives (sign = G2, DH = G1).
+    ///
+    /// # Custody
+    /// `peer_g1` is subgroup- and non-identity-checked BEFORE the scalar multiplication (inside
+    /// [`dig_identity::g1_dh`]), so a malformed / off-curve / small-subgroup / identity peer point is
+    /// rejected fail-closed and can never be used to recover bits of the identity scalar (invalid-curve
+    /// / small-subgroup key-recovery defense). Only the intended shared secret is ever returned; the
+    /// raw scalar is not exposed.
+    pub fn identity_dh(&self, peer_g1: &[u8; 48]) -> WalletResult<[u8; 48]> {
+        dig_identity::g1_dh(&self.identity_secret_key(), peer_g1).ok_or_else(|| {
+            WalletError::invalid_input(
+                "peer G1 point failed the subgroup / non-identity check (decap refused)",
+            )
+        })
     }
 }
 
@@ -182,4 +222,108 @@ mod tests {
     // Pinned from the first green run of `profile_zero_matches_golden_vector` — see that test.
     const GOLDEN_PROFILE_0_PUBKEY: &str =
         "8414b105c32eaac1095ad7f54ab41353c252d4567e5859b6cd69303ebcbc4f0ccf75917a70e1e1cbeddb838adbc2ee05";
+
+    // --- G1-ECDH decap (dig-message recipient open) -------------------------------------------
+
+    /// The compressed G1 identity element (point at infinity): 0xc0 flag byte, all coordinate bytes
+    /// zero. A DH against it must be refused (§6a.3 non-identity check).
+    fn g1_infinity() -> [u8; 48] {
+        let mut bytes = [0u8; 48];
+        bytes[0] = 0xc0;
+        bytes
+    }
+
+    /// The identity public key is a valid, non-identity G1 subgroup point (the slot-0x0010 value).
+    #[test]
+    fn identity_public_key_is_a_valid_g1_point() {
+        let key = MasterKey::from_seed_bytes(seed_from_label("id-pub"));
+        assert!(dig_identity::g1_subgroup_check(
+            &key.identity_public_key_bytes()
+        ));
+    }
+
+    /// The DECAP round-trip: `dh(our_sk, peer_pub) == dh(peer_sk, our_pub)` — the defining ECDH
+    /// symmetry, and exactly dig-identity's `g1_dh` KAT. This is what lets a recipient OPEN what a
+    /// sender sealed.
+    #[test]
+    fn decap_round_trip_is_symmetric() {
+        let ours = MasterKey::from_seed_bytes(seed_from_label("rt-ours"));
+        let peer = MasterKey::from_seed_bytes(seed_from_label("rt-peer"));
+
+        let we_open = ours.identity_dh(&peer.identity_public_key_bytes()).unwrap();
+        let they_open = peer.identity_dh(&ours.identity_public_key_bytes()).unwrap();
+
+        assert_eq!(we_open, they_open, "G1-ECDH must be symmetric");
+        // The shared secret is a real point, not a degenerate/identity result.
+        assert_ne!(we_open, g1_infinity());
+    }
+
+    /// Self-decap (sender == recipient) is valid: a holder DHing against its OWN identity key
+    /// produces a well-formed shared secret (dh(sk, sk·G) = sk²·G).
+    #[test]
+    fn self_decap_is_valid() {
+        let key = MasterKey::from_seed_bytes(seed_from_label("self"));
+        let shared = key.identity_dh(&key.identity_public_key_bytes()).unwrap();
+        assert!(dig_identity::g1_subgroup_check(&shared));
+    }
+
+    /// The subgroup / non-identity check REJECTS the identity point BEFORE any scalar mult — a
+    /// fail-closed error, no key material touched.
+    #[test]
+    fn decap_rejects_the_identity_point() {
+        let key = MasterKey::from_seed_bytes(seed_from_label("reject-inf"));
+        assert_eq!(
+            key.identity_dh(&g1_infinity()).unwrap_err().code,
+            crate::types::WalletErrorCode::InvalidInput,
+        );
+    }
+
+    /// A malformed / off-curve peer point is rejected fail-closed (invalid-curve attack defense).
+    #[test]
+    fn decap_rejects_a_malformed_point() {
+        let key = MasterKey::from_seed_bytes(seed_from_label("reject-junk"));
+        assert!(key.identity_dh(&[0xff; 48]).is_err());
+    }
+
+    /// Distinct peers yield distinct shared secrets (the DH actually depends on the peer point — no
+    /// constant/degenerate output).
+    #[test]
+    fn distinct_peers_yield_distinct_shared_secrets() {
+        let ours = MasterKey::from_seed_bytes(seed_from_label("dist-ours"));
+        let peer_a = MasterKey::from_seed_bytes(seed_from_label("dist-a"));
+        let peer_b = MasterKey::from_seed_bytes(seed_from_label("dist-b"));
+        let a = ours
+            .identity_dh(&peer_a.identity_public_key_bytes())
+            .unwrap();
+        let b = ours
+            .identity_dh(&peer_b.identity_public_key_bytes())
+            .unwrap();
+        assert_ne!(a, b);
+    }
+
+    /// Key isolation: the DECAP output is the SHARED SECRET only — it is not the identity public key
+    /// and not a copy of any advertised public material, so the scalar cannot be read back from it.
+    #[test]
+    fn decap_output_is_not_public_material() {
+        let ours = MasterKey::from_seed_bytes(seed_from_label("iso-ours"));
+        let peer = MasterKey::from_seed_bytes(seed_from_label("iso-peer"));
+        let shared = ours.identity_dh(&peer.identity_public_key_bytes()).unwrap();
+        assert_ne!(shared, ours.identity_public_key_bytes());
+        assert_ne!(shared, peer.identity_public_key_bytes());
+    }
+
+    /// The identity key is DISTINCT from the wallet coin keys (different derivation path) — a
+    /// leaked/rotated wallet address key can't reconstruct the identity key and vice-versa.
+    #[test]
+    fn identity_key_is_distinct_from_wallet_keys() {
+        let key = MasterKey::from_seed_bytes(seed_from_label("distinct"));
+        assert_ne!(
+            key.identity_public_key_bytes().to_vec(),
+            key.profile_public_key(0).to_bytes().to_vec(),
+        );
+        assert_ne!(
+            key.identity_public_key_bytes().to_vec(),
+            key.address_public_key(0, 0).to_bytes().to_vec(),
+        );
+    }
 }
