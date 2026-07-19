@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.8.1] - 2026-07-19
+
+### Bug Fixes
+- **deps:** Use crates.io dig-identity, not git (unblocks publish) (#11)
+
 ## [0.8.0] - 2026-07-19
 
 ### Features
