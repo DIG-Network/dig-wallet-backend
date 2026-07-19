@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [Unreleased]
+
+### Features
+- **engine:** Wire event emit points + in-memory catch-up (#1002) — `funds_sent` on a spent coin,
+  `new_tip`/`confirmation`/`transaction_failed` chain-watch emitters, and a concrete in-memory
+  `DeltaLog` implementing `dig_events_protocol::CatchUp` (bounded ring; SQLite-backed swap seam is
+  #1118). Cursors are now 1-based so `Cursor::default()` backfills the whole window.
+
 ## [0.5.0] - 2026-07-19
 
 ### Features

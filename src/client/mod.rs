@@ -31,6 +31,11 @@ pub use transport::{ControlTransport, IpcWalletClient};
 // `client::{CatchUp, filter_events}` keeps working for existing callers of this seam.
 pub use crate::types::{filter_events, CatchUp};
 
+// The live filtered subscription wrapper (in-process bridge) is available when the engine's
+// broadcast receiver is compiled in.
+#[cfg(feature = "engine")]
+pub use subscribe::{LagSignal, Subscription};
+
 use async_trait::async_trait;
 
 use crate::types::{
