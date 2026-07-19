@@ -298,7 +298,21 @@ async fn no_secret_material_is_ever_persisted() {
 
     // Byte guarantee: the raw DB file never contains a secret-bearing identifier — catches a secret
     // accidentally serialized into any JSON blob column, not just a mis-named column.
-    let raw = std::fs::read(&db.path).unwrap();
+    //
+    // With `journal_mode=WAL` the row blobs live in the `-wal` sidecar while a connection is open,
+    // so scanning only the main `.db` would see header pages, not the blob values, making this
+    // guarantee vacuous. Drop every handle (closing checkpoints the WAL into the main file) and
+    // also scan any residual `-wal` sidecar so the byte scan truly covers every persisted value.
+    drop(store);
+    drop(log);
+
+    let raw = {
+        let mut bytes = std::fs::read(&db.path).unwrap();
+        if let Ok(mut wal) = std::fs::read(format!("{}-wal", db.path.display())) {
+            bytes.append(&mut wal);
+        }
+        bytes
+    };
     let raw_lower = String::from_utf8_lossy(&raw).to_lowercase();
 
     for forbidden in [
