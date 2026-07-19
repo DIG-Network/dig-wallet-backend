@@ -32,11 +32,26 @@ use crate::types::{
 use super::hd::{MasterKey, DEFAULT_ADDRESS_GAP};
 
 /// The Chia mainnet genesis challenge — the AGG_SIG_ME additional data every mainnet spend
-/// signature is bound to. Canonical, byte-identical across the ecosystem.
-const MAINNET_AGG_SIG_ME_EXTRA_DATA: [u8; 32] =
-    hex_literal(b"ccd5bb71183532bff220ba46c268991a3ff07eb358e8255a65c30a2dce0e5fbb");
+/// signature is bound to. Sourced from `chia-consensus` (re-exported as `chia::consensus`) rather
+/// than a local hex literal, so the canonical source lives in one place; a KAT test
+/// (`mainnet_agg_sig_me_extra_data_matches_the_known_genesis`) still pins the expected bytes so a
+/// future chia-crate bump that silently changed this value would fail CI.
+///
+/// `chia-consensus` 0.26 publishes this only via `TEST_CONSTANTS` — there is no separate
+/// `MAINNET_CONSTANTS` export in this version — but `TEST_CONSTANTS.agg_sig_me_additional_data` IS
+/// the real Chia mainnet genesis challenge (`ccd5bb71…`), predating the upstream split into
+/// per-network constant sets.
+fn mainnet_agg_sig_me_extra_data() -> [u8; 32] {
+    <[u8; 32]>::from(
+        &chia::consensus::consensus_constants::TEST_CONSTANTS.agg_sig_me_additional_data,
+    )
+}
 
 /// The Chia testnet11 genesis challenge — the AGG_SIG_ME additional data on testnet11.
+///
+/// Kept as a literal: `chia-consensus` 0.26 does not publish a testnet11 constants set (only
+/// `TEST_CONSTANTS`, which carries the MAINNET genesis challenge — see
+/// [`mainnet_agg_sig_me_extra_data`]). KAT-verified against the documented testnet11 genesis below.
 const TESTNET11_AGG_SIG_ME_EXTRA_DATA: [u8; 32] =
     hex_literal(b"37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615");
 
@@ -96,7 +111,7 @@ impl LocalSigner {
     /// simulator's constant explicitly.
     pub fn new(identity: IdentityRef, master: MasterKey, network: Network) -> WalletResult<Self> {
         let agg_sig_me_extra_data = match network {
-            Network::Mainnet => MAINNET_AGG_SIG_ME_EXTRA_DATA,
+            Network::Mainnet => mainnet_agg_sig_me_extra_data(),
             Network::Testnet => TESTNET11_AGG_SIG_ME_EXTRA_DATA,
             Network::Simulator => return Err(WalletError::invalid_input(
                 "Network::Simulator has no fixed genesis challenge; use with_agg_sig_me_extra_data",
@@ -244,7 +259,7 @@ mod tests {
     /// suffix (what a real network-bound message carries).
     fn bound_message(body: &str) -> Vec<u8> {
         let mut msg = body.as_bytes().to_vec();
-        msg.extend_from_slice(&MAINNET_AGG_SIG_ME_EXTRA_DATA);
+        msg.extend_from_slice(&mainnet_agg_sig_me_extra_data());
         msg
     }
 
@@ -463,11 +478,23 @@ mod tests {
         ));
     }
 
+    /// KAT: the `chia-consensus` `TEST_CONSTANTS.agg_sig_me_additional_data` we now source the
+    /// mainnet AGG_SIG_ME extra data from MUST still equal the known Chia mainnet genesis
+    /// challenge. A future `chia` crate bump that silently changed this value would fail this
+    /// test rather than silently altering every mainnet spend's signature domain.
     #[test]
-    fn genesis_challenge_literal_decodes() {
+    fn mainnet_agg_sig_me_extra_data_matches_the_known_genesis() {
         assert_eq!(
-            hex::encode(MAINNET_AGG_SIG_ME_EXTRA_DATA),
+            hex::encode(mainnet_agg_sig_me_extra_data()),
             "ccd5bb71183532bff220ba46c268991a3ff07eb358e8255a65c30a2dce0e5fbb",
+        );
+    }
+
+    #[test]
+    fn testnet11_genesis_challenge_literal_decodes() {
+        assert_eq!(
+            hex::encode(TESTNET11_AGG_SIG_ME_EXTRA_DATA),
+            "37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615",
         );
     }
 }
