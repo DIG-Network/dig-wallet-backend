@@ -188,7 +188,10 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   success, a `Rejected { reason }` is a fail-closed `spend_validation_failed`, and a transport
   failure propagates as `transport`.
 - **`engine::events::EventSink`** (THE EMITTER) — `publish(WalletEvent) -> Cursor` (stamps a
-  monotonic cursor, best-effort fan-out), `subscribe()`, `subscriber_count()`. §5.
+  monotonic 1-based cursor, records it in the in-memory delta log, best-effort fan-out),
+  `subscribe()`, `catch_up_log() -> DeltaLog`, `subscriber_count()`. `DeltaLog` is the in-memory
+  `CatchUp` backfill source (bounded ring, `DEFAULT_HISTORY_CAPACITY` events; the persistent
+  SQLite-backed backing is #1118, behind the same trait). §5.
 - **`engine::signer::RemoteSigner::sign(UnsignedSpend) -> SignedBundle`** — the callback the engine
   invokes. The engine holds `Arc<dyn RemoteSigner>`, never a key. In dig-node-service the concrete
   impl is the IPC proxy to dig-app.
@@ -238,8 +241,9 @@ and the `WalletId`/`Amount`/`AssetId` payload newtypes are defined ONCE, in the 
 crate, and re-exported here (`crate::types`) — the ONE ecosystem definition so a second implementation
 can never drift from this one (#1067/#1072). `EventSink` implements that crate's `EventEmitter` trait;
 a subscriber's backfill implements its `CatchUp` trait. This crate owns only the machinery that
-produces, persists, and streams events — the bus (`engine::events::EventSink`), the persisted-delta
-catch-up store (a later lane), and the live subscription wrapper (`client::subscribe::Subscription`).
+produces, persists, and streams events — the bus (`engine::events::EventSink`), the delta catch-up
+store (`engine::events::DeltaLog`, in-memory now; SQLite-backed is #1118, behind the same `CatchUp`
+trait), and the live subscription wrapper (`client::subscribe::Subscription`).
 
 ### 5.1 Taxonomy
 
@@ -254,8 +258,13 @@ API. `WalletEvent::kind()` returns the `EventKind` discriminant used for filteri
 ### 5.2 Emit + subscribe
 
 - **Emit (engine):** `EventSink::publish(event) -> Cursor` — assigns the next monotonic per-instance
-  cursor and fans the event out. Publishing with no subscribers is a no-op (best-effort); the cursor
-  is still consumed so monotonicity holds for catch-up.
+  cursor (1-based; `Cursor::default()` = 0 is the "seen nothing" sentinel), records the event in the
+  delta log, and fans it out. Publishing with no subscribers is a best-effort no-op for the live
+  fan-out, but the event is ALWAYS recorded in the delta log so a later subscriber can catch up to it.
+- **Emit points (engine wiring):** the sync loop emits `funds_received` on a new inbound coin and
+  `funds_sent` when a tracked coin becomes spent (with `coin_state_changed` on every coin transition),
+  `sync_progress` as sync advances / on reorg; the chain-watch loop calls `observe_tip` (`new_tip`),
+  `confirm_transaction` (`confirmation`), and `fail_transaction` (`transaction_failed`).
 - **Subscribe (client):** a subscriber passes an `EnumSet<EventKind>` FILTER and receives only matching
   events (e.g. #970 subscribes `funds_received | funds_sent`; #979 subscribes `coin_state_changed |
   new_tip`). Non-matching events are skipped transparently.
@@ -264,9 +273,14 @@ API. `WalletEvent::kind()` returns the `EventKind` discriminant used for filteri
 
 The live broadcast does NOT replay history. A lagging or reconnecting subscriber observes a lag
 signal, then calls `catch_up(since_cursor, filter)` ONCE to fetch the missed range from the engine's
-persisted delta, then resumes live. Every delivered event is an `EmittedEvent { cursor, event }`; the
-subscriber remembers the last cursor. This is the normative "event-driven, poll only for catch-up"
-contract. #979 Subscription adopts this exact pattern.
+delta log (`DeltaLog`), then resumes live. `catch_up` returns every retained `EmittedEvent` with a
+cursor STRICTLY GREATER than `since`, in cursor order, narrowed by the same `EnumSet<EventKind>`
+filter as the live stream (so live and catch-up deliver an identical filtered view). Every delivered
+event is an `EmittedEvent { cursor, event }`; the subscriber remembers the last cursor. The in-memory
+`DeltaLog` retains a bounded window (`DEFAULT_HISTORY_CAPACITY`); a gap older than the window is
+unrecoverable in-memory — the persistent SQLite-backed catch-up (#1118) removes that bound behind the
+same `CatchUp` trait, with no consumer call-site change. This is the normative "event-driven, poll
+only for catch-up" contract. #979 Subscription adopts this exact pattern.
 
 ---
 

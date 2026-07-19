@@ -17,7 +17,7 @@ use async_trait::async_trait;
 
 use crate::types::value::Puzzlehash;
 use crate::types::{
-    CoinRecord, IdentityRef, SyncLifecycle, WalletErrorCode, WalletEvent, WalletResult,
+    CoinRecord, Cursor, IdentityRef, SyncLifecycle, WalletErrorCode, WalletEvent, WalletResult,
 };
 
 use super::events::EventSink;
@@ -125,6 +125,11 @@ impl SyncEngine {
 
     /// Emit the event a coin change warrants. Returns whether anything changed (an `Unchanged`
     /// re-delivery emits nothing and does not count).
+    ///
+    /// A newly-created coin is inbound value ([`WalletEvent::FundsReceived`]); a coin transitioning
+    /// to spent is outbound value ([`WalletEvent::FundsSent`]). Either way — and for a plain field
+    /// update — a [`WalletEvent::CoinStateChanged`] is always emitted so chain-watch subscribers see
+    /// every state transition.
     fn emit_for_change(
         &self,
         identity: &IdentityRef,
@@ -144,7 +149,22 @@ impl SyncEngine {
                     });
                 }
             }
-            CoinChange::Spent | CoinChange::Updated => {}
+            CoinChange::Spent => {
+                if let Some(height) = record.spent_height {
+                    // A tracked coin becoming spent is confirmed outbound value. The in-memory sync
+                    // model has no separate transaction record, so the spent coin id is the best
+                    // available transaction correlator (#1118's persistent store carries a real
+                    // tx_id).
+                    self.events.publish(WalletEvent::FundsSent {
+                        wallet_id: identity.wallet_id,
+                        asset: None,
+                        amount: record.amount,
+                        tx_id: record.coin_id.clone(),
+                        confirmed_height: height,
+                    });
+                }
+            }
+            CoinChange::Updated => {}
         }
         self.events.publish(WalletEvent::CoinStateChanged {
             coin_id: record.coin_id.clone(),
@@ -153,6 +173,37 @@ impl SyncEngine {
             spent_height: record.spent_height,
         });
         true
+    }
+
+    /// Announce a newly-observed chain tip ([`WalletEvent::NewTip`]).
+    ///
+    /// The chain-watch loop calls this when a peer reports a new peak header; chain-watch
+    /// subscribers (e.g. #979 `coin_state_changed | new_tip`) drive off it.
+    pub fn observe_tip(&self, height: u32, header_hash: impl Into<String>) -> Cursor {
+        self.events.publish(WalletEvent::NewTip {
+            height,
+            header_hash: header_hash.into(),
+        })
+    }
+
+    /// Announce that a submitted transaction confirmed on-chain ([`WalletEvent::Confirmation`]).
+    ///
+    /// Called when chain-watch observes a previously-broadcast transaction settle; the client seam
+    /// resolves a pending send against it.
+    pub fn confirm_transaction(&self, tx_id: impl Into<String>, height: u32) -> Cursor {
+        self.events.publish(WalletEvent::Confirmation {
+            tx_id: tx_id.into(),
+            height,
+        })
+    }
+
+    /// Announce that a submitted transaction failed ([`WalletEvent::TransactionFailed`]) — rejected
+    /// by the mempool or never confirmed within the tracking window.
+    pub fn fail_transaction(&self, tx_id: impl Into<String>, error: impl Into<String>) -> Cursor {
+        self.events.publish(WalletEvent::TransactionFailed {
+            tx_id: tx_id.into(),
+            error: error.into(),
+        })
     }
 
     /// Sync from the primary peer source: fetch coin states, ingest them, and mark the wallet
@@ -412,14 +463,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spending_a_coin_emits_only_coin_state_changed() {
+    async fn spending_a_tracked_coin_emits_funds_sent_and_coin_state_changed() {
         let e = engine();
         let id = identity(1);
         e.ingest(&id, vec![coin("a", 100, Some(5), None)]);
         let mut rx = e.events.subscribe();
         e.ingest(&id, vec![coin("a", 100, Some(5), Some(9))]);
         let kinds = drain_kinds(&mut rx);
-        assert_eq!(kinds, vec![EventKind::CoinStateChanged]);
+        assert_eq!(
+            kinds,
+            vec![EventKind::FundsSent, EventKind::CoinStateChanged]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_coin_first_seen_already_spent_emits_funds_sent() {
+        let e = engine();
+        let id = identity(1);
+        let mut rx = e.events.subscribe();
+        e.ingest(&id, vec![coin("a", 100, Some(5), Some(6))]);
+        let kinds = drain_kinds(&mut rx);
+        assert!(kinds.contains(&EventKind::FundsSent));
+        assert!(kinds.contains(&EventKind::CoinStateChanged));
+    }
+
+    #[tokio::test]
+    async fn observe_tip_emits_new_tip() {
+        let e = engine();
+        let mut rx = e.events.subscribe();
+        let cursor = e.observe_tip(1000, "deadbeef");
+        assert_eq!(cursor, Cursor(1));
+        let event = rx.try_recv().unwrap().event;
+        assert_eq!(
+            event,
+            WalletEvent::NewTip {
+                height: 1000,
+                header_hash: "deadbeef".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_transaction_emits_confirmation() {
+        let e = engine();
+        let mut rx = e.events.subscribe();
+        e.confirm_transaction("tx1", 42);
+        assert_eq!(drain_kinds(&mut rx), vec![EventKind::Confirmation]);
+    }
+
+    #[tokio::test]
+    async fn fail_transaction_emits_transaction_failed() {
+        let e = engine();
+        let mut rx = e.events.subscribe();
+        e.fail_transaction("tx1", "DOUBLE_SPEND");
+        let event = rx.try_recv().unwrap().event;
+        assert_eq!(
+            event,
+            WalletEvent::TransactionFailed {
+                tx_id: "tx1".into(),
+                error: "DOUBLE_SPEND".into(),
+            }
+        );
     }
 
     #[tokio::test]
