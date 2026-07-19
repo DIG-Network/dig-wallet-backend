@@ -62,6 +62,22 @@ impl HdIdentity {
         self.master.profile_public_key(self.identity.profile_ix)
     }
 
+    /// The 48-byte compressed G1 identity public key (dig-identity slot `0x0010`) — the value a
+    /// sender seals a dig-message to. Public material; safe to advertise.
+    pub fn identity_public_key_bytes(&self) -> [u8; 48] {
+        self.master.identity_public_key_bytes()
+    }
+
+    /// The recipient DECAP of a dig-message seal: the G1-ECDH `dh(identity_sk, peer_g1)` against the
+    /// held identity key, returning the 48-byte compressed shared secret for the KEM/KDF. `peer_g1`
+    /// is subgroup- and non-identity-checked before the scalar multiplication (fail-closed). This is
+    /// the DH the recipient uses to OPEN a message; it is NOT a signature (see
+    /// [`sign_identity_message`](HdIdentity::sign_identity_message)) — the one identity key does both
+    /// on group-separated primitives. See [`MasterKey::identity_dh`](super::hd::MasterKey::identity_dh).
+    pub fn decap(&self, peer_g1: &[u8; 48]) -> WalletResult<[u8; 48]> {
+        self.master.identity_dh(peer_g1)
+    }
+
     /// Sign an application-level message under `domain`, domain-separated so the signature can
     /// never be confused with (or replayed as) a spend signature. Fails closed on an empty or
     /// non-ASCII-alphanumeric-or-dash `domain`.
@@ -176,6 +192,34 @@ mod tests {
         let a = id.sign_identity_message("auth", payload).unwrap();
         let b = id.sign_identity_message("login", payload).unwrap();
         assert_ne!(a.to_bytes(), b.to_bytes());
+    }
+
+    #[test]
+    fn decap_round_trips_between_two_identities() {
+        let ours = identity("dh-a", 0);
+        let peer = identity("dh-b", 0);
+        let we_open = ours.decap(&peer.identity_public_key_bytes()).unwrap();
+        let they_open = peer.decap(&ours.identity_public_key_bytes()).unwrap();
+        assert_eq!(we_open, they_open);
+    }
+
+    #[test]
+    fn decap_rejects_a_bad_peer_point() {
+        let id = identity("dh-bad", 0);
+        assert_eq!(
+            id.decap(&[0xff; 48]).unwrap_err().code,
+            WalletErrorCode::InvalidInput,
+        );
+    }
+
+    #[test]
+    fn identity_public_key_is_48_bytes_and_distinct_from_spend_key() {
+        let id = identity("dh-pub", 0);
+        assert_eq!(id.identity_public_key_bytes().len(), 48);
+        assert_ne!(
+            id.identity_public_key_bytes().to_vec(),
+            id.profile_public_key().to_bytes().to_vec(),
+        );
     }
 
     #[test]

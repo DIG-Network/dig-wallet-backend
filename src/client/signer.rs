@@ -159,6 +159,20 @@ impl LocalSigner {
         })
     }
 
+    /// The 48-byte compressed G1 identity public key (dig-identity slot `0x0010`) this signer can
+    /// DECAP against. Public material — safe to advertise so a sender can seal a dig-message to it.
+    pub fn identity_public_key_bytes(&self) -> [u8; 48] {
+        self.master.identity_public_key_bytes()
+    }
+
+    /// The recipient DECAP: the G1-ECDH `dh(identity_sk, peer_g1)` against the held identity key,
+    /// returning the 48-byte compressed shared secret for the dig-message KEM/KDF. `peer_g1` is
+    /// subgroup- and non-identity-checked before the scalar multiplication (fail-closed). See
+    /// [`MasterKey::identity_dh`](super::hd::MasterKey::identity_dh).
+    pub fn decap(&self, peer_g1: &[u8; 48]) -> WalletResult<[u8; 48]> {
+        self.master.identity_dh(peer_g1)
+    }
+
     /// Reject any message not bound to this network's AGG_SIG_ME additional data — i.e. refuse to
     /// sign `AGG_SIG_UNSAFE`/unbound bytes that could be replayed against another coin.
     fn reject_unbound_message(&self, message: &[u8]) -> WalletResult<()> {
@@ -192,6 +206,10 @@ impl IdentitySigner for LocalSigner {
 impl crate::engine::signer::RemoteSigner for LocalSigner {
     async fn sign(&self, unsigned: UnsignedSpend) -> WalletResult<SignedBundle> {
         self.sign_unsigned(&unsigned)
+    }
+
+    async fn dh(&self, peer_g1: [u8; 48]) -> WalletResult<[u8; 48]> {
+        self.decap(&peer_g1)
     }
 }
 
@@ -452,6 +470,62 @@ mod tests {
             &addr_pk,
             &message
         ));
+    }
+
+    #[cfg(feature = "engine")]
+    #[tokio::test]
+    async fn remote_signer_dh_decaps_against_the_identity_key() {
+        use crate::engine::signer::RemoteSigner;
+
+        let ours = mainnet_signer("dh-ours");
+        let peer = mainnet_signer("dh-peer");
+
+        // The engine-facing decap round-trips with the peer's inherent decap (ECDH symmetry).
+        let we_open = RemoteSigner::dh(&ours, peer.identity_public_key_bytes())
+            .await
+            .unwrap();
+        let they_open = peer.decap(&ours.identity_public_key_bytes()).unwrap();
+        assert_eq!(we_open, they_open);
+    }
+
+    #[cfg(feature = "engine")]
+    #[tokio::test]
+    async fn remote_signer_dh_default_impl_fails_closed() {
+        use crate::engine::signer::RemoteSigner;
+
+        // A signer that only signs (no identity key wired) — uses the trait's default `dh`.
+        struct SignOnly;
+        #[async_trait]
+        impl RemoteSigner for SignOnly {
+            async fn sign(&self, _u: UnsignedSpend) -> WalletResult<SignedBundle> {
+                unreachable!("not exercised")
+            }
+        }
+        let err = SignOnly.dh([0u8; 48]).await.unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn sign_path_is_unchanged_alongside_decap() {
+        // The one key does both: signing still works exactly as before after decap is added.
+        let signer = mainnet_signer("both");
+        let addr_pk = master("both").address_public_key(0, 0);
+        let message = bound_message("sign-and-decap");
+        let signed = signer
+            .sign(spend_needing(vec![RequiredSignature {
+                public_key: addr_pk,
+                message: message.clone(),
+            }]))
+            .await
+            .unwrap();
+        assert!(bls_verify(
+            &signed.bundle.aggregated_signature,
+            &addr_pk,
+            &message
+        ));
+        // And decap works with the same holder.
+        let peer = mainnet_signer("both-peer");
+        assert!(signer.decap(&peer.identity_public_key_bytes()).is_ok());
     }
 
     /// signer == engine byte-KAT (signer half). The signer requires every message to be bound to
