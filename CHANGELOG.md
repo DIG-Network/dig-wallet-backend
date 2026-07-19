@@ -7,11 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.7.0] - 2026-07-19
 
 ### Features
-- **engine:** SQLite persistence backing for WalletStore + a persistent CatchUp event log (#1118) —
-  `SqliteWalletStore` (durable coin/CAT/NFT/DID/tx/sync state surviving restarts, versioned
-  migrations, WAL journaling) and `SqliteDeltaLog` (an unbounded on-disk `CatchUp` that swaps in
-  behind `&dyn CatchUp` with no call-site change). `EventSink::with_persistent_log` dual-writes
-  every published event for durability. No secret material is ever persisted (key-isolation §1.4).
+- **engine:** SQLite persistence backing for WalletStore + CatchUp (#1118) (#9)
 
 ## [0.6.1] - 2026-07-19
 
