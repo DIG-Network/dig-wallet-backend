@@ -55,8 +55,10 @@ use crate::types::{
 /// a new capability adds a migration, never edits a released one (§5.1 backwards-compatibility).
 const MIGRATIONS: &[&str] = &[
     // v1 — the initial schema: per-wallet coin/asset/tx/sync state + the global event log.
+    // Every statement is `IF NOT EXISTS` so a re-run (e.g. after a crash left the DDL committed but
+    // the version unrecorded) is a harmless no-op rather than a fatal "table already exists".
     "
-    CREATE TABLE coins (
+    CREATE TABLE IF NOT EXISTS coins (
         wallet_id      INTEGER NOT NULL,
         coin_id        TEXT    NOT NULL,
         puzzle_hash    TEXT    NOT NULL,
@@ -65,9 +67,9 @@ const MIGRATIONS: &[&str] = &[
         spent_height   INTEGER,
         PRIMARY KEY (wallet_id, coin_id)
     );
-    CREATE INDEX coins_unspent ON coins (wallet_id) WHERE spent_height IS NULL;
+    CREATE INDEX IF NOT EXISTS coins_unspent ON coins (wallet_id) WHERE spent_height IS NULL;
 
-    CREATE TABLE cats (
+    CREATE TABLE IF NOT EXISTS cats (
         wallet_id INTEGER NOT NULL,
         asset_id  TEXT    NOT NULL,
         balance   TEXT    NOT NULL,
@@ -75,37 +77,37 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (wallet_id, asset_id)
     );
 
-    CREATE TABLE nfts (
+    CREATE TABLE IF NOT EXISTS nfts (
         wallet_id   INTEGER NOT NULL,
         launcher_id TEXT    NOT NULL,
         data_uri    TEXT,
         PRIMARY KEY (wallet_id, launcher_id)
     );
 
-    CREATE TABLE dids (
+    CREATE TABLE IF NOT EXISTS dids (
         wallet_id   INTEGER NOT NULL,
         launcher_id TEXT    NOT NULL,
         name        TEXT,
         PRIMARY KEY (wallet_id, launcher_id)
     );
 
-    CREATE TABLE transactions (
+    CREATE TABLE IF NOT EXISTS transactions (
         seq              INTEGER PRIMARY KEY AUTOINCREMENT,
         wallet_id        INTEGER NOT NULL,
         tx_id            TEXT    NOT NULL,
         confirmed_height INTEGER,
         summary_json     TEXT    NOT NULL
     );
-    CREATE INDEX transactions_wallet ON transactions (wallet_id);
+    CREATE INDEX IF NOT EXISTS transactions_wallet ON transactions (wallet_id);
 
-    CREATE TABLE sync_state (
+    CREATE TABLE IF NOT EXISTS sync_state (
         wallet_id     INTEGER PRIMARY KEY,
         peak_height   INTEGER NOT NULL DEFAULT 0,
         target_height INTEGER NOT NULL DEFAULT 0,
         lifecycle     TEXT    NOT NULL
     );
 
-    CREATE TABLE events (
+    CREATE TABLE IF NOT EXISTS events (
         cursor     INTEGER PRIMARY KEY,
         event_json TEXT NOT NULL
     );
@@ -192,17 +194,16 @@ fn migrate(conn: &Connection) -> WalletResult<()> {
         if version <= current {
             continue;
         }
-        conn.execute_batch(&format!("BEGIN; {statements} COMMIT;"))
-            .map_err(storage_err)?;
-    }
-
-    if target != current {
-        conn.execute("DELETE FROM schema_version", [])
-            .map_err(storage_err)?;
-        conn.execute(
-            "INSERT INTO schema_version (version) VALUES (?1)",
-            params![target],
-        )
+        // Apply the DDL AND record the new version in ONE transaction. If the process crashes
+        // mid-migration the whole batch rolls back atomically, so the DB is never left with the
+        // schema upgraded but the version unrecorded (which would re-run the migration on reopen).
+        conn.execute_batch(&format!(
+            "BEGIN;\
+             {statements}\
+             DELETE FROM schema_version;\
+             INSERT INTO schema_version (version) VALUES ({version});\
+             COMMIT;"
+        ))
         .map_err(storage_err)?;
     }
     Ok(())
@@ -947,6 +948,29 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn migration_recovers_from_a_crash_between_ddl_and_version_write() {
+        // Regression (H1/F4): a crash AFTER a migration's DDL committed but BEFORE its version was
+        // recorded must not brick the DB. Simulate that exact window — apply migration 1's DDL and
+        // commit it, but leave the recorded version at 0 — then run the reopen path (`migrate`) and
+        // assert it recovers idempotently instead of failing with "table coins already exists".
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        // No version row written: the reopen resolves current_version = 0 and re-runs migration 1.
+
+        migrate(&conn).expect("reopen must recover idempotently from the crash window");
+
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
     }
 
     #[test]
