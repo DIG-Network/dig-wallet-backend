@@ -20,6 +20,7 @@
 pub mod broadcast;
 pub mod build;
 pub mod events;
+pub mod persist;
 pub mod selection;
 pub mod signer;
 pub mod state;
