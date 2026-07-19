@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.8.0] - 2026-07-19
 
 ### Features
-- **client:** G1-ECDH decap capability on the key-holder seam — `RemoteSigner::dh` + `LocalSigner`/`HdIdentity`/`MasterKey` decap against the dig-identity key (dig-message recipient open); reuses dig-identity v0.4.0 `g1_dh` (subgroup-check-before-mult). Sign path unchanged (#1172)
+- **client:** G1-ECDH decap capability on the key-holder seam (#10)
 
 ## [0.7.0] - 2026-07-19
 
