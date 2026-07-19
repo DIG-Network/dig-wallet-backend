@@ -62,7 +62,7 @@ mod hex_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::value::Amount;
+    use crate::types::Amount;
 
     #[test]
     fn required_signature_round_trips_with_hex_message() {

@@ -7,7 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::identity::IdentityRef;
-use super::value::{Address, Amount, AssetId};
+use super::value::Address;
+use super::{Amount, AssetId};
 
 /// A request to send native XCH.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

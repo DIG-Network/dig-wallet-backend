@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet-backend"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.81"
 description = "Canonical event-driven Chia wallet backend for the DIG Network. Exports two carefully-partitioned seams: an `engine` seam (imported by dig-node — the single running wallet instance: state, sync, unsigned-spend construction, event emission; identity-parameterized, never holds a private key) and a `client` seam (used by dig-app — the event subscriber, spend review/decode, the signing interface + identity provider that hold the key). Clean-room, chia-wallet-sdk-based. Replaces dig-l1-wallet."
@@ -47,6 +47,11 @@ hex = "0.4"
 enumset = { version = "1", features = ["serde"] }
 # async traits for the signing + broadcast callbacks (RemoteSigner::sign is async).
 async-trait = "0.1"
+# The CANONICAL wallet/chain event taxonomy (WalletEvent, EventKind, Cursor, WalletId, Amount,
+# AssetId) + the EventEmitter/CatchUp shape traits — the ONE ecosystem definition so the engine's
+# emitted wire shape and dig-app's subscriber never drift apart (#1067, #1072). Re-exported from
+# `crate::types`; the bus/store/subscription machinery that PRODUCES these stays here.
+dig-events-protocol = "0.1.2"
 
 # --- seam-gated (async runtime for the event emitter + subscriber + sync loop) ---
 # `sync` = the broadcast channel the EventSink fans events out over. `rt`/`macros`/`time`
