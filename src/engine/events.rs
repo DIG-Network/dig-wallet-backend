@@ -13,7 +13,20 @@ use async_trait::async_trait;
 use enumset::EnumSet;
 use tokio::sync::broadcast;
 
-use crate::types::{CatchUp, Cursor, EmittedEvent, EventKind, WalletError, WalletEvent};
+use crate::types::{
+    CatchUp, Cursor, EmittedEvent, EventKind, WalletError, WalletEvent, WalletResult,
+};
+
+/// A durable sink an [`EventSink`] dual-writes every published event into, so the delta log survives
+/// a process restart and can backfill beyond the in-memory ring (#1118).
+///
+/// The persistent SQLite backing (`super::persist::SqliteDeltaLog`) implements this AND [`CatchUp`],
+/// so wiring it into an [`EventSink`] gives durable emission while a consumer reads it back through
+/// the same `&dyn CatchUp` seam — no call-site change.
+pub trait PersistentEventLog: Send + Sync {
+    /// Durably record one emitted event. Idempotent on its cursor.
+    fn append(&self, emitted: &EmittedEvent) -> WalletResult<()>;
+}
 
 /// How many recently-emitted events the in-memory delta log retains for catch-up backfill.
 ///
@@ -35,6 +48,9 @@ pub struct EventSink {
     /// The recently-emitted events retained for `catch_up` backfill (bounded ring, oldest evicted).
     history: Arc<Mutex<VecDeque<EmittedEvent>>>,
     history_capacity: usize,
+    /// An optional durable delta log every published event is ALSO written to (#1118). When set,
+    /// the on-disk log outlives the process and the bounded in-memory ring.
+    persistent: Option<Arc<dyn PersistentEventLog>>,
 }
 
 impl EventSink {
@@ -48,6 +64,26 @@ impl EventSink {
     /// Create an emitter with an explicit broadcast `capacity` and delta-log `history_capacity`
     /// (the number of recent events retained for catch-up backfill).
     pub fn with_history_capacity(capacity: usize, history_capacity: usize) -> Self {
+        Self::build(capacity, history_capacity, None)
+    }
+
+    /// Create an emitter that ALSO dual-writes every published event to a durable `persistent` log,
+    /// so catch-up survives a restart + reaches beyond the in-memory window (#1118). The in-memory
+    /// ring is retained too (fast, live-stream catch-up); the durable log is the unbounded backstop.
+    pub fn with_persistent_log(
+        capacity: usize,
+        history_capacity: usize,
+        persistent: Arc<dyn PersistentEventLog>,
+    ) -> Self {
+        Self::build(capacity, history_capacity, Some(persistent))
+    }
+
+    /// Shared constructor for the three public builders above.
+    fn build(
+        capacity: usize,
+        history_capacity: usize,
+        persistent: Option<Arc<dyn PersistentEventLog>>,
+    ) -> Self {
         let (sender, _) = broadcast::channel(capacity);
         Self {
             sender,
@@ -56,6 +92,7 @@ impl EventSink {
             next_cursor: Arc::new(AtomicU64::new(1)),
             history: Arc::new(Mutex::new(VecDeque::with_capacity(history_capacity))),
             history_capacity,
+            persistent,
         }
     }
 
@@ -74,8 +111,17 @@ impl EventSink {
         cursor
     }
 
-    /// Append an emitted event to the bounded delta log, evicting the oldest when at capacity.
+    /// Append an emitted event to the bounded in-memory delta log (evicting the oldest at capacity)
+    /// and, when a durable log is wired, to that too.
+    ///
+    /// The durable write is best-effort: `publish` returns a `Cursor` infallibly (SPEC §5), so a
+    /// persistence failure cannot abort emission — the event still lives in the in-memory ring and
+    /// the live fan-out. The durable log is the beyond-the-window backstop, not the source of truth
+    /// for a live subscriber.
     fn record(&self, emitted: EmittedEvent) {
+        if let Some(persistent) = &self.persistent {
+            let _ = persistent.append(&emitted);
+        }
         let mut history = self.history.lock().expect("event delta log mutex poisoned");
         if history.len() == self.history_capacity {
             history.pop_front();

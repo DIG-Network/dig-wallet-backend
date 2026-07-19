@@ -28,7 +28,8 @@ pub mod sync;
 
 pub use broadcast::{Broadcaster, MempoolBroadcaster, MempoolClient, MempoolStatus};
 pub use build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
-pub use events::{DeltaLog, EventSink, DEFAULT_HISTORY_CAPACITY};
+pub use events::{DeltaLog, EventSink, PersistentEventLog, DEFAULT_HISTORY_CAPACITY};
+pub use persist::{SqliteDeltaLog, SqliteWalletStore};
 pub use selection::{
     select_for_consolidation, select_for_spend, SelectionOutcome, DEFAULT_COIN_CAP,
 };

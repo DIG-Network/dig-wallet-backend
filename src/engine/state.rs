@@ -245,7 +245,13 @@ impl InMemoryWalletStore {
 }
 
 /// Decide how an incoming coin-state update changes a (possibly-existing) coin.
-fn classify_coin_change(previous: Option<&CoinRecord>, incoming: &CoinRecord) -> CoinChange {
+///
+/// Shared by both backings so the persistent [`super::persist::SqliteWalletStore`] classifies a
+/// coin update identically to [`InMemoryWalletStore`] (backend-parity, SPEC §3).
+pub(crate) fn classify_coin_change(
+    previous: Option<&CoinRecord>,
+    incoming: &CoinRecord,
+) -> CoinChange {
     match previous {
         None if incoming.spent_height.is_some() => CoinChange::Spent,
         None => CoinChange::Created,

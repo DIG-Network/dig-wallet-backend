@@ -159,8 +159,23 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   `WalletId`, balance derived from unspent coins, reorg rollback to a fork height). Its mutation
   surface (`apply_coin_state` → `CoinChange`, `rollback_to`, `set_peak`, `set_sync_status`,
   `upsert_*`, `record_transaction`) is engine-internal — the sync loop drives it; the client seam
-  sees only the read trait over IPC. A persistent (SQLite) backing is a later drop-in over the same
-  surface.
+  sees only the read trait over IPC.
+- **`engine::persist::SqliteWalletStore`** — the persistent (SQLite) backing for the same read +
+  mutation surface as `InMemoryWalletStore`; a drop-in whose coin/CAT/NFT/DID/transaction/sync state
+  survives a process restart. It classifies a coin update with the SAME rule as the in-memory
+  backing, so the observable `CoinChange` result and every read are identical across the two
+  backings (backend-parity). Amounts are stored as decimal TEXT (full `u64` range); the schema is
+  brought forward by versioned, additive migrations on open (§5.1 spirit — never a destructive
+  rewrite); WAL journaling gives crash-safe atomic writes. It MUST NOT persist any secret material —
+  only public coin/asset/transaction/sync state (SPEC §1.4; asserted by an on-disk no-secret test).
+- **`engine::persist::SqliteDeltaLog`** — the persistent `CatchUp` backing: an unbounded on-disk
+  event log that backfills every retained event with a cursor strictly greater than `since`, in
+  cursor order, narrowed by the same `EnumSet<EventKind>` filter as the in-memory `DeltaLog`. It
+  implements `CatchUp<Error = WalletError>`, so a consumer holding `&dyn CatchUp` swaps to it with no
+  call-site change, and `PersistentEventLog`, so an `EventSink` created with
+  `EventSink::with_persistent_log` dual-writes every published event into it. Appends are idempotent
+  on the cursor. This removes the in-memory window bound (§5.3): a subscriber offline longer than the
+  in-memory ring can still recover the full missed range.
 - **`engine::sync::SyncConfig { ipv6_first, coin_cap, fallback_endpoints }`** — the peer sync loop.
   Peer dialing MUST be IPv6-first with IPv4 fallback (§5.2 ecosystem rule). Fallback point-read
   endpoints are used only while syncing / for out-of-DB reads.
