@@ -219,6 +219,48 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   (invalid-curve / small-subgroup key-recovery defense); only the shared secret is returned, never
   the scalar. Neither the argument nor the return carries secret key material.
 
+### 3a. Options — covered-option actions (`engine::build_options`)
+
+- **`engine::build_options::OptionBuilder`** — `build_mint_option`, `build_transfer_option`,
+  `build_exercise_option`, each composing the canonical `dig-options` (CHIP-0042) builders (never
+  hand-rolled option CLVM) and returning an UNSIGNED result. The builder MUST NOT sign; the
+  `required_signatures` are extracted through the SAME key-free `RequiredSignature::from_coin_spends`
+  path as every other spend, so signer == engine by construction.
+- **Mint** (`build_mint_option`) locks an XCH underlying and issues the option singleton via
+  `dig_options::create`, returning `MintedOption { unsigned, handle }`. `dig_options::create` funds
+  the locked underlying + the 1-mojo singleton from ONE funding coin and has no change output; the
+  funding coin's excess over `underlying + 1` is an implicit fee, which the builder bounds above by
+  the caller's `fee` (a mint MUST NOT burn more than the caller consented to). The returned
+  `OptionHandle` carries the terms (not recoverable from the on-chain singleton) + the ids to locate
+  the option and its underlying.
+- **Exercise atomicity (SECURITY-CRITICAL invariant).** On exercise the unlocked underlying lands on
+  a BARE anyone-can-claim settlement coin. Consensus forces the strike payment to the creator but
+  does NOT force the underlying claim back to the holder — that leg is BUILDER-ENFORCED ONLY. The
+  exercise `UnsignedSpend` MUST carry the FULL bundle intact, INCLUDING the settlement leg that
+  claims the unlocked underlying (a settlement-puzzle coin of the underlying amount) to the holder;
+  no path may drop or reorder it, and a caller MUST broadcast the whole bundle — a subset strands the
+  underlying for any mempool watcher to steal after the holder has paid the strike. This invariant is
+  pinned by a dependency-guard conformance test (`exercise_bundle_includes_the_underlying_claim_leg`).
+- **v0.9.0 scope.** Mint is fully wired. **Transfer** (no curated `dig-options` transfer builder in
+  0.1.0) and **exercise** (needs a `dig_options::CreatedOption` rehydrated from on-chain state, which
+  the pure build seam cannot supply) ACCEPT + fail-closed VALIDATE their request and return
+  `NotImplemented` until the `dig-options` additions land (release-first) — no consumer-facing shape
+  change when they do.
+
+### 3b. Tips — $DIG tipping actions (`engine::build_tips`)
+
+- **`engine::build_tips::TipBuilder`** — `build_tip` (an explicit CAT tip) and `build_auto_tip` (the
+  guarded, honest auto-tip), composing the canonical `dig-tips` (`build_tip` / `build_tip_if_allowed`)
+  builders, returning UNSIGNED results. A tip is a single CAT payment; `required_signatures` come from
+  the SAME key-free path as every other spend. The builder resolves the input CATs to a SINGLE
+  authorizing key (the largest key-controlled p2 group) — a v0.9.0 single-key tip.
+- **The honest auto-tip (§6.0 $DIG North Star).** `build_auto_tip` runs the capped decision FIRST
+  against the `AutoTipPolicy` (enabled, mode, per-tip amount, per-day count + amount caps) and today's
+  `TipLedger`; it builds a spend ONLY when the decision is `TipDecision::Tip`, and builds NOTHING on
+  any skip (disabled, below threshold, not approved, cap reached). A capped/declined tip can therefore
+  never be constructed — the default-on money movement is honest, capped, and one-flag-off, and never
+  gates consuming content.
+
 **NOT in the engine seam:** key custody, mnemonic generation, a `sign()` implementation (only the
 trait it calls), any HD seed.
 

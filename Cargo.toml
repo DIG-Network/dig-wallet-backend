@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet-backend"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.81"
 description = "Canonical event-driven Chia wallet backend for the DIG Network. Exports two carefully-partitioned seams: an `engine` seam (imported by dig-node — the single running wallet instance: state, sync, unsigned-spend construction, event emission; identity-parameterized, never holds a private key) and a `client` seam (used by dig-app — the event subscriber, spend review/decode, the signing interface + identity provider that hold the key). Clean-room, chia-wallet-sdk-based. Replaces dig-l1-wallet."
@@ -24,6 +24,8 @@ engine = [
     "dep:futures-core",
     "dep:chia-wallet-sdk",
     "dep:dig-options",
+    "dep:dig-tips",
+    "dep:dig-cat",
     "dep:clvmr",
     "dep:rusqlite",
 ]
@@ -89,6 +91,15 @@ chia-wallet-sdk = { version = "0.30", default-features = false, optional = true 
 # spends and reports required signatures, never holding a key or signing (identity boundary #908).
 # Engine-seam only.
 dig-options = { version = "0.1", optional = true }
+# The CANONICAL DIG tipping expert crate: a pure, key-free CAT-payment builder for tips (incl. the
+# honest, capped, default-on auto-tip to the DIG treasury — the §6.0 $DIG North Star). The engine
+# composes `build_tip`/`build_tip_if_allowed`; it speaks `dig_cat` types that re-export
+# `chia_protocol`/`chia_wallet_sdk` (same 0.26/0.30 tree — no conversion). Engine-seam only.
+dig-tips = { version = "0.1", optional = true }
+# The canonical CAT builder crate dig-tips wraps; the engine consumes its `CatError` taxonomy to map
+# a failed tip build into the wallet error catalogue. Its type re-exports (Coin/Cat/CoinSpend/Bytes32)
+# are `chia_protocol`/`chia_wallet_sdk`'s own (same 0.26/0.30 tree). Engine-seam only.
+dig-cat = { version = "0.1", optional = true }
 # The CLVM allocator RequiredSignature::from_coin_spends threads its parse through.
 clvmr = { version = "0.14", optional = true }
 # The persistent (SQLite) backing for the engine state store + event delta log (#1118). `bundled`

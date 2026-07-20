@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.0] - 2026-07-20
+
+### Features
+- **engine:** $DIG tipping surface + option-exercise atomicity guard (unsigned build) (#1127)
+  - Tips: `TipBuilder::build_tip` + `build_auto_tip` compose the canonical `dig-tips` builders; the
+    capped honest auto-tip (§6.0) decides first and builds nothing on a skip.
+  - Options: security-critical exercise-atomicity dependency-guard test (mint shipped in 0.9.0).
+  - Engine builds UNSIGNED only; the client `LocalSigner` is unchanged (identity boundary #908).
+
 ## [0.9.0] - 2026-07-20
 
 ### Features

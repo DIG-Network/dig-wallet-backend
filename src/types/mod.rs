@@ -14,6 +14,7 @@ pub mod identity;
 pub mod options;
 pub mod request;
 pub mod spend;
+pub mod tips;
 pub mod value;
 
 pub use dig_events_protocol::{
@@ -28,6 +29,10 @@ pub use options::{
 };
 pub use request::{SendCatRequest, SendXchRequest};
 pub use spend::{RequiredSignature, SignedBundle, UnsignedSpend};
+pub use tips::{
+    AutoTipOutcome, AutoTipPolicy, AutoTipRequest, CapReason, TipDecision, TipLedger, TipMode,
+    TipRequest,
+};
 pub use value::{
     Address, Balance, CatRecord, CoinRecord, DidRecord, Network, NftRecord, Puzzlehash,
     SpendOutput, TransactionRecord, TransactionSummary,

@@ -468,4 +468,72 @@ mod tests {
             funding_coin_id: hex::encode([5u8; 32]),
         }
     }
+
+    /// SECURITY-CRITICAL dependency guard for option-exercise atomicity (SPEC §3a).
+    ///
+    /// On exercise, the unlocked underlying lands on a BARE anyone-can-claim settlement coin;
+    /// consensus forces the strike payment to the creator but does NOT force the underlying claim
+    /// back to the holder — that leg is BUILDER-ENFORCED ONLY. If any path ever dropped or
+    /// reordered it, the underlying would be stranded for a mempool watcher to steal while the
+    /// holder has paid the strike and received nothing. This test pins the invariant our future
+    /// engine exercise wiring composes: `dig_options::exercise` MUST emit the underlying-claim
+    /// settlement leg (a settlement-puzzle coin of the underlying amount) inside the SAME bundle,
+    /// so a `dig-options` bump that regressed it fails here before it can reach custody code.
+    ///
+    /// Key-free: `create` + `exercise` build UNSIGNED spends from a public [`Owner::Standard`] key
+    /// (the G1 generator), never a secret — honouring the SPEC §1.4 engine key-isolation invariant.
+    #[test]
+    fn exercise_bundle_includes_the_underlying_claim_leg() {
+        use chia_wallet_sdk::types::puzzles::SettlementPayment;
+        use chia_wallet_sdk::types::Mod;
+        use dig_options::{exercise, StrikePayment};
+
+        let pk = test_public_key();
+        let holder_ph = wallet_puzzle_hash();
+        let underlying_amount: u64 = 1_000;
+        let strike_amount: u64 = 500;
+
+        // Mint an option to the holder (self-minted), locking the underlying.
+        let mut ctx = SpendContext::new();
+        let funding_coin = wallet_coin(underlying_amount + 1, 1);
+        let terms = OptionTerms {
+            creator_puzzle_hash: holder_ph,
+            owner_puzzle_hash: holder_ph,
+            underlying_amount,
+            strike_type: OptionType::Xch {
+                amount: strike_amount,
+            },
+            expiry_seconds: 1_800_000_000,
+        };
+        let created = create(&mut ctx, &Owner::Standard(pk), funding_coin, &terms)
+            .expect("create option")
+            .created
+            .expect("created option");
+
+        // Exercise it, paying the strike from a holder-owned coin.
+        let strike_funding = wallet_coin(strike_amount, 2);
+        let exercised = exercise(
+            &mut ctx,
+            &Owner::Standard(pk),
+            &created,
+            &StrikePayment {
+                funding_coin: strike_funding,
+            },
+        )
+        .expect("exercise option");
+
+        // The bundle MUST carry a settlement-puzzle coin spend of the FULL underlying amount — the
+        // claim leg routing the unlocked underlying back to the holder. Its absence would strand
+        // the underlying on a public settlement coin.
+        let settlement_ph = Bytes32::from(<[u8; 32]>::from(SettlementPayment::mod_hash()));
+        let has_underlying_claim = exercised
+            .coin_spends
+            .iter()
+            .any(|cs| cs.coin.puzzle_hash == settlement_ph && cs.coin.amount == underlying_amount);
+        assert!(
+            has_underlying_claim,
+            "exercise bundle is missing the underlying-claim settlement leg (amount {underlying_amount}); \
+             the unlocked underlying would be stranded for anyone to claim",
+        );
+    }
 }
