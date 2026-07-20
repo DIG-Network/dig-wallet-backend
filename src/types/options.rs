@@ -98,18 +98,54 @@ pub struct MintedOption {
     pub handle: OptionHandle,
 }
 
+/// A spendable coin in its pure wire form — the three fields needed to reconstruct a
+/// `chia_protocol::Coin` (its parent, so a `CoinSpend` can be built against it) without any SDK
+/// type crossing the seam. Amounts are mojos; the two hashes are lowercase hex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireCoin {
+    /// The parent coin id (hex) — the coin this one was created by spending.
+    pub parent_coin_info: String,
+    /// The coin's puzzle hash (hex).
+    pub puzzle_hash: String,
+    /// The coin's value in mojos.
+    pub amount: u64,
+}
+
+/// The on-chain projection of an option the CLIENT fetches and hands to the engine so it can
+/// compose a transfer or exercise WITHOUT holding a key or touching the network (the chain-agnostic
+/// engine seam, #908).
+///
+/// The engine cannot recover a `dig_options::CreatedOption` from a handle alone: it needs the option
+/// singleton's CURRENT parent spend (to `parse_child` the live option child, which may have been
+/// transferred since mint) plus the locked-underlying coin (to `rehydrate` + verify the terms). A
+/// client with chain access fetches those and passes them here. Every field is a pure wire form
+/// (hex + amounts); the engine decodes to `chia_protocol::{Coin, Program}` internally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptionOnChainState {
+    /// The coin whose spend created the option's CURRENT singleton child (its parent spend).
+    pub option_parent_coin: WireCoin,
+    /// The serialized CLVM puzzle reveal of `option_parent_coin`'s spend (lowercase hex).
+    pub option_parent_puzzle_reveal: String,
+    /// The serialized CLVM solution of `option_parent_coin`'s spend (lowercase hex).
+    pub option_parent_solution: String,
+    /// The locked-underlying coin the option unlocks on exercise.
+    pub underlying_coin: WireCoin,
+}
+
 /// A request to TRANSFER an option singleton to a new owner.
 ///
-/// Carries the [`OptionHandle`] retained from the mint plus the destination puzzle hash. Building
-/// the transfer requires a `dig_options::transfer` builder that composes `OptionContract::transfer`
-/// — not present in `dig-options` 0.1.0 (see the crate's follow-up); until it ships this request is
-/// accepted but the build returns [`crate::types::WalletErrorCode::NotImplemented`].
+/// Carries the [`OptionHandle`] retained from the mint, the [`OptionOnChainState`] projection the
+/// client fetched for the option's current singleton, and the destination puzzle hash. The engine
+/// rehydrates the option from the projection and composes `dig_options::transfer` — never holding a
+/// key or touching the network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferOptionRequest {
     /// The current owner identity authorizing the transfer (public material).
     pub identity: IdentityRef,
     /// The option to transfer.
     pub handle: OptionHandle,
+    /// The current on-chain projection of the option (parent spend + underlying coin).
+    pub on_chain: OptionOnChainState,
     /// The puzzle hash to transfer the option singleton to.
     pub to_puzzle_hash: Puzzlehash,
     /// The farmer fee to pay.
@@ -118,16 +154,18 @@ pub struct TransferOptionRequest {
 
 /// A request to EXERCISE an option: pay the strike, unlock the underlying to the holder.
 ///
-/// Carries the [`OptionHandle`] plus the strike-funding source. Building the exercise requires
-/// reconstructing `dig_options::CreatedOption` from on-chain state — a `dig-options` rehydration
-/// helper not present in 0.1.0 (see the crate's follow-up); until it ships this request is accepted
-/// but the build returns [`crate::types::WalletErrorCode::NotImplemented`].
+/// Carries the [`OptionHandle`], the [`OptionOnChainState`] projection the client fetched for the
+/// option's current singleton, and the strike-funding source (resolved engine-side from the current
+/// owner's spendable XCH). The engine rehydrates + verifies the option against the projection
+/// (fail-closed) and composes `dig_options::exercise`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExerciseOptionRequest {
     /// The holder identity exercising the option (public material).
     pub identity: IdentityRef,
     /// The option to exercise.
     pub handle: OptionHandle,
+    /// The current on-chain projection of the option (parent spend + underlying coin).
+    pub on_chain: OptionOnChainState,
     /// The farmer fee to pay.
     pub fee: Amount,
 }
@@ -184,11 +222,29 @@ mod tests {
         assert_eq!(handle, back);
     }
 
+    fn sample_on_chain() -> OptionOnChainState {
+        OptionOnChainState {
+            option_parent_coin: WireCoin {
+                parent_coin_info: "aa".repeat(32),
+                puzzle_hash: "bb".repeat(32),
+                amount: 1,
+            },
+            option_parent_puzzle_reveal: "ff01".into(),
+            option_parent_solution: "80".into(),
+            underlying_coin: WireCoin {
+                parent_coin_info: "cc".repeat(32),
+                puzzle_hash: "dd".repeat(32),
+                amount: 1_000,
+            },
+        }
+    }
+
     #[test]
     fn transfer_and_exercise_requests_round_trip() {
         let transfer = TransferOptionRequest {
             identity: IdentityRef::new(WalletId(2)),
             handle: sample_handle(),
+            on_chain: sample_on_chain(),
             to_puzzle_hash: Puzzlehash("99".repeat(32)),
             fee: Amount(3),
         };
@@ -199,10 +255,19 @@ mod tests {
         let exercise = ExerciseOptionRequest {
             identity: IdentityRef::new(WalletId(3)),
             handle: sample_handle(),
+            on_chain: sample_on_chain(),
             fee: Amount(4),
         };
         let back: ExerciseOptionRequest =
             serde_json::from_str(&serde_json::to_string(&exercise).unwrap()).unwrap();
         assert_eq!(exercise, back);
+    }
+
+    #[test]
+    fn on_chain_state_round_trips() {
+        let state = sample_on_chain();
+        let back: OptionOnChainState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(state, back);
     }
 }

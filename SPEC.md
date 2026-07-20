@@ -247,11 +247,30 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   no path may drop or reorder it, and a caller MUST broadcast the whole bundle — a subset strands the
   underlying for any mempool watcher to steal after the holder has paid the strike. This invariant is
   pinned by a dependency-guard conformance test (`exercise_bundle_includes_the_underlying_claim_leg`).
-- **v0.9.0 scope.** Mint is fully wired. **Transfer** (no curated `dig-options` transfer builder in
-  0.1.0) and **exercise** (needs a `dig_options::CreatedOption` rehydrated from on-chain state, which
-  the pure build seam cannot supply) ACCEPT + fail-closed VALIDATE their request and return
-  `NotImplemented` until the `dig-options` additions land (release-first) — no consumer-facing shape
-  change when they do.
+- **Transfer + exercise are wired over `dig-options` v0.2.0** — `build_transfer_option` composes
+  `dig_options::transfer`; `build_exercise_option` composes `dig_options::exercise`. Both are
+  key-free and network-free: the engine cannot fetch an option's live singleton or recover a
+  `dig_options::CreatedOption`, so the CLIENT supplies the option's current on-chain state.
+- **The on-chain-projection contract (`OptionOnChainState`).** `TransferOptionRequest` and
+  `ExerciseOptionRequest` each carry an `OptionOnChainState { option_parent_coin,
+  option_parent_puzzle_reveal, option_parent_solution, underlying_coin }` — a WIRE-ONLY projection
+  (hex + amounts, no SDK types) the client fetches: the option singleton's CURRENT parent spend (so
+  the engine `parse_child`s the live option, which may have been transferred since mint) and the
+  locked-underlying coin. The engine decodes it to `chia_protocol::{Coin, Program}` internally.
+- **Fail-closed rehydration (NC-9 — the engine never trusts the projection).** Before composing any
+  spend the engine (a) asserts the parsed option's launcher id equals the retained handle's launcher
+  id (rejecting a substituted option), then (b) `dig_options::rehydrate`s the terms, which
+  independently re-derives + checks the option's three on-chain commitments — the 1-of-2
+  exercise/clawback path, the underlying delegated-puzzle hash, and the underlying-coin-id binding —
+  so a tampered underlying coin, a wrong strike, or a wrong term is rejected. The authorizing key is
+  the PARSED option's current `p2_puzzle_hash` (the current owner), not the handle's original owner;
+  a wallet that holds no key for it is not the current owner and cannot operate the option.
+- **Exercise strike funding + fee.** The strike is funded from a single spendable XCH coin AT the
+  option's current-owner puzzle hash covering the strike; its excess over the strike is an implicit
+  fee bounded above by the caller's `fee` (the exercise path has no change output, mirroring mint).
+  **Transfer fee.** `dig_options::transfer` spends only the 1-mojo singleton and takes no fee; a
+  requested farmer fee is honoured with a SEPARATE engine-side fee-coin spend linked to the singleton
+  via `assert_concurrent_spend` (atomic; never silently dropped).
 
 ### 3b. Tips — $DIG tipping actions (`engine::build_tips`)
 

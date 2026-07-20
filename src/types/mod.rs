@@ -30,8 +30,8 @@ pub use offer::{
     RequestedAssets, SummarizeOfferRequest, SummaryAsset, TakeOfferRequest,
 };
 pub use options::{
-    ExerciseOptionRequest, MintOptionRequest, MintedOption, OptionHandle, OptionStrike,
-    TransferOptionRequest,
+    ExerciseOptionRequest, MintOptionRequest, MintedOption, OptionHandle, OptionOnChainState,
+    OptionStrike, TransferOptionRequest, WireCoin,
 };
 pub use request::{SendCatRequest, SendXchRequest};
 pub use spend::{RequiredSignature, SignedBundle, UnsignedSpend};
