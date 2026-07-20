@@ -74,9 +74,9 @@ pub trait SpendInputs: Send + Sync {
 /// Holds only PUBLIC material: the injected [`SpendInputs`] provider, the network (for the
 /// aggregate-signature domain), and the coin-count cap selection is bounded by. No secret key.
 pub struct SdkSpendBuilder {
-    inputs: Arc<dyn SpendInputs>,
-    network: Network,
-    coin_cap: usize,
+    pub(crate) inputs: Arc<dyn SpendInputs>,
+    pub(crate) network: Network,
+    pub(crate) coin_cap: usize,
 }
 
 impl SdkSpendBuilder {
@@ -91,7 +91,7 @@ impl SdkSpendBuilder {
 
     /// The aggregate-signature domain for the builder's network (the AGG_SIG_ME additional data
     /// each required signature is bound to).
-    fn agg_sig_constants(&self) -> AggSigConstants {
+    pub(crate) fn agg_sig_constants(&self) -> AggSigConstants {
         // Sourced from `dig-constants` — the SAME constant the client signer binds to
         // (`crate::client::signer`), so the message the engine builds and the message the signer
         // will accept are byte-identical by construction (no hand-copied hex to drift). The
@@ -152,7 +152,7 @@ impl SdkSpendBuilder {
     /// Runs each puzzle through chia-wallet-sdk's [`RequiredSignature`] extractor (no secret
     /// key), producing the `(public_key, message)` pairs the client signer must satisfy. A
     /// standard/CAT spend is BLS-only; a secp requirement is unexpected and rejected fail-closed.
-    fn required_signatures(
+    pub(crate) fn required_signatures(
         &self,
         coin_spends: &[CoinSpend],
     ) -> WalletResult<Vec<RequiredSignature>> {
@@ -430,7 +430,7 @@ fn assert_conserved(inputs: u64, outputs: u64, fee: u64) -> WalletResult<()> {
 
 /// Fail-closed structural check: a real spend produces coin spends AND requires at least one
 /// signature. A signatureless "unsigned" spend would broadcast to nothing — reject it here.
-fn ensure_signed_offline(
+pub(crate) fn ensure_signed_offline(
     coin_spends: &[CoinSpend],
     required: &[RequiredSignature],
 ) -> WalletResult<()> {
@@ -444,7 +444,7 @@ fn ensure_signed_offline(
 }
 
 /// Shorthand for a [`WalletErrorCode::SpendValidationFailed`] error.
-fn spend_failed(message: impl Into<String>) -> WalletError {
+pub(crate) fn spend_failed(message: impl Into<String>) -> WalletError {
     WalletError::new(WalletErrorCode::SpendValidationFailed, message)
 }
 
