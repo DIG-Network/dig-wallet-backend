@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.12.1] - 2026-07-20
+
+### Bug Fixes
+- **engine:** Auto-tip decides before resolving inputs, so a disabled/capped tip on a wallet with no spendable CAT skips instead of erroring `InsufficientFunds` (SPEC §3b); summary sources its amount from the decision (#1310)
+
+### Documentation
+- SPEC: consumer MUST atomically persist the `TipLedger`; options mint summary is review-UX (signed `coin_spends` authoritative); drop stale version labels (#1310)
+
 ## [0.12.0] - 2026-07-20
 
 ### Features

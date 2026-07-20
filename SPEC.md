@@ -278,13 +278,21 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   guarded, honest auto-tip), composing the canonical `dig-tips` (`build_tip` / `build_tip_if_allowed`)
   builders, returning UNSIGNED results. A tip is a single CAT payment; `required_signatures` come from
   the SAME key-free path as every other spend. The builder resolves the input CATs to a SINGLE
-  authorizing key (the largest key-controlled p2 group) — a v0.9.0 single-key tip.
+  authorizing key (the largest key-controlled p2 group) — a single-key tip.
 - **The honest auto-tip (§6.0 $DIG North Star).** `build_auto_tip` runs the capped decision FIRST
   against the `AutoTipPolicy` (enabled, mode, per-tip amount, per-day count + amount caps) and today's
-  `TipLedger`; it builds a spend ONLY when the decision is `TipDecision::Tip`, and builds NOTHING on
-  any skip (disabled, below threshold, not approved, cap reached). A capped/declined tip can therefore
-  never be constructed — the default-on money movement is honest, capped, and one-flag-off, and never
-  gates consuming content.
+  `TipLedger`, BEFORE resolving any tip inputs; it builds a spend ONLY when the decision is
+  `TipDecision::Tip`, and builds NOTHING on any skip (disabled, below threshold, not approved, cap
+  reached). Because the decision is made before inputs are resolved, a disabled/capped auto-tip on a
+  wallet with no spendable CAT returns its honest Skip outcome — never a spurious `InsufficientFunds`.
+  A capped/declined tip can therefore never be constructed — the default-on money movement is honest,
+  capped, and one-flag-off, and never gates consuming content.
+- **The caps are only as strong as the consumer's ledger persistence.** The engine is STATELESS with
+  respect to the `TipLedger`: it decides against the snapshot the consumer supplies but does not itself
+  record that a tip fired. The CONSUMER therefore MUST atomically persist the updated `TipLedger`
+  (advancing the per-day count + amount) before or in the same durable transaction as broadcasting the
+  signed tip — otherwise a crash between broadcast and persistence lets the same daily budget be spent
+  again, silently exceeding the honest ceiling. The per-day caps hold only under that atomic persistence.
 
 ### 3c. Offers — Chia offer actions (`engine::build_offer`)
 

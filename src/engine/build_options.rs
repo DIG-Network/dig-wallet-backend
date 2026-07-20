@@ -145,6 +145,11 @@ impl OptionBuilder for SdkSpendBuilder {
             funding_coin_id: hex::encode(funding_coin.coin_id()),
         };
 
+        // Review-UX only: the summary models the locked underlying as a plain output to `owner_ph`
+        // so a reviewer sees the amount + destination at a glance. The AUTHORITATIVE spend is the
+        // signed `coin_spends` above (the underlying is locked into the option singleton's puzzle,
+        // not sent as a bare payment) — the summary is a human-readable projection, never the source
+        // of truth for what is signed.
         let unsigned = UnsignedSpend {
             coin_spends,
             required_signatures,
@@ -432,7 +437,7 @@ impl SdkSpendBuilder {
     }
 }
 
-/// Map an [`OptionStrike`] wire value to the SDK's `OptionType` (XCH-only in v0.9.0).
+/// Map an [`OptionStrike`] wire value to the SDK's `OptionType` (XCH-only for now).
 fn strike_to_option_type(strike: &OptionStrike) -> OptionType {
     match strike {
         OptionStrike::Xch { amount } => OptionType::Xch {
@@ -441,7 +446,7 @@ fn strike_to_option_type(strike: &OptionStrike) -> OptionType {
     }
 }
 
-/// The strike amount in mojos (XCH-only in v0.9.0).
+/// The strike amount in mojos (XCH-only for now).
 fn strike_amount_mojos(strike: &OptionStrike) -> u64 {
     match strike {
         OptionStrike::Xch { amount } => amount.mojos(),
