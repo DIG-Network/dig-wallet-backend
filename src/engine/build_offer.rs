@@ -29,8 +29,8 @@ use indexmap::IndexMap;
 
 use dig_offers::{
     cancel_build, combine as combine_offers, decode as decode_offer_bundle, make_assemble,
-    make_build, summarize as summarize_offer, take_build, take_combine, OfferAsset, OfferCost,
-    OfferedSide, RequestedSide, SpendContext, TakerFunds,
+    make_build, offer_id as offer_id_of, summarize as summarize_offer, take_build, take_combine,
+    OfferAsset, OfferCost, OfferedSide, RequestedSide, SpendContext, TakerFunds,
 };
 
 use crate::types::{
@@ -41,7 +41,9 @@ use crate::types::{
     WalletError, WalletErrorCode, WalletResult,
 };
 
-use super::build::{ensure_signed_offline, spend_failed, SdkSpendBuilder, SpendInputs};
+use super::build::{
+    ensure_signed_offline, select_or_fail, spend_failed, SdkSpendBuilder, SpendInputs,
+};
 use super::offer_state::{MakeIntermediate, PendingOffers, TakeIntermediate};
 
 /// Builds unsigned offer spends and assembles signed ones — the engine-side offers surface.
@@ -127,7 +129,7 @@ impl OfferBuilder {
             requested_asset_info,
         )
         .map_err(map_offer_error)?;
-        Ok(OfferString { offer })
+        finish_offer_string(offer)
     }
 
     // --- take: build → (client signs) → finalize ------------------------------------------------
@@ -204,7 +206,7 @@ impl OfferBuilder {
         let CombineOffersRequest { offers } = request;
         let refs: Vec<&str> = offers.iter().map(String::as_str).collect();
         let offer = combine_offers(&refs).map_err(map_offer_error)?;
-        Ok(OfferString { offer })
+        finish_offer_string(offer)
     }
 
     /// Summarize an offer's two sides + economics (pure; no wallet state).
@@ -212,6 +214,7 @@ impl OfferBuilder {
         let SummarizeOfferRequest { offer } = request;
         let summary = summarize_offer(&offer).map_err(map_offer_error)?;
         Ok(OfferSummary {
+            offer_id: compute_offer_id(&offer)?,
             offered: summary.offered.iter().map(map_offer_asset).collect(),
             requested: summary.requested.iter().map(map_offer_asset).collect(),
             arbitrage: cost_to_assets(&summary.arbitrage),
@@ -299,9 +302,19 @@ impl OfferBuilder {
         cost: &OfferCost,
         fee: u64,
     ) -> WalletResult<TakerFunds<'a>> {
+        // Taker fund selection shares engine::selection::select_for_spend (via select_or_fail) with
+        // ordinary XCH/CAT sends, so an over-cap taker selection reports NeedsConsolidation exactly
+        // as a send does — no bespoke greedy path that would diverge from that contract.
+        let cap = self.builder.coin_cap;
+
         let xch_target = cost.xch.saturating_add(fee);
         let xch_coins = if xch_target > 0 {
-            select_xch(&self.inputs().spendable_xch(identity)?, xch_target)?
+            select_or_fail(
+                &self.inputs().spendable_xch(identity)?,
+                xch_target,
+                cap,
+                "XCH (take)",
+            )?
         } else {
             Vec::new()
         };
@@ -310,7 +323,7 @@ impl OfferBuilder {
         for (asset, need) in &cost.cats {
             let asset_id = AssetId(hex::encode(asset));
             let available = self.inputs().spendable_cat(identity, &asset_id)?;
-            cat_coins.extend(select_cats(&available, *asset, *need)?);
+            cat_coins.extend(select_cats(&available, *asset, *need, cap)?);
         }
 
         let owner_keys = self.owner_keys_for(&xch_coins, &cat_coins)?;
@@ -347,6 +360,11 @@ impl OfferBuilder {
     ///
     /// Used by cancel: the offered coins are no longer "spendable" state (they are committed to the
     /// offer), but the wallet still holds the synthetic key for their standard-layer puzzle hash.
+    ///
+    /// Fail-closed on an UNOWNED offer: if the wallet holds NO key for ANY of the offer's committed
+    /// coins, it cannot be the offer's maker, so cancel is refused with a clear error rather than
+    /// silently returning an empty key map (which would yield a non-signable, un-broadcastable
+    /// unsigned spend — a footgun the caller can't distinguish from a real cancel).
     fn owner_keys_for_offer(&self, offer: &str) -> WalletResult<IndexMap<Bytes32, PublicKey>> {
         let bundle = decode_offer_bundle(offer).map_err(map_offer_error)?;
         let mut owner_keys = IndexMap::new();
@@ -355,6 +373,13 @@ impl OfferBuilder {
             if let Some(key) = self.inputs().synthetic_key(puzzle_hash) {
                 owner_keys.insert(puzzle_hash, key);
             }
+        }
+        if owner_keys.is_empty() {
+            return Err(spend_failed(
+                "cannot cancel this offer: the wallet holds no standard-layer key for any of its \
+                 offered coins (not the offer's maker, or a CAT/NFT offer whose coins must be \
+                 reclaimed through their native layer)",
+            ));
         }
         Ok(owner_keys)
     }
@@ -375,6 +400,17 @@ impl OfferBuilder {
         owner_keys.insert(puzzle_hash, key);
         Ok(())
     }
+}
+
+/// Wrap a finished `offer1…` string with its stable ecosystem id for the wire response.
+fn finish_offer_string(offer: String) -> WalletResult<OfferString> {
+    let offer_id = compute_offer_id(&offer)?;
+    Ok(OfferString { offer, offer_id })
+}
+
+/// The offer's stable, ecosystem-wide id (`sha256` of the uncompressed bundle) as lowercase hex.
+fn compute_offer_id(offer: &str) -> WalletResult<String> {
+    offer_id_of(offer).map(hex::encode).map_err(map_offer_error)
 }
 
 /// Resolve the requested side (what the taker pays) from its wire form.
@@ -482,52 +518,27 @@ fn cost_to_assets(cost: &OfferCost) -> Vec<SummaryAsset> {
     assets
 }
 
-/// Greedily select XCH coins (largest first) covering `need`, fail-closed on insufficient funds.
-fn select_xch(coins: &[Coin], need: u64) -> WalletResult<Vec<Coin>> {
-    let mut sorted = coins.to_vec();
-    sorted.sort_by_key(|coin| std::cmp::Reverse(coin.amount));
-    let mut chosen = Vec::new();
-    let mut sum = 0u64;
-    for coin in sorted {
-        if sum >= need {
-            break;
-        }
-        sum = sum.saturating_add(coin.amount);
-        chosen.push(coin);
-    }
-    if sum < need {
-        return Err(WalletError::new(
-            WalletErrorCode::InsufficientFunds,
-            format!("insufficient XCH to take: need {need}, have {sum}"),
-        ));
-    }
-    Ok(chosen)
-}
-
-/// Greedily select CAT coins of `asset` (largest first) covering `need`, fail-closed on shortfall.
-fn select_cats(coins: &[Cat], asset: Bytes32, need: u64) -> WalletResult<Vec<Cat>> {
-    let mut sorted: Vec<Cat> = coins
+/// Select CAT coins of `asset` covering `need`, sharing the capped high-value-first selection
+/// (and its NeedsConsolidation/InsufficientFunds distinction) that XCH/CAT sends use.
+///
+/// The shared [`select_or_fail`] operates on plain [`Coin`]s, so selection runs over the CATs'
+/// underlying coins; the chosen coin ids are then mapped back to their [`Cat`]s (with lineage
+/// proofs) for dig-offers to spend.
+fn select_cats(coins: &[Cat], asset: Bytes32, need: u64, cap: usize) -> WalletResult<Vec<Cat>> {
+    let of_asset: Vec<Cat> = coins
         .iter()
         .filter(|cat| cat.info.asset_id == asset)
         .copied()
         .collect();
-    sorted.sort_by_key(|cat| std::cmp::Reverse(cat.coin.amount));
-    let mut chosen = Vec::new();
-    let mut sum = 0u64;
-    for cat in sorted {
-        if sum >= need {
-            break;
-        }
-        sum = sum.saturating_add(cat.coin.amount);
-        chosen.push(cat);
-    }
-    if sum < need {
-        return Err(WalletError::new(
-            WalletErrorCode::InsufficientFunds,
-            format!("insufficient CAT {asset} to take: need {need}, have {sum}"),
-        ));
-    }
-    Ok(chosen)
+    let underlying: Vec<Coin> = of_asset.iter().map(|cat| cat.coin).collect();
+    let selected = select_or_fail(&underlying, need, cap, &format!("CAT {asset} (take)"))?;
+
+    let chosen_ids: std::collections::HashSet<Bytes32> =
+        selected.iter().map(Coin::coin_id).collect();
+    Ok(of_asset
+        .into_iter()
+        .filter(|cat| chosen_ids.contains(&cat.coin.coin_id()))
+        .collect())
 }
 
 /// Parse a 32-byte CAT asset id (TAIL hash) from its lowercase-hex wire form.
@@ -829,6 +840,207 @@ mod tests {
     }
 
     // --- unit tests: fail-closed edges ----------------------------------------------------------
+
+    /// Cancelling an offer the wallet does NOT own fails closed with a clear error, rather than
+    /// silently producing an empty/non-signable unsigned spend (the #1122 custody-adjacent finding).
+    #[test]
+    fn cancel_of_an_unowned_offer_is_rejected() {
+        let mut sim = Simulator::new();
+        let maker = sim.bls(50_000);
+        let stranger = sim.bls(50_000);
+        let cat_owner = sim.bls(0);
+        let (_cat, asset) = issue_cat_to(&mut sim, &cat_owner, 1_000);
+
+        // The maker builds + assembles a real XCH-for-CAT offer.
+        let maker_builder = builder_for(&maker, vec![maker.coin], vec![]);
+        let pending = maker_builder
+            .build_make(MakeOfferRequest {
+                identity: identity(),
+                offered: OfferedAssets {
+                    xch: Amount(50_000),
+                    cats: vec![],
+                },
+                requested: RequestedAssets {
+                    xch: Amount(0),
+                    cats: vec![(AssetId(hex::encode(asset)), Amount(1_000))],
+                    payee: xch_address(maker.puzzle_hash),
+                },
+                fee: Amount(0),
+            })
+            .unwrap();
+        let signed = client_sign(&pending.unsigned.coin_spends, &maker);
+        let offer = maker_builder
+            .assemble_make(AssembleOfferRequest {
+                build_id: pending.build_id,
+                signed,
+            })
+            .unwrap();
+
+        // A DIFFERENT wallet (no key for the maker's offered coin) must NOT be able to cancel it.
+        let stranger_builder = builder_for(&stranger, vec![stranger.coin], vec![]);
+        let err = stranger_builder
+            .build_cancel(CancelOfferRequest {
+                identity: identity(),
+                offer: offer.offer,
+                fee: Amount(0),
+            })
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            WalletErrorCode::SpendValidationFailed,
+            "an unowned cancel must fail closed, not return a non-signable spend"
+        );
+    }
+
+    /// The CAT-offer cancel path (previously untested): a CAT-offered coin must be reclaimed through
+    /// its native layer, which this standard-layer cancel does not build — so it fails closed rather
+    /// than emitting an unsignable spend from an empty owner-key map.
+    #[test]
+    fn cancel_of_a_cat_offer_is_rejected() {
+        let mut sim = Simulator::new();
+        let maker = sim.bls(0);
+        let (maker_cat, asset) = issue_cat_to(&mut sim, &maker, 1_000);
+
+        // maker offers a CAT, requesting XCH (no self-fund — the maker holds only the CAT).
+        let maker_builder = builder_for(&maker, vec![], vec![maker_cat]);
+        let pending = maker_builder
+            .build_make(MakeOfferRequest {
+                identity: identity(),
+                offered: OfferedAssets {
+                    xch: Amount(0),
+                    cats: vec![(AssetId(hex::encode(asset)), Amount(1_000))],
+                },
+                requested: RequestedAssets {
+                    xch: Amount(50_000),
+                    cats: vec![],
+                    payee: xch_address(maker.puzzle_hash),
+                },
+                fee: Amount(0),
+            })
+            .unwrap();
+        let signed = client_sign(&pending.unsigned.coin_spends, &maker);
+        let offer = maker_builder
+            .assemble_make(AssembleOfferRequest {
+                build_id: pending.build_id,
+                signed,
+            })
+            .unwrap();
+
+        let err = maker_builder
+            .build_cancel(CancelOfferRequest {
+                identity: identity(),
+                offer: offer.offer,
+                fee: Amount(0),
+            })
+            .unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    /// A make/summarize response carries the offer's stable ecosystem id (#1318 task 4).
+    #[test]
+    fn offer_string_and_summary_carry_the_offer_id() {
+        let mut sim = Simulator::new();
+        let maker = sim.bls(50_000);
+        let cat_owner = sim.bls(0);
+        let (_cat, asset) = issue_cat_to(&mut sim, &cat_owner, 1_000);
+
+        let maker_builder = builder_for(&maker, vec![maker.coin], vec![]);
+        let pending = maker_builder
+            .build_make(MakeOfferRequest {
+                identity: identity(),
+                offered: OfferedAssets {
+                    xch: Amount(50_000),
+                    cats: vec![],
+                },
+                requested: RequestedAssets {
+                    xch: Amount(0),
+                    cats: vec![(AssetId(hex::encode(asset)), Amount(1_000))],
+                    payee: xch_address(maker.puzzle_hash),
+                },
+                fee: Amount(0),
+            })
+            .unwrap();
+        let signed = client_sign(&pending.unsigned.coin_spends, &maker);
+        let offer = maker_builder
+            .assemble_make(AssembleOfferRequest {
+                build_id: pending.build_id,
+                signed,
+            })
+            .unwrap();
+
+        // 32-byte sha256 → 64 hex chars, and it matches summarize's id for the same offer.
+        assert_eq!(offer.offer_id.len(), 64, "offer_id is a 32-byte hex hash");
+        let summary = maker_builder
+            .summarize(SummarizeOfferRequest {
+                offer: offer.offer.clone(),
+            })
+            .unwrap();
+        assert_eq!(summary.offer_id, offer.offer_id, "id is stable per offer");
+    }
+
+    /// A taker whose funds are too fragmented to cover the requested amount within the coin cap
+    /// reports the consolidation shortfall the shared selection produces — the same behaviour a
+    /// plain XCH send has (#1318 task 3: taker selection unified through `select_for_spend`).
+    #[test]
+    fn over_cap_taker_selection_reports_needs_consolidation() {
+        let mut sim = Simulator::new();
+        let maker = sim.bls(0);
+        let (maker_cat, asset) = issue_cat_to(&mut sim, &maker, 1_000);
+        let taker = sim.bls(0);
+
+        // maker offers a CAT, requesting 3 XCH.
+        let maker_builder = builder_for(&maker, vec![], vec![maker_cat]);
+        let pending = maker_builder
+            .build_make(MakeOfferRequest {
+                identity: identity(),
+                offered: OfferedAssets {
+                    xch: Amount(0),
+                    cats: vec![(AssetId(hex::encode(asset)), Amount(1_000))],
+                },
+                requested: RequestedAssets {
+                    xch: Amount(3),
+                    cats: vec![],
+                    payee: xch_address(maker.puzzle_hash),
+                },
+                fee: Amount(0),
+            })
+            .unwrap();
+        let signed = client_sign(&pending.unsigned.coin_spends, &maker);
+        let offer = maker_builder
+            .assemble_make(AssembleOfferRequest {
+                build_id: pending.build_id,
+                signed,
+            })
+            .unwrap();
+
+        // The taker holds 3 XCH total but split across 3 one-mojo coins, under a coin cap of 2:
+        // enough value, too fragmented to reach 3 within the cap → NeedsConsolidation (surfaced as
+        // InsufficientFunds with a "consolidation" message, exactly as a send reports it).
+        let taker_coins: Vec<Coin> = (0..3).map(|_| sim.new_coin(taker.puzzle_hash, 1)).collect();
+        let taker_builder = OfferBuilder::new(
+            Arc::new(TestInputs {
+                xch: taker_coins,
+                cats: vec![],
+                keys: vec![(taker.puzzle_hash, taker.pk)],
+                change: taker.puzzle_hash,
+            }),
+            Network::Simulator,
+            2,
+        );
+        let err = taker_builder
+            .build_take(TakeOfferRequest {
+                identity: identity(),
+                offer: offer.offer,
+                fee: Amount(0),
+            })
+            .unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::InsufficientFunds);
+        assert!(
+            err.message.contains("consolidation"),
+            "over-cap taker selection reports consolidation, not a plain shortfall: {}",
+            err.message
+        );
+    }
 
     #[test]
     fn make_with_nothing_offered_is_rejected() {

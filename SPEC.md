@@ -127,7 +127,10 @@ this layer.**
 - Offer request/response types (the offers surface, §3c): `MakeOfferRequest`, `AssembleOfferRequest`,
   `TakeOfferRequest`, `FinalizeTakeRequest`, `CancelOfferRequest`, `CombineOffersRequest`,
   `SummarizeOfferRequest`, and the responses `PendingOfferBuild { build_id, unsigned }`,
-  `OfferString { offer }`, `OfferSummary`, plus the opaque handle `OfferBuildId`. All are pure serde
+  `OfferString { offer, offer_id }`, `OfferSummary` (which also carries `offer_id`), plus the opaque
+  handle `OfferBuildId`. `offer_id` is the offer's stable ecosystem id — `sha256` of the uncompressed
+  offer bundle as lowercase hex (the same value dexie, Sage, and Chia's `Offer.name()` use), so a
+  consumer keys/tracks an offer by it independent of the bech32 compression. All are pure serde
   data — NO chia-wallet-sdk allocator type (`Offer`/`RequestedPayments`/`AssetInfo`/`SpendContext`)
   ever crosses the seam; the non-serializable build state stays engine-side (§3c).
 
@@ -313,15 +316,22 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   (300 s) so an abandoned build cannot leak memory. No key material is ever parked.
   - **Make** (`build_make` → sign → `assemble_make`): `MakeOfferRequest { identity, offered,
     requested, fee }` → `PendingOfferBuild { build_id, unsigned }`; then `AssembleOfferRequest {
-    build_id, signed }` → `OfferString { offer }` (the `offer1…` string, via `encode_offer`).
+    build_id, signed }` → `OfferString { offer, offer_id }` (the `offer1…` string, via
+    `encode_offer`, plus the offer's stable id).
   - **Take** (`build_take` → sign → `finalize_take`): `TakeOfferRequest { identity, offer, fee }` →
     `PendingOfferBuild`; then `FinalizeTakeRequest { build_id, signed }` → `SignedBundle` — the
-    atomic settlement bundle, broadcastable but NEVER auto-pushed (the caller broadcasts it).
+    atomic settlement bundle, broadcastable but NEVER auto-pushed (the caller broadcasts it). The
+    taker's XCH/CAT fund selection shares `engine::selection::select_for_spend` with ordinary sends,
+    so an over-cap taker selection reports `NeedsConsolidation` (surfaced as `insufficient_funds`
+    with a consolidation message) identically to a send.
   - **Cancel** (single build call): `CancelOfferRequest { identity, offer, fee }` → `UnsignedSpend`,
-    signed + broadcast through the ordinary spend path (same shape as a send).
-  - **Combine** (pure): `CombineOffersRequest { offers }` → `OfferString`.
-  - **Summarize** (pure): `SummarizeOfferRequest { offer }` → `OfferSummary { offered, requested,
-    arbitrage, royalties }`.
+    signed + broadcast through the ordinary spend path (same shape as a send). **Fail-closed:** if
+    the wallet holds no standard-layer key for ANY of the offer's offered coins — it is not the
+    maker, or the offer's coins are CAT/NFT coins reclaimable only through their native layer —
+    cancel returns `spend_validation_failed` rather than an empty, non-signable spend.
+  - **Combine** (pure): `CombineOffersRequest { offers }` → `OfferString { offer, offer_id }`.
+  - **Summarize** (pure): `SummarizeOfferRequest { offer }` → `OfferSummary { offer_id, offered,
+    requested, arbitrage, royalties }`.
 - **No-self-fund invariant.** A make spends ONLY the offered assets; the requested side is an
   assertion, never a settle action — the maker never funds both sides. (Proven by the two-party
   simulator round-trip, where the maker holds ONLY the offered asset yet make succeeds.)

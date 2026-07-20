@@ -11,9 +11,12 @@
 //! `crate::types`) — this module concretizes them for the in-process bridge only
 //! ([`Subscription`], the live broadcast-receiver wrapper).
 
-use enumset::EnumSet;
-
+// Only the `engine`-gated live [`Subscription`] wrapper (and the tests) consume these; a
+// client-only build without the `engine` feature would otherwise flag them as unused imports.
+#[cfg(any(feature = "engine", test))]
 use crate::types::{EmittedEvent, EventKind};
+#[cfg(any(feature = "engine", test))]
+use enumset::EnumSet;
 
 /// A live subscription wrapper over the engine's broadcast receiver, applying the kind filter.
 ///
