@@ -55,3 +55,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 - **dig-wallet-backend:** SPEC + shared types + engine/client seam skeleton (#998) (#1)
 
 
+
+## Unreleased
+
+- feat(engine): economic action surface (options/offers/tips) — WIP
