@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet-backend"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.81"
 description = "Canonical event-driven Chia wallet backend for the DIG Network. Exports two carefully-partitioned seams: an `engine` seam (imported by dig-node — the single running wallet instance: state, sync, unsigned-spend construction, event emission; identity-parameterized, never holds a private key) and a `client` seam (used by dig-app — the event subscriber, spend review/decode, the signing interface + identity provider that hold the key). Clean-room, chia-wallet-sdk-based. Replaces dig-l1-wallet."
@@ -23,6 +23,7 @@ engine = [
     "dep:tokio-stream",
     "dep:futures-core",
     "dep:chia-wallet-sdk",
+    "dep:dig-options",
     "dep:clvmr",
     "dep:rusqlite",
 ]
@@ -82,6 +83,12 @@ dig-identity = { version = "0.4", default-features = false, features = ["bls"], 
 # these (§4.1: never hand-rolled CLVM) and NEVER touches the sdk's `SecretKey` path. Default
 # features off so no peer-networking/TLS stack is pulled into the engine build.
 chia-wallet-sdk = { version = "0.30", default-features = false, optional = true }
+# The CANONICAL Chia covered-option (CHIP-0042) CoinSpend builders (create/exercise/clawback +
+# inspect). The engine composes these for the options suite (mint/transfer/exercise, #1123) —
+# NEVER re-implementing option CLVM (§4.1). Pure, key-free, network-free: it builds unsigned
+# spends and reports required signatures, never holding a key or signing (identity boundary #908).
+# Engine-seam only.
+dig-options = { version = "0.1", optional = true }
 # The CLVM allocator RequiredSignature::from_coin_spends threads its parse through.
 clvmr = { version = "0.14", optional = true }
 # The persistent (SQLite) backing for the engine state store + event delta log (#1118). `bundled`

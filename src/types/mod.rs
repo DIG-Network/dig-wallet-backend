@@ -11,6 +11,7 @@
 
 pub mod error;
 pub mod identity;
+pub mod options;
 pub mod request;
 pub mod spend;
 pub mod value;
@@ -21,9 +22,13 @@ pub use dig_events_protocol::{
 };
 pub use error::{WalletError, WalletErrorCode, WalletResult};
 pub use identity::{Did, IdentityRef};
+pub use options::{
+    ExerciseOptionRequest, MintOptionRequest, MintedOption, OptionHandle, OptionStrike,
+    TransferOptionRequest,
+};
 pub use request::{SendCatRequest, SendXchRequest};
 pub use spend::{RequiredSignature, SignedBundle, UnsignedSpend};
 pub use value::{
-    Address, Balance, CatRecord, CoinRecord, DidRecord, Network, NftRecord, SpendOutput,
-    TransactionRecord, TransactionSummary,
+    Address, Balance, CatRecord, CoinRecord, DidRecord, Network, NftRecord, Puzzlehash,
+    SpendOutput, TransactionRecord, TransactionSummary,
 };
