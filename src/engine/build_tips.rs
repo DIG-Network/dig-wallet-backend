@@ -19,9 +19,9 @@ use chia::protocol::Bytes32;
 use chia_wallet_sdk::driver::Cat;
 use dig_cat::CatError;
 use dig_tips::{
-    build_tip, build_tip_if_allowed, AutoTipPolicy as DigAutoTipPolicy, CapReason as DigCapReason,
-    LedgerSnapshot, TipDecision as DigTipDecision, TipMode as DigTipMode,
-    TipRequest as DigTipRequest,
+    build_tip, build_tip_if_allowed, decide_auto_tip, AutoTipPolicy as DigAutoTipPolicy,
+    CapReason as DigCapReason, LedgerSnapshot, TipDecision as DigTipDecision,
+    TipMode as DigTipMode, TipRequest as DigTipRequest,
 };
 
 use crate::types::{
@@ -82,34 +82,53 @@ impl TipBuilder for SdkSpendBuilder {
 
         let asset_id = policy.asset_id.clone();
         let recipient_ph = parse_puzzle_hash(&policy.recipient)?;
-        let inputs = self.resolve_tip_inputs(&identity, &asset_id)?;
-        let dig_policy = to_dig_policy(&policy, recipient_ph, inputs.asset_id)?;
+        let asset = parse_asset_id(&asset_id)?;
+        let dig_policy = to_dig_policy(&policy, recipient_ph, asset)?;
+        let snapshot = LedgerSnapshot {
+            tips_today: ledger.tips_today,
+            amount_today: ledger.amount_today.mojos(),
+        };
 
-        let (decision, spend) = build_tip_if_allowed(
+        // SPEC §3b: the capped decision runs FIRST. A disabled / below-threshold / capped auto-tip
+        // must skip WITHOUT touching funds — so a switched-off tip on a wallet with no spendable CAT
+        // returns the honest Skip outcome, never a spurious InsufficientFunds. Only a `Tip` decision
+        // resolves inputs and builds a spend, so the cap can never be bypassed (nothing is built on a
+        // skip) and consuming content is never gated by a tip's funding.
+        let decision = decide_auto_tip(&dig_policy, primary_send_amount.mojos(), &snapshot);
+        let DigTipDecision::Tip { amount } = decision else {
+            return Ok(AutoTipOutcome {
+                decision: from_dig_decision(decision),
+                unsigned: None,
+            });
+        };
+
+        let inputs = self.resolve_tip_inputs(&identity, &asset_id)?;
+        let (built_decision, spend) = build_tip_if_allowed(
             &dig_policy,
             primary_send_amount.mojos(),
-            &LedgerSnapshot {
-                tips_today: ledger.tips_today,
-                amount_today: ledger.amount_today.mojos(),
-            },
+            &snapshot,
             inputs.cats,
             inputs.owner_pk,
             inputs.change_puzzle_hash,
         )
         .map_err(map_tip_error)?;
 
+        // The re-decide inside `build_tip_if_allowed` is deterministic over the same inputs, so it
+        // agrees with the short-circuit decision above; source the summary amount from the returned
+        // decision (not the policy) so a future partial/remaining-cap tip is reported honestly.
+        debug_assert_eq!(built_decision, decision);
         let unsigned = match spend {
             Some(cat_spend) => Some(self.finish_tip(
                 cat_spend.coin_spends,
                 recipient_ph,
-                Amount(dig_policy.tip_amount),
+                Amount(amount),
                 asset_id,
             )?),
             None => None,
         };
 
         Ok(AutoTipOutcome {
-            decision: from_dig_decision(decision),
+            decision: from_dig_decision(built_decision),
             unsigned,
         })
     }
@@ -130,7 +149,7 @@ impl SdkSpendBuilder {
     /// the change puzzle hash.
     ///
     /// Groups the wallet's CATs by inner (p2) puzzle hash, keeps only groups the wallet holds a key
-    /// for, and picks the largest such group — a v0.9.0 single-key tip. Fail-closed:
+    /// for, and picks the largest such group — a single-key tip. Fail-closed:
     /// [`WalletErrorCode::InsufficientFunds`] when no spendable, key-controlled CAT of the asset
     /// exists.
     fn resolve_tip_inputs(
@@ -549,6 +568,49 @@ mod tests {
         );
         let spend = outcome.unsigned.expect("a Tip decision must build a spend");
         assert_eq!(spend.summary.outputs[0].amount, Amount(1_000));
+    }
+
+    /// A disabled auto-tip MUST decide-first (SPEC §3b): it returns `SkipDisabled` even on a wallet
+    /// with ZERO spendable CAT — the capped/disabled decision never needs, and never touches, funds.
+    /// Regression for the ordering bug where `resolve_tip_inputs` ran first and turned a disabled tip
+    /// on an empty wallet into a spurious `InsufficientFunds` error.
+    #[tokio::test]
+    async fn disabled_auto_tip_on_empty_wallet_skips_without_needing_funds() {
+        let disabled = AutoTipPolicy {
+            enabled: false,
+            ..policy(AssetId(hex::encode(ASSET)))
+        };
+        let outcome =
+            builder(vec![]) // zero spendable CAT
+                .build_auto_tip(auto_request(disabled, 100_000, TipLedger::default()))
+                .await
+                .expect("a disabled auto-tip must skip, not error on missing funds");
+        assert_eq!(outcome.decision, TipDecision::SkipDisabled);
+        assert!(outcome.unsigned.is_none());
+    }
+
+    /// A capped auto-tip likewise decides first: a wallet at its amount cap with no spendable CAT
+    /// returns the cap skip, never `InsufficientFunds`.
+    #[tokio::test]
+    async fn capped_auto_tip_on_empty_wallet_skips_without_needing_funds() {
+        let outcome = builder(vec![]) // zero spendable CAT
+            .build_auto_tip(auto_request(
+                policy(AssetId(hex::encode(ASSET))),
+                100_000,
+                TipLedger {
+                    tips_today: 0,
+                    amount_today: Amount(4_500), // 4_500 + 1_000 > 5_000 cap
+                },
+            ))
+            .await
+            .expect("a capped auto-tip must skip, not error on missing funds");
+        assert_eq!(
+            outcome.decision,
+            TipDecision::SkipCapReached {
+                reason: CapReason::Amount
+            }
+        );
+        assert!(outcome.unsigned.is_none());
     }
 
     #[tokio::test]

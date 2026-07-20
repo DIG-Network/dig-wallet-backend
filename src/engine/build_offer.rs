@@ -15,7 +15,7 @@
 //! intermediate is parked in [`super::offer_state::PendingOffers`] between the two calls, keyed by
 //! an opaque [`OfferBuildId`]; only that id and the [`UnsignedSpend`] cross the wire.
 //!
-//! # Scope (v0.11.0)
+//! # Scope
 //! XCH↔CAT offers. NFT offer legs are deferred (they need spendable-NFT resolution through the
 //! input provider); `$DIG` is a CAT, so the CAT legs cover the #1122 value flow.
 
