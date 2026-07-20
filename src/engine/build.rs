@@ -341,9 +341,10 @@ impl SdkSpendBuilder {
         Ok(cat_spends)
     }
 
-    /// Pay a CAT-send `fee` from the wallet's XCH coins, linked to the CAT ring via
-    /// `assert_concurrent_spend` so the fee is spent atomically with the CAT send.
-    fn add_xch_fee(
+    /// Pay a `fee` from the wallet's XCH coins, linked to a lead coin via `assert_concurrent_spend`
+    /// so the fee is spent atomically with it. Used to attach a farmer fee to a spend whose builder
+    /// takes no fee of its own (the CAT ring; an option transfer).
+    pub(crate) fn add_xch_fee(
         &self,
         ctx: &mut SpendContext,
         identity: &IdentityRef,

@@ -7,27 +7,33 @@
 //! and the required signatures are extracted key-free through the same
 //! [`SdkSpendBuilder::required_signatures`] path the XCH/CAT builders use.
 //!
-//! # Scope (v0.9.0)
-//! **Mint** is fully wired over `dig_options::create`. **Transfer** and **exercise** have their
-//! seam types + validation in place but return [`WalletErrorCode::NotImplemented`] pending two
-//! `dig-options` additions (release-first, §4.1), because building them without hand-rolling
-//! option internals requires crate support that 0.1.0 does not expose:
-//! - **transfer** needs a `dig_options::transfer` builder over `OptionContract::transfer`
-//!   (the SDK has the method; `dig-options` 0.1.0 does not expose a builder for it);
-//! - **exercise** needs to reconstruct `dig_options::CreatedOption` from on-chain state, which
-//!   needs a `dig-options` rehydration helper (`parse` alone cannot recover an option's terms).
+//! # Scope
+//! All three actions — **mint**, **transfer**, **exercise** — are fully wired over `dig-options`
+//! v0.2.0. Mint composes `dig_options::create`; transfer + exercise compose
+//! `dig_options::{parse_child, rehydrate, transfer, exercise}`.
 //!
-//! The wire surface exists now so consumers can code against it and the two ops light up when the
-//! `dig-options` builders land — no consumer-facing shape change.
+//! ## The on-chain-projection seam (transfer + exercise)
+//! The engine is chain-agnostic and key-free (#908): it cannot fetch an option's live singleton or
+//! recover a `dig_options::CreatedOption` on its own. So a chain-reading CLIENT supplies the option's
+//! current on-chain state as an [`OptionOnChainState`] projection — the option singleton's current
+//! parent spend (its coin + serialized puzzle reveal + solution) plus the locked-underlying coin.
+//! The engine decodes it, `parse_child`s the live option, and `rehydrate`s + VERIFIES its terms
+//! fail-closed against the retained [`OptionHandle`] before composing the spend (see
+//! [`SdkSpendBuilder::rehydrate_option`]). The engine never trusts the projection blindly (NC-9):
+//! a substituted option, a tampered underlying coin, or a wrong strike/term is rejected.
 
 use async_trait::async_trait;
-use chia::protocol::{Bytes32, Coin};
-use dig_options::{create, OptionTerms, OptionType, Owner, SpendContext};
+use chia::bls::PublicKey;
+use chia::protocol::{Bytes32, Coin, Program};
+use dig_options::{
+    create, exercise, parse_child, rehydrate, transfer, CreatedOption, OptionTerms, OptionType,
+    Owner, RehydratedTerms, SpendContext, StrikePayment,
+};
 
 use crate::types::{
-    Amount, ExerciseOptionRequest, MintOptionRequest, MintedOption, OptionHandle, OptionStrike,
-    Puzzlehash, SpendOutput, TransactionSummary, TransferOptionRequest, UnsignedSpend, WalletError,
-    WalletErrorCode, WalletResult,
+    Amount, ExerciseOptionRequest, IdentityRef, MintOptionRequest, MintedOption, OptionHandle,
+    OptionOnChainState, OptionStrike, Puzzlehash, SpendOutput, TransactionSummary,
+    TransferOptionRequest, UnsignedSpend, WalletError, WalletErrorCode, WalletResult, WireCoin,
 };
 
 use super::build::{ensure_signed_offline, spend_failed, SdkSpendBuilder};
@@ -159,24 +165,119 @@ impl OptionBuilder for SdkSpendBuilder {
         &self,
         request: TransferOptionRequest,
     ) -> WalletResult<UnsignedSpend> {
-        // Validate inputs so the request shape is exercised even before the builder lands.
-        parse_puzzle_hash(&request.to_puzzle_hash)?;
-        Err(WalletError::new(
-            WalletErrorCode::NotImplemented,
-            "option transfer requires a dig_options::transfer builder (release-first, #1123)",
-        ))
+        let TransferOptionRequest {
+            identity,
+            handle,
+            on_chain,
+            to_puzzle_hash,
+            fee,
+        } = request;
+        let destination = parse_puzzle_hash(&to_puzzle_hash)?;
+
+        // Rehydrate + verify the option from its on-chain projection, fail-closed against the
+        // handle (NC-9). `holder_key` authorizes the CURRENT owner's singleton spend.
+        let mut ctx = SpendContext::new();
+        let (created, holder_key) = self.rehydrate_option(&mut ctx, &handle, &on_chain)?;
+
+        // `dig_options::transfer` re-homes only the singleton (the underlying + terms are
+        // unchanged) and rejects a `holder_key` that is not the option's current owner.
+        let transferred = transfer(
+            &mut ctx,
+            &Owner::Standard(holder_key),
+            &created,
+            destination,
+        )
+        .map_err(map_options_error)?;
+        let mut coin_spends = transferred.coin_spends;
+
+        // `dig_options::transfer` takes no fee (it spends only the 1-mojo singleton). A requested
+        // farmer fee is honoured with a SEPARATE engine-side fee-coin spend, linked to the
+        // singleton via `assert_concurrent_spend` so it is atomic with the transfer — never
+        // silently dropped.
+        let fee = fee.mojos();
+        if fee > 0 {
+            let change_ph = self.inputs.change_puzzle_hash(&identity)?;
+            let singleton_id = created.option.coin.coin_id();
+            self.add_xch_fee(&mut ctx, &identity, fee, change_ph, singleton_id)?;
+            coin_spends.extend(ctx.take());
+        }
+
+        let required_signatures = self.required_signatures(&coin_spends)?;
+        ensure_signed_offline(&coin_spends, &required_signatures)?;
+
+        Ok(UnsignedSpend {
+            coin_spends,
+            required_signatures,
+            summary: TransactionSummary {
+                outputs: vec![SpendOutput {
+                    address: encode_address(destination)?,
+                    amount: Amount(created.option.coin.amount),
+                    asset_id: None,
+                }],
+                fee: Amount(fee),
+            },
+        })
     }
 
     async fn build_exercise_option(
         &self,
         request: ExerciseOptionRequest,
     ) -> WalletResult<UnsignedSpend> {
-        parse_puzzle_hash(&request.handle.owner_puzzle_hash)?;
-        Err(WalletError::new(
-            WalletErrorCode::NotImplemented,
-            "option exercise requires a dig_options CreatedOption rehydration helper \
-             (release-first, #1123)",
-        ))
+        let ExerciseOptionRequest {
+            identity,
+            handle,
+            on_chain,
+            fee,
+        } = request;
+        // Keep the early handle validation so a malformed request fails before any chain decode.
+        parse_puzzle_hash(&handle.owner_puzzle_hash)?;
+        let strike_amount = strike_amount_mojos(&handle.strike);
+
+        // Rehydrate + verify the option from its on-chain projection, fail-closed (NC-9).
+        let mut ctx = SpendContext::new();
+        let (created, holder_key) = self.rehydrate_option(&mut ctx, &handle, &on_chain)?;
+
+        // Fund the XCH strike from a coin the CURRENT owner controls (at the option's live p2
+        // puzzle hash). `dig_options::exercise` emits only `create_coin(SETTLEMENT, strike)` from
+        // this coin with no change output, so its excess over the strike is an implicit fee —
+        // bounded above by the caller's `fee` (mirrors the mint path; never burns more than
+        // consented).
+        let p2_puzzle_hash = created.option.info.p2_puzzle_hash;
+        let fee_ceiling = strike_amount
+            .checked_add(fee.mojos())
+            .ok_or_else(|| WalletError::invalid_input("strike + fee overflows"))?;
+        let funding_coin =
+            self.pick_strike_coin(&identity, p2_puzzle_hash, strike_amount, fee_ceiling)?;
+        let implicit_fee = funding_coin.amount - strike_amount;
+
+        // Build the exercise. Its bundle carries BOTH settlement legs (the underlying claimed back
+        // to the holder AND the strike paid to the creator) in one atomic spend — see the
+        // atomicity conformance test below.
+        let exercised = exercise(
+            &mut ctx,
+            &Owner::Standard(holder_key),
+            &created,
+            &StrikePayment { funding_coin },
+        )
+        .map_err(map_options_error)?;
+
+        let coin_spends = exercised.coin_spends;
+        let required_signatures = self.required_signatures(&coin_spends)?;
+        ensure_signed_offline(&coin_spends, &required_signatures)?;
+
+        Ok(UnsignedSpend {
+            coin_spends,
+            required_signatures,
+            summary: TransactionSummary {
+                outputs: vec![SpendOutput {
+                    // The unlocked underlying is claimed to the option's current owner (p2).
+                    address: encode_address(p2_puzzle_hash)?,
+                    amount: handle.underlying_amount,
+                    asset_id: None,
+                }],
+                fee: Amount(implicit_fee),
+            },
+        })
     }
 }
 
@@ -223,6 +324,112 @@ impl SdkSpendBuilder {
         }
         Ok(*coin)
     }
+
+    /// Pick the strike-funding coin for an exercise: the smallest spendable XCH coin AT the option's
+    /// current-owner puzzle hash (the exercise authorizes it through that owner's key) covering the
+    /// strike, whose excess over the strike (the implicit fee) does not exceed `fee_ceiling`.
+    ///
+    /// Filtering by `p2_puzzle_hash` is load-bearing: `dig_options::exercise` spends the funding coin
+    /// through the holder's standard layer, so a coin at any other puzzle hash could not be
+    /// authorized by `holder_key`. Fail-closed like [`Self::pick_funding_coin`] — the exercise path
+    /// has no change output, so an oversized-only coin is a split case, not silently over-burned.
+    fn pick_strike_coin(
+        &self,
+        identity: &IdentityRef,
+        p2_puzzle_hash: Bytes32,
+        strike_amount: u64,
+        fee_ceiling: u64,
+    ) -> WalletResult<Coin> {
+        let coins = self.inputs.spendable_xch(identity)?;
+        let smallest_covering = coins
+            .iter()
+            .filter(|c| c.puzzle_hash == p2_puzzle_hash && c.amount >= strike_amount)
+            .min_by_key(|c| c.amount);
+
+        let Some(coin) = smallest_covering else {
+            return Err(WalletError::new(
+                WalletErrorCode::InsufficientFunds,
+                format!(
+                    "no spendable XCH coin at the option owner's puzzle hash covers the strike \
+                     ({strike_amount})"
+                ),
+            ));
+        };
+
+        if coin.amount > fee_ceiling {
+            return Err(WalletError::new(
+                WalletErrorCode::InsufficientFunds,
+                format!(
+                    "smallest strike coin ({}) exceeds strike + max fee ({fee_ceiling}); split a \
+                     coin to that size first (exercise has no change output)",
+                    coin.amount
+                ),
+            ));
+        }
+        Ok(*coin)
+    }
+
+    /// Decode + fail-closed VERIFY an option's on-chain projection into an operable
+    /// [`CreatedOption`], returning it alongside the CURRENT owner's authorizing public key.
+    ///
+    /// This is the shared spine of transfer + exercise. It NEVER trusts the projection (NC-9): it
+    /// `parse_child`s the live option from the supplied parent spend, asserts the parsed launcher id
+    /// matches the handle we intend to operate (rejecting a substituted option), then `rehydrate`s
+    /// the terms — which independently re-derives and checks the option's three on-chain commitments
+    /// (the 1-of-2 exercise/clawback path, the underlying delegated-puzzle hash, and the
+    /// underlying-coin-id binding), so a tampered coin, term, or strike is rejected here.
+    ///
+    /// The authorizing key is resolved from the PARSED option's current `p2_puzzle_hash`, not the
+    /// handle's original owner — the singleton may have been transferred since mint. A wallet that
+    /// does not hold that key is not the current owner and cannot operate the option.
+    fn rehydrate_option(
+        &self,
+        ctx: &mut SpendContext,
+        handle: &OptionHandle,
+        on_chain: &OptionOnChainState,
+    ) -> WalletResult<(CreatedOption, PublicKey)> {
+        let parent_coin = decode_wire_coin(&on_chain.option_parent_coin)?;
+        let parent_reveal = decode_program(&on_chain.option_parent_puzzle_reveal, "puzzle reveal")?;
+        let parent_solution = decode_program(&on_chain.option_parent_solution, "solution")?;
+        let underlying_coin = decode_wire_coin(&on_chain.underlying_coin)?;
+
+        let parsed = parse_child(ctx, parent_coin, &parent_reveal, &parent_solution)
+            .map_err(|e| spend_failed(format!("parse option child from parent spend: {e}")))?
+            .ok_or_else(|| spend_failed("on-chain parent did not create an option child"))?;
+
+        // NC-9 fail-closed: the handle names the option we intend to operate; the on-chain parent
+        // MUST produce THAT option's launcher, never a substituted one.
+        let expected_launcher = parse_bytes32(&handle.launcher_id, "launcher id")?;
+        if parsed.option.info.launcher_id != expected_launcher {
+            return Err(spend_failed(
+                "on-chain option launcher does not match the handle's launcher id",
+            ));
+        }
+
+        let terms = RehydratedTerms {
+            creator_puzzle_hash: parse_puzzle_hash(&handle.creator_puzzle_hash)?,
+            expiry_seconds: handle.expiry_seconds,
+            strike_type: strike_to_option_type(&handle.strike),
+        };
+        // Fail-closed: `rehydrate` re-derives + checks the option's three on-chain commitments
+        // (1-of-2 path, delegated-puzzle hash, underlying-coin-id binding). A tampered coin, term,
+        // or strike is rejected here — a validation failure against untrusted chain data, not a
+        // caller input-shape error.
+        let created = rehydrate(&parsed.option, &terms, underlying_coin).map_err(|e| {
+            spend_failed(format!(
+                "option rehydration rejected the on-chain projection: {e}"
+            ))
+        })?;
+
+        let holder_key = self
+            .inputs
+            .synthetic_key(parsed.option.info.p2_puzzle_hash)
+            .ok_or_else(|| {
+                spend_failed("not the current option owner (no key for its puzzle hash)")
+            })?;
+
+        Ok((created, holder_key))
+    }
 }
 
 /// Map an [`OptionStrike`] wire value to the SDK's `OptionType` (XCH-only in v0.9.0).
@@ -234,14 +441,42 @@ fn strike_to_option_type(strike: &OptionStrike) -> OptionType {
     }
 }
 
-/// Parse a 32-byte puzzle hash from its lowercase-hex wire form, fail-closed on a bad value.
-fn parse_puzzle_hash(ph: &Puzzlehash) -> WalletResult<Bytes32> {
-    let bytes = hex::decode(&ph.0)
-        .map_err(|e| WalletError::invalid_input(format!("bad puzzle hash {}: {e}", ph.0)))?;
+/// The strike amount in mojos (XCH-only in v0.9.0).
+fn strike_amount_mojos(strike: &OptionStrike) -> u64 {
+    match strike {
+        OptionStrike::Xch { amount } => amount.mojos(),
+    }
+}
+
+/// Parse a 32-byte hash from its lowercase-hex wire form, fail-closed with a `label`ed message.
+fn parse_bytes32(hex_str: &str, label: &str) -> WalletResult<Bytes32> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| WalletError::invalid_input(format!("bad {label} {hex_str}: {e}")))?;
     let array: [u8; 32] = bytes
         .try_into()
-        .map_err(|_| WalletError::invalid_input(format!("puzzle hash {} is not 32 bytes", ph.0)))?;
+        .map_err(|_| WalletError::invalid_input(format!("{label} {hex_str} is not 32 bytes")))?;
     Ok(Bytes32::new(array))
+}
+
+/// Parse a 32-byte puzzle hash from its lowercase-hex wire form, fail-closed on a bad value.
+fn parse_puzzle_hash(ph: &Puzzlehash) -> WalletResult<Bytes32> {
+    parse_bytes32(&ph.0, "puzzle hash")
+}
+
+/// Decode a [`WireCoin`] projection into a `chia_protocol::Coin`, fail-closed on any bad field.
+fn decode_wire_coin(coin: &WireCoin) -> WalletResult<Coin> {
+    Ok(Coin::new(
+        parse_bytes32(&coin.parent_coin_info, "coin parent id")?,
+        parse_bytes32(&coin.puzzle_hash, "coin puzzle hash")?,
+        coin.amount,
+    ))
+}
+
+/// Decode a serialized-CLVM `Program` from its lowercase-hex wire form, fail-closed with a `label`.
+fn decode_program(hex_str: &str, label: &str) -> WalletResult<Program> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| WalletError::invalid_input(format!("bad {label} hex: {e}")))?;
+    Ok(Program::from(bytes))
 }
 
 /// Encode a puzzle hash as an `xch1…` bech32m address for the review summary.
@@ -416,57 +651,341 @@ mod tests {
         assert!(err.message.contains("split"), "message: {}", err.message);
     }
 
-    #[tokio::test]
-    async fn transfer_reports_not_implemented() {
-        let b = builder(vec![]);
-        let req = TransferOptionRequest {
-            identity: IdentityRef::new(WalletId(1)),
-            handle: sample_handle(),
-            to_puzzle_hash: Puzzlehash(hex::encode([9u8; 32])),
-            fee: Amount(1),
+    // ---- Transfer + exercise: real, key-free fixtures ----
+    //
+    // A minted option's on-chain projection is built by minting via `dig_options::create` in-test
+    // (public G1 owner, no secret, no simulator) and extracting the option child's parent spend
+    // from the create bundle — exactly what a chain-reading client would fetch and pass as an
+    // `OptionOnChainState`. The engine then rehydrates + composes transfer/exercise against it.
+
+    const TEST_EXPIRY: u64 = 1_800_000_000;
+
+    fn wire_coin(coin: &Coin) -> WireCoin {
+        WireCoin {
+            parent_coin_info: hex::encode(coin.parent_coin_info),
+            puzzle_hash: hex::encode(coin.puzzle_hash),
+            amount: coin.amount,
+        }
+    }
+
+    fn program_hex(program: &Program) -> String {
+        hex::encode(Vec::<u8>::from(program.clone()))
+    }
+
+    /// Mint a real option to `owner_ph` (creator `creator_ph`) and return the handle a client
+    /// retains plus the on-chain projection it would fetch to later operate the option.
+    fn minted_fixture(
+        underlying: u64,
+        strike: u64,
+        creator_ph: Bytes32,
+        owner_ph: Bytes32,
+    ) -> (OptionHandle, OptionOnChainState) {
+        let mut ctx = SpendContext::new();
+        let funding_coin = wallet_coin(underlying + 1, 1);
+        let terms = OptionTerms {
+            creator_puzzle_hash: creator_ph,
+            owner_puzzle_hash: owner_ph,
+            underlying_amount: underlying,
+            strike_type: OptionType::Xch { amount: strike },
+            expiry_seconds: TEST_EXPIRY,
         };
-        let err = b.build_transfer_option(req).await.unwrap_err();
-        assert_eq!(err.code, WalletErrorCode::NotImplemented);
+        let spend = create(
+            &mut ctx,
+            &Owner::Standard(test_public_key()),
+            funding_coin,
+            &terms,
+        )
+        .expect("mint option");
+        let created = spend.created.clone().expect("created option");
+
+        // The option child's parent coin is spent inside the same create bundle; find that spend to
+        // build the `parse_child` projection.
+        let parent_id = created.option.coin.parent_coin_info;
+        let parent_spend = spend
+            .coin_spends
+            .iter()
+            .find(|cs| cs.coin.coin_id() == parent_id)
+            .expect("create bundle contains the option child's parent spend");
+
+        let handle = OptionHandle {
+            launcher_id: hex::encode(created.option.info.launcher_id),
+            creator_puzzle_hash: Puzzlehash(hex::encode(creator_ph)),
+            owner_puzzle_hash: Puzzlehash(hex::encode(owner_ph)),
+            underlying_amount: Amount(underlying),
+            strike: OptionStrike::Xch {
+                amount: Amount(strike),
+            },
+            expiry_seconds: TEST_EXPIRY,
+            underlying_coin_id: hex::encode(created.underlying_coin.coin_id()),
+            funding_coin_id: hex::encode(funding_coin.coin_id()),
+        };
+        let on_chain = OptionOnChainState {
+            option_parent_coin: wire_coin(&parent_spend.coin),
+            option_parent_puzzle_reveal: program_hex(&parent_spend.puzzle_reveal),
+            option_parent_solution: program_hex(&parent_spend.solution),
+            underlying_coin: wire_coin(&created.underlying_coin),
+        };
+        (handle, on_chain)
+    }
+
+    /// A self-minted option owned + created by the test wallet (the common single-party case).
+    fn self_minted(underlying: u64, strike: u64) -> (OptionHandle, OptionOnChainState) {
+        let ph = wallet_puzzle_hash();
+        minted_fixture(underlying, strike, ph, ph)
+    }
+
+    fn settlement_payment_hash() -> Bytes32 {
+        use chia_wallet_sdk::types::puzzles::SettlementPayment;
+        use chia_wallet_sdk::types::Mod;
+        Bytes32::from(<[u8; 32]>::from(SettlementPayment::mod_hash()))
     }
 
     #[tokio::test]
-    async fn exercise_reports_not_implemented() {
-        let b = builder(vec![]);
-        let req = ExerciseOptionRequest {
-            identity: IdentityRef::new(WalletId(1)),
-            handle: sample_handle(),
-            fee: Amount(1),
-        };
-        let err = b.build_exercise_option(req).await.unwrap_err();
-        assert_eq!(err.code, WalletErrorCode::NotImplemented);
+    async fn builds_an_unsigned_exercise_with_the_underlying_claim_and_implicit_fee() {
+        let (handle, on_chain) = self_minted(1_000, 500);
+        // Strike-funding coin at the wallet: 500 strike + 5 excess (implicit fee), within fee=10.
+        let b = builder(vec![wallet_coin(505, 7)]);
+        let unsigned = b
+            .build_exercise_option(ExerciseOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                fee: Amount(10),
+            })
+            .await
+            .unwrap();
+
+        assert!(!unsigned.coin_spends.is_empty());
+        assert!(!unsigned.required_signatures.is_empty());
+        assert_eq!(unsigned.summary.fee, Amount(5));
+        assert_eq!(unsigned.summary.outputs[0].amount, Amount(1_000));
+    }
+
+    /// WIRED atomicity guard (SPEC §3a): the engine-built exercise bundle MUST carry the settlement
+    /// leg claiming the FULL underlying back to the holder — pinned through the engine, not just the
+    /// raw `dig_options::exercise` call, so no engine wiring can ever drop or reorder it.
+    #[tokio::test]
+    async fn wired_exercise_bundle_includes_the_underlying_claim_leg() {
+        let (handle, on_chain) = self_minted(1_000, 500);
+        let b = builder(vec![wallet_coin(500, 7)]);
+        let unsigned = b
+            .build_exercise_option(ExerciseOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                fee: Amount(0),
+            })
+            .await
+            .unwrap();
+
+        let settlement_ph = settlement_payment_hash();
+        let has_underlying_claim = unsigned
+            .coin_spends
+            .iter()
+            .any(|cs| cs.coin.puzzle_hash == settlement_ph && cs.coin.amount == 1_000);
+        assert!(
+            has_underlying_claim,
+            "wired exercise bundle is missing the underlying-claim settlement leg (amount 1000)"
+        );
+    }
+
+    /// Two-party (creator ≠ holder): the wallet is the HOLDER; the creator is a foreign puzzle hash.
+    /// Both settlement legs must be present — the underlying (claimed to the holder) AND the strike
+    /// (settled to the creator) — proving amounts are not misrouted.
+    #[tokio::test]
+    async fn exercise_two_party_routes_underlying_and_strike_without_misrouting() {
+        let creator_ph = Bytes32::new([0xC1; 32]);
+        let (handle, on_chain) = minted_fixture(1_000, 300, creator_ph, wallet_puzzle_hash());
+        let b = builder(vec![wallet_coin(300, 7)]);
+        let unsigned = b
+            .build_exercise_option(ExerciseOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                fee: Amount(0),
+            })
+            .await
+            .unwrap();
+
+        let settlement_ph = settlement_payment_hash();
+        let has_underlying = unsigned
+            .coin_spends
+            .iter()
+            .any(|cs| cs.coin.puzzle_hash == settlement_ph && cs.coin.amount == 1_000);
+        let has_strike = unsigned
+            .coin_spends
+            .iter()
+            .any(|cs| cs.coin.puzzle_hash == settlement_ph && cs.coin.amount == 300);
+        assert!(has_underlying, "underlying claim leg (1000) missing");
+        assert!(has_strike, "strike settlement leg (300) missing");
     }
 
     #[tokio::test]
-    async fn transfer_rejects_a_bad_destination_before_not_implemented() {
-        let b = builder(vec![]);
-        let req = TransferOptionRequest {
-            identity: IdentityRef::new(WalletId(1)),
-            handle: sample_handle(),
-            to_puzzle_hash: Puzzlehash("not-hex".into()),
-            fee: Amount(1),
+    async fn exercise_without_the_owner_key_is_rejected() {
+        // Option owned by a foreign puzzle hash — the wallet holds no key for it.
+        let foreign = Bytes32::new([0xF0; 32]);
+        let (handle, on_chain) = minted_fixture(1_000, 500, foreign, foreign);
+        let b = builder(vec![wallet_coin(500, 7)]);
+        let err = b
+            .build_exercise_option(ExerciseOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                fee: Amount(10),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    #[tokio::test]
+    async fn exercise_without_a_strike_coin_is_insufficient_funds() {
+        let (handle, on_chain) = self_minted(1_000, 500);
+        let b = builder(vec![]); // no strike-funding coin
+        let err = b
+            .build_exercise_option(ExerciseOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                fee: Amount(10),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::InsufficientFunds);
+    }
+
+    // ---- NC-9 fail-closed: the engine never trusts the on-chain projection ----
+
+    #[tokio::test]
+    async fn exercise_rejects_a_handle_launcher_mismatch() {
+        let (mut handle, on_chain) = self_minted(1_000, 500);
+        // Tamper the handle's launcher id — it no longer names the option the projection produces.
+        handle.launcher_id = hex::encode([0xAB; 32]);
+        let b = builder(vec![wallet_coin(500, 7)]);
+        let err = b
+            .build_exercise_option(ExerciseOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                fee: Amount(10),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+        assert!(err.message.contains("launcher"), "message: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn exercise_rejects_a_tampered_underlying_coin() {
+        let (handle, mut on_chain) = self_minted(1_000, 500);
+        // Tamper the underlying coin amount — rehydrate's coin-id + path checks must reject it.
+        on_chain.underlying_coin.amount = 999;
+        let b = builder(vec![wallet_coin(500, 7)]);
+        let err = b
+            .build_exercise_option(ExerciseOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                fee: Amount(10),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    #[tokio::test]
+    async fn exercise_rejects_a_wrong_strike_in_the_handle() {
+        let (mut handle, on_chain) = self_minted(1_000, 500);
+        // Tamper the strike — rehydrate's delegated-puzzle-hash check must reject it.
+        handle.strike = OptionStrike::Xch {
+            amount: Amount(499),
         };
-        let err = b.build_transfer_option(req).await.unwrap_err();
+        let b = builder(vec![wallet_coin(500, 7)]);
+        let err = b
+            .build_exercise_option(ExerciseOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                fee: Amount(10),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    // ---- Transfer ----
+
+    #[tokio::test]
+    async fn builds_an_unsigned_transfer_with_a_fee() {
+        let (handle, on_chain) = self_minted(1_000, 500);
+        // A fee coin at the wallet to fund the separate farmer-fee leg.
+        let b = builder(vec![wallet_coin(50, 8)]);
+        let unsigned = b
+            .build_transfer_option(TransferOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                to_puzzle_hash: Puzzlehash(hex::encode([9u8; 32])),
+                fee: Amount(5),
+            })
+            .await
+            .unwrap();
+        assert!(!unsigned.coin_spends.is_empty());
+        assert!(!unsigned.required_signatures.is_empty());
+        assert_eq!(unsigned.summary.fee, Amount(5));
+    }
+
+    #[tokio::test]
+    async fn builds_an_unsigned_transfer_without_a_fee() {
+        let (handle, on_chain) = self_minted(1_000, 500);
+        let b = builder(vec![]); // no fee → no fee coin needed
+        let unsigned = b
+            .build_transfer_option(TransferOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                to_puzzle_hash: Puzzlehash(hex::encode([9u8; 32])),
+                fee: Amount(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(unsigned.summary.fee, Amount(0));
+        assert!(!unsigned.required_signatures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_rejects_a_bad_destination() {
+        let (handle, on_chain) = self_minted(1_000, 500);
+        let b = builder(vec![]);
+        let err = b
+            .build_transfer_option(TransferOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                to_puzzle_hash: Puzzlehash("not-hex".into()),
+                fee: Amount(1),
+            })
+            .await
+            .unwrap_err();
         assert_eq!(err.code, WalletErrorCode::InvalidInput);
     }
 
-    fn sample_handle() -> OptionHandle {
-        OptionHandle {
-            launcher_id: hex::encode([1u8; 32]),
-            creator_puzzle_hash: Puzzlehash(hex::encode([2u8; 32])),
-            owner_puzzle_hash: Puzzlehash(hex::encode([3u8; 32])),
-            underlying_amount: Amount(1000),
-            strike: OptionStrike::Xch {
-                amount: Amount(500),
-            },
-            expiry_seconds: 1_800_000_000,
-            underlying_coin_id: hex::encode([4u8; 32]),
-            funding_coin_id: hex::encode([5u8; 32]),
-        }
+    #[tokio::test]
+    async fn transfer_without_the_owner_key_is_rejected() {
+        let foreign = Bytes32::new([0xF0; 32]);
+        let (handle, on_chain) = minted_fixture(1_000, 500, foreign, foreign);
+        let b = builder(vec![]);
+        let err = b
+            .build_transfer_option(TransferOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                to_puzzle_hash: Puzzlehash(hex::encode([9u8; 32])),
+                fee: Amount(0),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
     }
 
     /// SECURITY-CRITICAL dependency guard for option-exercise atomicity (SPEC §3a).
