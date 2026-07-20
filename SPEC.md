@@ -124,6 +124,12 @@ this layer.**
 
 - `SendXchRequest { identity, to, amount, fee }`, `SendCatRequest { identity, asset_id, to, amount,
   fee }` — pure data both seams import (client sends them; engine consumes them).
+- Offer request/response types (the offers surface, §3c): `MakeOfferRequest`, `AssembleOfferRequest`,
+  `TakeOfferRequest`, `FinalizeTakeRequest`, `CancelOfferRequest`, `CombineOffersRequest`,
+  `SummarizeOfferRequest`, and the responses `PendingOfferBuild { build_id, unsigned }`,
+  `OfferString { offer }`, `OfferSummary`, plus the opaque handle `OfferBuildId`. All are pure serde
+  data — NO chia-wallet-sdk allocator type (`Offer`/`RequestedPayments`/`AssetInfo`/`SpendContext`)
+  ever crosses the seam; the non-serializable build state stays engine-side (§3c).
 
 ### 2.5 Errors (machine contract)
 
@@ -260,6 +266,41 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   any skip (disabled, below threshold, not approved, cap reached). A capped/declined tip can therefore
   never be constructed — the default-on money movement is honest, capped, and one-flag-off, and never
   gates consuming content.
+
+### 3c. Offers — Chia offer actions (`engine::build_offer`)
+
+- **`engine::build_offer::OfferBuilder`** — the offers surface (make, take, cancel, combine,
+  summarize), composing the canonical `dig-offers` (CHIP-0023/CHIP-0024 settlement) builders. It
+  NEVER signs, NEVER auto-broadcasts, and NEVER hand-rolls offer/settlement CLVM — the
+  make-must-NOT-settle (no-self-fund) rule and take's settlement-announcement assertions live INSIDE
+  `dig-offers` and are preserved by composing it. `required_signatures` come from the SAME key-free
+  path as every other spend.
+- **Engine-side stateful TWO-CALL make/take.** Making and taking each split into build → (client
+  signs) → assemble/finalize, and the two phases MUST share ONE `SpendContext`. That context — and
+  the requested-payment metadata (make) or parsed `Offer` (take) it carries — is a non-serializable
+  SDK allocator object, so it MUST NOT cross the seam: `dig_offers::make_assemble` and
+  `take_combine` use NO secret key (they transform an ALREADY-SIGNED bundle plus public data), so
+  assembly runs ENGINE-side. The intermediate is parked in `engine::offer_state::PendingOffers`
+  between the two calls, keyed by an opaque, engine-generated `OfferBuildId`; only that id and the
+  `UnsignedSpend` cross the wire. A parked build is single-use and is swept after `PENDING_TTL`
+  (300 s) so an abandoned build cannot leak memory. No key material is ever parked.
+  - **Make** (`build_make` → sign → `assemble_make`): `MakeOfferRequest { identity, offered,
+    requested, fee }` → `PendingOfferBuild { build_id, unsigned }`; then `AssembleOfferRequest {
+    build_id, signed }` → `OfferString { offer }` (the `offer1…` string, via `encode_offer`).
+  - **Take** (`build_take` → sign → `finalize_take`): `TakeOfferRequest { identity, offer, fee }` →
+    `PendingOfferBuild`; then `FinalizeTakeRequest { build_id, signed }` → `SignedBundle` — the
+    atomic settlement bundle, broadcastable but NEVER auto-pushed (the caller broadcasts it).
+  - **Cancel** (single build call): `CancelOfferRequest { identity, offer, fee }` → `UnsignedSpend`,
+    signed + broadcast through the ordinary spend path (same shape as a send).
+  - **Combine** (pure): `CombineOffersRequest { offers }` → `OfferString`.
+  - **Summarize** (pure): `SummarizeOfferRequest { offer }` → `OfferSummary { offered, requested,
+    arbitrage, royalties }`.
+- **No-self-fund invariant.** A make spends ONLY the offered assets; the requested side is an
+  assertion, never a settle action — the maker never funds both sides. (Proven by the two-party
+  simulator round-trip, where the maker holds ONLY the offered asset yet make succeeds.)
+- **v0.11.0 scope.** XCH↔CAT offers (make/take/cancel/combine/summarize). NFT offer legs are
+  deferred (they need spendable-NFT resolution through the input provider); `$DIG` is a CAT, so the
+  CAT legs cover the value flow.
 
 **NOT in the engine seam:** key custody, mnemonic generation, a `sign()` implementation (only the
 trait it calls), any HD seed.
