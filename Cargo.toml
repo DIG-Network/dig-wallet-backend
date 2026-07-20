@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet-backend"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.81"
 description = "Canonical event-driven Chia wallet backend for the DIG Network. Exports two carefully-partitioned seams: an `engine` seam (imported by dig-node — the single running wallet instance: state, sync, unsigned-spend construction, event emission; identity-parameterized, never holds a private key) and a `client` seam (used by dig-app — the event subscriber, spend review/decode, the signing interface + identity provider that hold the key). Clean-room, chia-wallet-sdk-based. Replaces dig-l1-wallet."
@@ -24,8 +24,10 @@ engine = [
     "dep:futures-core",
     "dep:chia-wallet-sdk",
     "dep:dig-options",
+    "dep:dig-offers",
     "dep:dig-tips",
     "dep:dig-cat",
+    "dep:indexmap",
     "dep:clvmr",
     "dep:rusqlite",
 ]
@@ -106,6 +108,18 @@ clvmr = { version = "0.14", optional = true }
 # statically links a vendored SQLite so no system library is needed. Engine-seam only; it stores
 # PUBLIC coin/asset/tx/event state — NEVER key material (the key-isolation invariant, SPEC §1.4).
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+# The CANONICAL Chia offers expert crate (make/take/cancel/combine/summarize over XCH/CAT/NFT):
+# a pure, key-free, network-free settlement `SpendBundle`-builder (CHIP-0023/CHIP-0024). The engine
+# composes it for the offers surface — NEVER hand-rolling offer/settlement CLVM (§4.1). The
+# make-must-NOT-settle (no-self-fund) rule and take's settlement-announcement assertions live INSIDE
+# dig-offers and are preserved by composing it. Pure + key-free: it builds unsigned spends and
+# reports required signatures, holding no key and never signing (identity boundary #908). Its
+# `make_assemble`/`take_combine` transform an ALREADY-SIGNED bundle + public data, so assembly runs
+# engine-side without any secret key. Engine-seam only.
+dig-offers = { version = "0.1", optional = true }
+# `IndexMap<Bytes32, PublicKey>` is dig-offers' `owner_keys` input shape (a coin-puzzle-hash → key
+# map, order-preserving). Engine-seam only; used solely to hand keys to the offer builders.
+indexmap = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
@@ -113,6 +127,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 # Derives deterministic, hashed test seeds (never integer-literal keys — CodeQL-clean).
 sha2 = "0.10"
+chia-sdk-test = "0.30"
 
 [package.metadata.docs.rs]
 all-features = true

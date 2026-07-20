@@ -11,6 +11,7 @@
 
 pub mod error;
 pub mod identity;
+pub mod offer;
 pub mod options;
 pub mod request;
 pub mod spend;
@@ -23,6 +24,11 @@ pub use dig_events_protocol::{
 };
 pub use error::{WalletError, WalletErrorCode, WalletResult};
 pub use identity::{Did, IdentityRef};
+pub use offer::{
+    AssembleOfferRequest, CancelOfferRequest, CombineOffersRequest, FinalizeTakeRequest,
+    MakeOfferRequest, OfferBuildId, OfferString, OfferSummary, OfferedAssets, PendingOfferBuild,
+    RequestedAssets, SummarizeOfferRequest, SummaryAsset, TakeOfferRequest,
+};
 pub use options::{
     ExerciseOptionRequest, MintOptionRequest, MintedOption, OptionHandle, OptionStrike,
     TransferOptionRequest,
