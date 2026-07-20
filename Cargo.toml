@@ -24,7 +24,6 @@ engine = [
     "dep:futures-core",
     "dep:chia-wallet-sdk",
     "dep:dig-options",
-    "dep:dig-offers",
     "dep:dig-tips",
     "dep:dig-cat",
     "dep:clvmr",
@@ -92,12 +91,6 @@ chia-wallet-sdk = { version = "0.30", default-features = false, optional = true 
 # spends and reports required signatures, never holding a key or signing (identity boundary #908).
 # Engine-seam only.
 dig-options = { version = "0.1", optional = true }
-# The CANONICAL Chia offers expert crate (make/take/cancel/combine + read-only summarize/parse/
-# decode). The engine composes these for the offers surface — NEVER hand-rolling settlement CLVM
-# (§4.1). Pure, key-free, network-free: it builds unsigned spends and reports required signatures,
-# never holding a key or signing (identity boundary #908). Apache/MIT into GPL-2.0-only backend is
-# license-compatible. Engine-seam only.
-dig-offers = { version = "0.1", optional = true }
 # The CANONICAL DIG tipping expert crate: a pure, key-free CAT-payment builder for tips (incl. the
 # honest, capped, default-on auto-tip to the DIG treasury — the §6.0 $DIG North Star). The engine
 # composes `build_tip`/`build_tip_if_allowed`; it speaks `dig_cat` types that re-export

@@ -247,22 +247,7 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   `NotImplemented` until the `dig-options` additions land (release-first) — no consumer-facing shape
   change when they do.
 
-### 3b. Offers — Chia offer actions (`engine::build_offers`)
-
-- **`engine::build_offers::OfferBuilder`** — `build_make_offer`, `build_take_offer`,
-  `build_cancel_offer`, composing the canonical `dig-offers` crate (never hand-rolled settlement
-  CLVM), returning UNSIGNED results. A Chia offer is inherently **build → sign → assemble/combine**:
-  `make_build`/`take_build` return the unsigned spends plus SDK allocator artifacts
-  (`RequestedPayments`/`AssetInfo`/`Offer`) that `make_assemble`/`take_combine` fold into the final
-  `offer1…` string AFTER signing.
-- **v0.9.0 scope.** Those assemble artifacts do NOT cross the serde IPC seam and the assemble step
-  sits on the client side of the signer boundary (#908), so v0.9.0 ACCEPTS + fail-closed VALIDATES
-  every offer request (rejecting a bad amount, puzzle hash, or non-offer string before any build) and
-  returns `NotImplemented` until the wire-serializable assemble/combine seam lands (a documented
-  fast-follow). The request surface is stable now so consumers can code against it with no later
-  shape change.
-
-### 3c. Tips — $DIG tipping actions (`engine::build_tips`)
+### 3b. Tips — $DIG tipping actions (`engine::build_tips`)
 
 - **`engine::build_tips::TipBuilder`** — `build_tip` (an explicit CAT tip) and `build_auto_tip` (the
   guarded, honest auto-tip), composing the canonical `dig-tips` (`build_tip` / `build_tip_if_allowed`)

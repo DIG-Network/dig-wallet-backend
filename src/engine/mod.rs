@@ -19,7 +19,6 @@
 
 pub mod broadcast;
 pub mod build;
-pub mod build_offers;
 pub mod build_options;
 pub mod build_tips;
 pub mod events;
@@ -31,7 +30,6 @@ pub mod sync;
 
 pub use broadcast::{Broadcaster, MempoolBroadcaster, MempoolClient, MempoolStatus};
 pub use build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
-pub use build_offers::OfferBuilder;
 pub use build_options::OptionBuilder;
 pub use build_tips::TipBuilder;
 pub use events::{DeltaLog, EventSink, PersistentEventLog, DEFAULT_HISTORY_CAPACITY};
