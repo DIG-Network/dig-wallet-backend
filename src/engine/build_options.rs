@@ -99,9 +99,10 @@ impl OptionBuilder for SdkSpendBuilder {
         let funding_coin = self.pick_funding_coin(&identity, needed, fee_ceiling)?;
         let implicit_fee = funding_coin.amount - needed;
 
-        let creator_key = self.inputs.synthetic_key(funding_coin.puzzle_hash).ok_or_else(|| {
-            spend_failed("no public key for the mint funding coin's puzzle hash")
-        })?;
+        let creator_key = self
+            .inputs
+            .synthetic_key(funding_coin.puzzle_hash)
+            .ok_or_else(|| spend_failed("no public key for the mint funding coin's puzzle hash"))?;
 
         let terms = OptionTerms {
             creator_puzzle_hash: creator_ph,
@@ -112,11 +113,16 @@ impl OptionBuilder for SdkSpendBuilder {
         };
 
         let mut ctx = SpendContext::new();
-        let option_spend = create(&mut ctx, &Owner::Standard(creator_key), funding_coin, &terms)
-            .map_err(map_options_error)?;
-        let created = option_spend.created.ok_or_else(|| {
-            spend_failed("dig-options create did not return the created option")
-        })?;
+        let option_spend = create(
+            &mut ctx,
+            &Owner::Standard(creator_key),
+            funding_coin,
+            &terms,
+        )
+        .map_err(map_options_error)?;
+        let created = option_spend
+            .created
+            .ok_or_else(|| spend_failed("dig-options create did not return the created option"))?;
 
         let coin_spends = option_spend.coin_spends;
         let required_signatures = self.required_signatures(&coin_spends)?;
@@ -258,8 +264,8 @@ fn map_options_error(error: dig_options::Error) -> WalletError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{IdentityRef, Network, WalletId};
     use crate::engine::build::SpendInputs;
+    use crate::types::{IdentityRef, Network, WalletId};
     use chia::bls::PublicKey;
     use chia::puzzles::standard::StandardArgs;
     use chia_wallet_sdk::driver::Cat;
@@ -332,7 +338,10 @@ mod tests {
     async fn builds_an_unsigned_mint_with_handle_and_required_signatures() {
         // Funding coin = underlying(1000) + 1 singleton + 10 implicit fee = 1011.
         let b = builder(vec![wallet_coin(1011, 1)]);
-        let minted = b.build_mint_option(mint_request(1000, 500, 10)).await.unwrap();
+        let minted = b
+            .build_mint_option(mint_request(1000, 500, 10))
+            .await
+            .unwrap();
 
         assert!(!minted.unsigned.coin_spends.is_empty());
         assert!(!minted.unsigned.required_signatures.is_empty());
@@ -368,21 +377,30 @@ mod tests {
     async fn mint_picks_the_smallest_covering_coin() {
         // 1005 (excess 4 <= fee 10) is chosen over 2000; implicit fee = 1005 - 1001 = 4.
         let b = builder(vec![wallet_coin(2000, 1), wallet_coin(1005, 2)]);
-        let minted = b.build_mint_option(mint_request(1000, 500, 10)).await.unwrap();
+        let minted = b
+            .build_mint_option(mint_request(1000, 500, 10))
+            .await
+            .unwrap();
         assert_eq!(minted.unsigned.summary.fee, Amount(4));
     }
 
     #[tokio::test]
     async fn mint_zero_underlying_is_rejected() {
         let b = builder(vec![wallet_coin(1011, 1)]);
-        let err = b.build_mint_option(mint_request(0, 500, 10)).await.unwrap_err();
+        let err = b
+            .build_mint_option(mint_request(0, 500, 10))
+            .await
+            .unwrap_err();
         assert_eq!(err.code, WalletErrorCode::InvalidInput);
     }
 
     #[tokio::test]
     async fn mint_without_a_covering_coin_is_insufficient_funds() {
         let b = builder(vec![wallet_coin(100, 1)]);
-        let err = b.build_mint_option(mint_request(1000, 500, 10)).await.unwrap_err();
+        let err = b
+            .build_mint_option(mint_request(1000, 500, 10))
+            .await
+            .unwrap_err();
         assert_eq!(err.code, WalletErrorCode::InsufficientFunds);
     }
 
@@ -390,7 +408,10 @@ mod tests {
     async fn mint_rejects_a_coin_whose_excess_exceeds_the_fee() {
         // Only a 2000 coin: excess over 1001 = 999 > fee 10 → split-required error.
         let b = builder(vec![wallet_coin(2000, 1)]);
-        let err = b.build_mint_option(mint_request(1000, 500, 10)).await.unwrap_err();
+        let err = b
+            .build_mint_option(mint_request(1000, 500, 10))
+            .await
+            .unwrap_err();
         assert_eq!(err.code, WalletErrorCode::InsufficientFunds);
         assert!(err.message.contains("split"), "message: {}", err.message);
     }
