@@ -4,22 +4,10 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.13.0] - 2026-07-20
-
-### Features
-- **offers:** Surface the stable ecosystem `offer_id` on the make/combine (`OfferString`) and
-  summarize (`OfferSummary`) responses so a consumer can key/track an offer (#1318)
+## [0.13.0] - 2026-07-21
 
 ### Bug Fixes
-- **offers:** `build_cancel` now fails closed (`spend_validation_failed`) when the wallet owns no
-  standard-layer key for any of an offer's offered coins, instead of returning an empty,
-  non-signable unsigned spend (#1318, #1122)
-- **client:** Silence unused-import warnings in `client::subscribe` under
-  `--no-default-features --features client` (#1318)
-
-### Refactor
-- **offers:** Route taker XCH/CAT fund selection through `engine::selection::select_for_spend`, so an
-  over-cap taker selection reports `NeedsConsolidation` identically to an ordinary send (#1318)
+- **offers:** Offers hardening bundle (#1122 triple-gate findings) (#18)
 
 ## [0.12.1] - 2026-07-20
 
