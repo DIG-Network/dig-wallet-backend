@@ -384,7 +384,12 @@ fn checked_target(amount: u64, fee: u64) -> WalletResult<u64> {
 ///
 /// `NeedsConsolidation` surfaces as [`WalletErrorCode::InsufficientFunds`] (the frozen error
 /// catalogue has no dedicated code) with a message directing the caller to consolidate.
-fn select_or_fail(coins: &[Coin], target: u64, cap: usize, asset: &str) -> WalletResult<Vec<Coin>> {
+pub(crate) fn select_or_fail(
+    coins: &[Coin],
+    target: u64,
+    cap: usize,
+    asset: &str,
+) -> WalletResult<Vec<Coin>> {
     match select_for_spend(coins, target, cap) {
         SelectionOutcome::Selected { coins, .. } => Ok(coins),
         SelectionOutcome::NeedsConsolidation {

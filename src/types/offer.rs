@@ -144,6 +144,11 @@ pub struct PendingOfferBuild {
 pub struct OfferString {
     /// The encoded offer.
     pub offer: String,
+    /// The offer's stable, ecosystem-wide id (`sha256` of the uncompressed offer bundle, hex).
+    ///
+    /// This is the same value dexie, Sage, and Chia's `Offer.name()` use to identify an offer, and
+    /// is independent of the bech32 compression — so a consumer can key/track the offer by it.
+    pub offer_id: String,
 }
 
 /// One asset line in an [`OfferSummary`].
@@ -172,6 +177,11 @@ pub enum SummaryAsset {
 /// A decoded, human- and machine-readable view of an offer's two sides plus its economics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferSummary {
+    /// The offer's stable, ecosystem-wide id (`sha256` of the uncompressed offer bundle, hex).
+    ///
+    /// The same value dexie, Sage, and Chia's `Offer.name()` use to identify an offer — a consumer
+    /// keys/tracks the offer by it. Independent of the bech32 compression.
+    pub offer_id: String,
     /// What the offer gives up.
     pub offered: Vec<SummaryAsset>,
     /// What the offer asks for.
@@ -234,6 +244,7 @@ mod tests {
     #[test]
     fn summary_asset_is_tagged() {
         let summary = OfferSummary {
+            offer_id: "ab".repeat(32),
             offered: vec![SummaryAsset::Cat {
                 asset_id: AssetId("dbx".into()),
                 amount: Amount(1_000),
