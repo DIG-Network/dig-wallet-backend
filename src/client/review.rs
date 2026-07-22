@@ -21,6 +21,11 @@ pub struct HumanReadableSummary {
     pub coin_spend_count: usize,
     /// The number of signatures the user's key must produce.
     pub required_signature_count: usize,
+    /// Whether the rendered lines were INDEPENDENTLY re-derived from the coin spends
+    /// ([`super::verify::derive_summary`]). When `false` the spend could not be independently decoded
+    /// — the lines fall back to the engine's (untrusted) claim and the confirm UI MUST surface this
+    /// as unverifiable; [`super::signer::LocalSigner::sign_unsigned`] will refuse to sign it.
+    pub verified: bool,
 }
 
 /// Render `amount` as a decimal XCH string (or the raw base amount for a CAT, when `is_xch`
@@ -48,8 +53,9 @@ fn render_amount(amount: Amount, is_xch: bool) -> String {
 /// (potentially lying) claim. If the spend cannot be independently decoded the engine summary is
 /// shown as a last resort, but [`super::signer::LocalSigner::sign_unsigned`] will then refuse it.
 pub fn decode(unsigned: &UnsignedSpend) -> HumanReadableSummary {
-    let summary = super::verify::derive_summary(&unsigned.coin_spends)
-        .unwrap_or_else(|_| unsigned.summary.clone());
+    let derived = super::verify::derive_summary(&unsigned.coin_spends);
+    let verified = derived.is_ok();
+    let summary = derived.unwrap_or_else(|_| unsigned.summary.clone());
     let lines = summary
         .outputs
         .iter()
@@ -73,6 +79,7 @@ pub fn decode(unsigned: &UnsignedSpend) -> HumanReadableSummary {
         fee_line: format!("Fee {} XCH", render_amount(summary.fee, true)),
         coin_spend_count: unsigned.coin_spends.len(),
         required_signature_count: unsigned.required_signatures.len(),
+        verified,
     }
 }
 
@@ -129,6 +136,9 @@ mod tests {
         assert_eq!(summary.fee_line, "Fee 0.0001 XCH");
         assert_eq!(summary.coin_spend_count, 0);
         assert_eq!(summary.required_signature_count, 0);
+        // No coin spends to independently decode → the engine summary is a fallback, flagged
+        // unverified so the confirm UI warns and the signer refuses.
+        assert!(!summary.verified);
     }
 
     #[test]
@@ -136,5 +146,77 @@ mod tests {
         let summary = decode(&unsigned(vec![], Amount(0)));
         assert!(summary.lines.is_empty());
         assert_eq!(summary.fee_line, "Fee 0 XCH");
+        assert!(
+            !summary.verified,
+            "an undecodable spend is not independently verified"
+        );
+    }
+
+    /// A real, decodable spend is rendered from the re-derived (authoritative) summary and flagged
+    /// verified.
+    #[cfg(feature = "engine")]
+    #[tokio::test]
+    async fn decode_of_a_real_spend_is_verified() {
+        use crate::engine::build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
+        use crate::types::{IdentityRef, Network, SendXchRequest, WalletId};
+        use chia::protocol::{Bytes32, Coin};
+        use chia::puzzles::standard::StandardArgs;
+        use chia_wallet_sdk::utils::Address as Bech32Address;
+        use std::sync::Arc;
+
+        fn pk() -> chia::bls::PublicKey {
+            let mut g = [0u8; 48];
+            for (i, b) in [
+                0x97u8, 0xf1, 0xd3, 0xa7, 0x31, 0x97, 0xd7, 0x94, 0x26, 0x95, 0x63, 0x8c, 0x4f,
+                0xa9, 0xac, 0x0f, 0xc3, 0x68, 0x8c, 0x4f, 0x97, 0x74, 0xb9, 0x05, 0xa1, 0x4e, 0x3a,
+                0x3f, 0x17, 0x1b, 0xac, 0x58, 0x6c, 0x55, 0xe8, 0x3f, 0xf9, 0x7a, 0x1a, 0xef, 0xfb,
+                0x3a, 0xf0, 0x0a, 0xdb, 0x22, 0xc6, 0xbb,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                g[i] = b;
+            }
+            chia::bls::PublicKey::from_bytes(&g).unwrap()
+        }
+        fn ph() -> Bytes32 {
+            Bytes32::from(StandardArgs::curry_tree_hash(pk()).to_bytes())
+        }
+        struct One;
+        impl SpendInputs for One {
+            fn spendable_xch(&self, _: &IdentityRef) -> crate::types::WalletResult<Vec<Coin>> {
+                Ok(vec![Coin::new(Bytes32::new([3u8; 32]), ph(), 1000)])
+            }
+            fn spendable_cat(
+                &self,
+                _: &IdentityRef,
+                _: &crate::types::AssetId,
+            ) -> crate::types::WalletResult<Vec<chia_wallet_sdk::driver::Cat>> {
+                Ok(vec![])
+            }
+            fn synthetic_key(&self, p: Bytes32) -> Option<chia::bls::PublicKey> {
+                (p == ph()).then(pk)
+            }
+            fn change_puzzle_hash(&self, _: &IdentityRef) -> crate::types::WalletResult<Bytes32> {
+                Ok(ph())
+            }
+        }
+        let to = Address(
+            Bech32Address::new(Bytes32::new([7u8; 32]), "xch".into())
+                .encode()
+                .unwrap(),
+        );
+        let unsigned = SdkSpendBuilder::new(Arc::new(One), Network::Mainnet, 500)
+            .build_send_xch(SendXchRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                to,
+                amount: Amount(600),
+                fee: Amount(10),
+            })
+            .await
+            .unwrap();
+        let summary = decode(&unsigned);
+        assert!(summary.verified);
+        assert_eq!(summary.lines.len(), 1);
     }
 }

@@ -386,8 +386,15 @@ Used by dig-app. The subscriber + identity provider + signer.
      unbound (`AGG_SIG_UNSAFE`) message is refused.
   3. **Verify-before-sign (#1058).** `sign_unsigned` FIRST re-derives the spend via `client::verify`,
      requires every change output to return to a wallet-owned puzzle hash (no exfiltration), and
-     requires the engine-supplied summary to match the re-derived recipients + fee. No `bls_sign`
+     requires the engine-supplied summary to match the re-derived recipients + fee. The required
+     signatures actually signed are RE-DERIVED from the verified coin spends via
+     `SdkRequiredSignature::from_coin_spends` — the engine-supplied `required_signatures` field is
+     UNTRUSTED (only cross-checked, never the signing source), so a malicious engine cannot use it as
+     a signing oracle to obtain an `AGG_SIG_ME` over an arbitrary delegated puzzle. No `bls_sign`
      runs until the coin spends are independently accounted for — the signer never blind-signs.
+  - **Signing scope (fail-closed).** `sign_unsigned` signs ONLY the standard-XCH-send and CAT-send
+    classes `client::verify` can decode. An offer (settlement), option, or tip `UnsignedSpend` routed
+    through it is refused (`SpendValidationFailed`) until its verify decoder lands.
 - **`client::identity::IdentityProvider`** — `active_identity()`, `tracked_public_keys()`. Supplies the
   engine public material only. `HdIdentity` additionally exposes `identity_public_key_bytes()` (the
   48-byte G1 identity key published to slot `0x0010`) and `decap(peer_g1)` (the dig-message recipient

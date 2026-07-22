@@ -15,10 +15,21 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ### Features
 - **signer:** Verify coin spends before signing (#1058) — `client::verify::{analyze, derive_summary}`
   independently reconstructs a spend's value flow from its `CoinSpend`s via the chia-wallet-sdk
-  drivers. `sign_unsigned` gates on it fail-closed: every change output must return to the wallet,
-  the engine summary must match the re-derived recipients + fee, and any spend that cannot be fully
+  drivers. `sign_unsigned` gates on it fail-closed: the required signatures signed are RE-DERIVED from
+  the verified coin spends (the engine-supplied `required_signatures` is untrusted — only cross-checked
+  — so it cannot be used as a signing oracle), every change output must return to the wallet, the
+  engine summary must match the re-derived recipients + fee, and any spend that cannot be fully
   accounted for is refused — closing the blind-signing gap. `client::review::decode` renders the
-  authoritative re-derived summary.
+  authoritative re-derived summary and exposes a `verified` flag (false when a spend can't be
+  independently decoded).
+
+### Notes
+- **Signing is scoped to XCH + CAT sends (fail-closed).** `LocalSigner::sign_unsigned` currently signs
+  only the standard-layer XCH send and CAT send classes `client::verify` can independently decode.
+  Offer (settlement), option, and tip `UnsignedSpend`s routed through it are REFUSED
+  (`SpendValidationFailed`) until their verify decoders land (tracked follow-up). No live consumer
+  signs offers/options/tips via this `LocalSigner` today (dig-node uses its own wallet; dig-app signs
+  its money-path in-app), so this stays a minor release.
 
 ## [0.13.0] - 2026-07-21
 

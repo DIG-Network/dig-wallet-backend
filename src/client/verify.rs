@@ -155,12 +155,15 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             "XCH value not conserved: in {xch_in} != out+fee {xch_out_plus_fee}"
         )));
     }
-    for (asset, out) in &cat_out {
-        // A CAT output whose asset was never an input would be a mint out of thin air.
+    // Conservation is checked in BOTH directions over the union of assets seen as inputs or outputs:
+    // an output whose asset was never an input is a mint from thin air; an input asset with no (or a
+    // smaller) matching output is a melt/leak. Iterating only one side would miss the other.
+    for asset in cat_in.keys().chain(cat_out.keys()) {
         let input = cat_in.get(asset).copied().unwrap_or(0);
-        if input != *out {
+        let output = cat_out.get(asset).copied().unwrap_or(0);
+        if input != output {
             return Err(reject(format!(
-                "CAT {} value not conserved: in {input} != out {out}",
+                "CAT {} value not conserved: in {input} != out {output}",
                 hex::encode(asset)
             )));
         }

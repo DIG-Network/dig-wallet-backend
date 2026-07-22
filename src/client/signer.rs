@@ -253,20 +253,80 @@ impl LocalSigner {
         Ok(())
     }
 
-    /// The custody core: independently verify the spend (#1058), then verify every required
-    /// signature is a network-bound message the signer can produce, sign each, and aggregate into a
-    /// broadcast-ready bundle. Fail-closed.
+    /// The custody core (SPEC §4). Currently signs only the two spend classes the engine builds and
+    /// [`verify`](super::verify) can independently decode — a standard-layer XCH send and a CAT send.
+    /// An offer, option, or tip [`UnsignedSpend`] routed here is refused fail-closed until its
+    /// verify decoder lands (#1058 follow-up); those flows do not sign through `LocalSigner` today.
+    ///
+    /// Fail-closed, in order: (1) independently verify the coin spends' value flow (#1058); (2)
+    /// RE-DERIVE the authoritative required signatures FROM the verified coin spends — the
+    /// engine-supplied `unsigned.required_signatures` is UNTRUSTED and is only cross-checked, never
+    /// the signing source (a malicious engine could otherwise use it as a signing oracle, obtaining
+    /// an `AGG_SIG_ME` over an arbitrary delegated puzzle that drains a real coin while the human
+    /// reviewed a benign summary); (3) sign ONLY the re-derived set and aggregate.
     pub fn sign_unsigned(&self, unsigned: &UnsignedSpend) -> WalletResult<SignedBundle> {
-        // Verify BEFORE producing any signature: no bls_sign may run until the coin spends are
-        // independently accounted for and match the reviewed summary.
+        // (1) Verify BEFORE anything: no bls_sign may run until the coin spends are independently
+        // accounted for and match the reviewed summary.
         self.verify_before_signing(unsigned)?;
-        self.produce_signatures(unsigned)
+
+        // (2) The AUTHORITATIVE required signatures come from the verified coin spends themselves,
+        // never the engine field. Cross-check the engine's claim and fail-closed on any divergence.
+        let authoritative = self.required_signatures_from(&unsigned.coin_spends)?;
+        assert_required_signatures_match(&unsigned.required_signatures, &authoritative)?;
+
+        // (3) Sign ONLY the re-derived set (bundled with the verified coin spends).
+        let verified = UnsignedSpend {
+            coin_spends: unsigned.coin_spends.clone(),
+            required_signatures: authoritative,
+            summary: unsigned.summary.clone(),
+        };
+        self.produce_signatures(&verified)
     }
 
-    /// Gather each required signature (matching its public key to a derived key, refusing unbound
-    /// messages) and aggregate into a broadcast-ready bundle. Fail-closed. This is the signing
-    /// PRIMITIVE — [`sign_unsigned`](LocalSigner::sign_unsigned) runs the #1058 coin-spend
-    /// verification first, and only then calls this.
+    /// Re-derive the required signatures straight from `coin_spends` via chia-wallet-sdk's key-free
+    /// [`RequiredSignature`](chia_wallet_sdk::signer::RequiredSignature) extractor, bound to THIS
+    /// signer's network genesis challenge (so the messages are exactly what this signer would accept
+    /// — signer == engine by construction). A `secp` requirement is not expected in a wallet spend
+    /// and is refused. This is the trusted source of truth for what to sign.
+    fn required_signatures_from(
+        &self,
+        coin_spends: &[chia::protocol::CoinSpend],
+    ) -> WalletResult<Vec<crate::types::RequiredSignature>> {
+        use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature as SdkRequiredSignature};
+
+        let mut allocator = clvmr::Allocator::new();
+        let constants = AggSigConstants::new(Bytes32::new(self.agg_sig_me_extra_data));
+        let extracted =
+            SdkRequiredSignature::from_coin_spends(&mut allocator, coin_spends, &constants)
+                .map_err(|e| {
+                    WalletError::new(
+                        WalletErrorCode::SpendValidationFailed,
+                        format!("required-signature extraction failed: {e:?}"),
+                    )
+                })?;
+
+        let mut required = Vec::with_capacity(extracted.len());
+        for item in extracted {
+            match item {
+                SdkRequiredSignature::Bls(bls) => required.push(crate::types::RequiredSignature {
+                    public_key: bls.public_key,
+                    message: bls.message(),
+                }),
+                SdkRequiredSignature::Secp(_) => {
+                    return Err(WalletError::new(
+                        WalletErrorCode::SpendValidationFailed,
+                        "unexpected secp signature requirement in a wallet spend",
+                    ))
+                }
+            }
+        }
+        Ok(required)
+    }
+
+    /// Sign each (already-authoritative) required signature — matching its public key to a derived
+    /// key and refusing unbound messages — and aggregate into a broadcast-ready bundle. Fail-closed.
+    /// This is the signing PRIMITIVE; [`sign_unsigned`](LocalSigner::sign_unsigned) runs the #1058
+    /// verification + re-derivation first and only then calls this over the RE-DERIVED set.
     fn produce_signatures(&self, unsigned: &UnsignedSpend) -> WalletResult<SignedBundle> {
         let mut signatures: Vec<Signature> = Vec::with_capacity(unsigned.required_signatures.len());
 
@@ -279,6 +339,11 @@ impl LocalSigner {
                 )
             })?;
             signatures.push(bls_sign(&key, &required.message));
+            // NOTE: `chia::bls::SecretKey` (chia-bls 0.26) exposes no `Zeroize`/`Drop` scrub, so the
+            // transient derived key cannot be wiped here; it is dropped immediately at end of scope.
+            // The master SEED it derives from IS zeroized (see `hd::MasterKey`). Upgrading chia-bls
+            // to a zeroizing `SecretKey` is a tracked follow-up.
+            drop(key);
         }
 
         let aggregated = aggregate(&signatures);
@@ -313,6 +378,30 @@ impl LocalSigner {
             ))
         }
     }
+}
+
+/// Require the engine-supplied required-signature set to equal the set independently re-derived from
+/// the coin spends (compared as multisets of public key + message). This is belt-and-suspenders: the
+/// signer already signs ONLY the re-derived set, but any divergence means the engine tried to slip in
+/// an extra/altered message (a signing-oracle attempt) and is refused fail-closed.
+fn assert_required_signatures_match(
+    engine_claimed: &[crate::types::RequiredSignature],
+    authoritative: &[crate::types::RequiredSignature],
+) -> WalletResult<()> {
+    let key = |sig: &crate::types::RequiredSignature| {
+        (sig.public_key.to_bytes().to_vec(), sig.message.clone())
+    };
+    let mut claimed: Vec<_> = engine_claimed.iter().map(key).collect();
+    let mut truth: Vec<_> = authoritative.iter().map(key).collect();
+    claimed.sort();
+    truth.sort();
+    if claimed != truth {
+        return Err(WalletError::new(
+            WalletErrorCode::SpendValidationFailed,
+            "engine-supplied required signatures do not match the coin spends (signing-oracle attempt)",
+        ));
+    }
+    Ok(())
 }
 
 /// Decode a bech32m recipient address to its 32-byte puzzle hash, fail-closed.
@@ -939,6 +1028,94 @@ mod tests {
             foreign_signer.sign_unsigned(&unsigned).unwrap_err().code,
             WalletErrorCode::SpendValidationFailed,
         );
+    }
+
+    /// #1058 CRITICAL (signing-oracle): a malicious engine sends BENIGN, fully-consistent
+    /// coin_spends + summary (they pass verify) but swaps `required_signatures` to an entry NOT
+    /// derived from those coin spends — an `AGG_SIG_ME` over an attacker-chosen delegated puzzle that
+    /// would drain a real coin. The signer MUST refuse fail-closed and produce ZERO signatures,
+    /// because it signs ONLY the set re-derived from the verified coin spends. Before the fix this
+    /// returned Ok (the engine field was signed blindly) — that flip is the proof.
+    #[cfg(feature = "engine")]
+    #[tokio::test]
+    async fn refuses_a_required_signature_not_derived_from_the_coin_spends() {
+        use chia::puzzles::DeriveSynthetic;
+
+        let (signer, mut unsigned) = owned_xch_send("oracle", 600, 10).await;
+
+        // A forged AGG_SIG_ME message: (attacker delegated-puzzle hash) || (coin id) || genesis
+        // challenge — well-formed and network-bound (passes reject_unbound_message), keyed on a REAL
+        // wallet key (passes find_key), but NOT among the signatures the coin spends actually
+        // require. The verify+re-derive gate must catch it before any signing.
+        let wallet_synthetic_pk = master("oracle")
+            .address_key(0, 0)
+            .derive_synthetic()
+            .public_key();
+        let mut evil_message = vec![0xAB; 32]; // stand-in delegated-puzzle tree hash
+        evil_message.extend_from_slice(&[0xCD; 32]); // stand-in coin id
+        evil_message.extend_from_slice(&MAINNET_AGG_SIG_ME_EXTRA_DATA);
+        unsigned.required_signatures = vec![RequiredSignature {
+            public_key: wallet_synthetic_pk,
+            message: evil_message,
+        }];
+
+        let err = signer.sign_unsigned(&unsigned).unwrap_err();
+        assert_eq!(
+            err.code,
+            WalletErrorCode::SpendValidationFailed,
+            "an engine-supplied required signature not derived from the coin spends must be refused"
+        );
+    }
+
+    /// #1058 scoping: offer/option/tip spends (non-standard puzzles verify cannot yet decode) routed
+    /// through `sign_unsigned` are refused fail-closed until their decoders land. Uses the REAL Chia
+    /// settlement-payments puzzle (the offer-settlement class) as the coin's puzzle.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn refuses_an_offer_class_settlement_spend() {
+        use crate::types::{Amount, SpendOutput, TransactionSummary};
+        use chia::protocol::{Coin, CoinSpend};
+
+        // The canonical, immutable Chia settlement-payments puzzle (chia_puzzles::SETTLEMENT_PAYMENT
+        // V1) — an offer/settlement coin's puzzle, which is neither standard-layer nor CAT.
+        let settlement_puzzle = hex::decode(
+            "ff02ffff01ff02ff0affff04ff02ffff04ff03ff80808080ffff04ffff01ffff\
+             333effff02ffff03ff05ffff01ff04ffff04ff0cffff04ffff02ff1effff04ff\
+             02ffff04ff09ff80808080ff808080ffff02ff16ffff04ff02ffff04ff19ffff\
+             04ffff02ff0affff04ff02ffff04ff0dff80808080ff808080808080ff8080ff\
+             0180ffff02ffff03ff05ffff01ff04ffff04ff08ff0980ffff02ff16ffff04ff\
+             02ffff04ff0dffff04ff0bff808080808080ffff010b80ff0180ff02ffff03ff\
+             ff07ff0580ffff01ff0bffff0102ffff02ff1effff04ff02ffff04ff09ff8080\
+             8080ffff02ff1effff04ff02ffff04ff0dff8080808080ffff01ff0bffff0101\
+             ff058080ff0180ff018080",
+        )
+        .unwrap();
+        let coin = Coin::new(
+            chia::protocol::Bytes32::new([1u8; 32]),
+            chia::protocol::Bytes32::new([2u8; 32]),
+            1_000,
+        );
+        let spend = CoinSpend::new(coin, settlement_puzzle.into(), vec![0x80].into());
+        let unsigned = UnsignedSpend {
+            coin_spends: vec![spend],
+            required_signatures: vec![RequiredSignature {
+                public_key: PublicKey::default(),
+                message: bound_message("settlement"),
+            }],
+            summary: TransactionSummary {
+                outputs: vec![SpendOutput {
+                    address: crate::types::Address("xch1whatever".into()),
+                    amount: Amount(1_000),
+                    asset_id: None,
+                }],
+                fee: Amount(0),
+            },
+        };
+
+        let err = mainnet_signer("offer-class")
+            .sign_unsigned(&unsigned)
+            .unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
     }
 
     /// Regression for #1368, CAT path: a CAT send spends each CAT coin through its inner
