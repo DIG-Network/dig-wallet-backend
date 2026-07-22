@@ -8,11 +8,19 @@
 //! and fee. The signer then gates on THIS, closing the blind-signing gap.
 //!
 //! # Fail-closed
-//! Only the two spend classes the engine builds today are decodable: a standard-layer XCH send and
-//! a CAT send (each optionally with standard-layer XCH fee/support coins). Any coin spend the driver
-//! cannot fully parse+account for — a foreign puzzle, a value leak, a minted CAT — yields
+//! Four spend classes are decodable: a standard-layer XCH send, a CAT send, and an NFT or DID
+//! singleton spend (each optionally with standard-layer XCH fee/support coins). Every class is
+//! owner-controlled through the SAME standard-layer p2 puzzle, so all four share ONE fail-closed
+//! accounting core ([`Ledger::account_p2`]): the p2 MUST be a quote-form standard layer carrying
+//! exactly one committed `AGG_SIG_ME` and no other signature condition (controls #1058/#1519). A
+//! singleton's mojo amount is native XCH locked in the singleton, so NFT/DID spends fold into the
+//! same XCH value ledger as a plain send — an NFT/DID that melts value to an unaccounted output
+//! surfaces either as a visible recipient or as broken conservation, never a silent drain. Any coin
+//! spend the drivers cannot FULLY parse+account for — a foreign puzzle, a value leak, a minted CAT,
+//! a non-standard singleton owner, a mint/launcher spend — yields
 //! [`WalletErrorCode::SpendValidationFailed`]; the signer refuses to sign it. (Offers/options/tips
-//! reaching the signer are refused here until their decoders land — that is intended.)
+//! and NFT/DID MINT bundles reaching the signer are refused here until their decoders land — that is
+//! intended: B2 decodes the TRANSFER/update of an existing NFT/DID singleton, not launcher mints.)
 
 use std::collections::BTreeMap;
 
@@ -20,7 +28,7 @@ use chia::clvm_traits::FromClvm;
 use chia::clvm_utils::tree_hash;
 use chia::protocol::{Bytes32, CoinSpend};
 use chia::puzzles::Memos;
-use chia_wallet_sdk::driver::{Cat, Layer, Puzzle, StandardLayer};
+use chia_wallet_sdk::driver::{Cat, Did, Layer, Nft, Puzzle, StandardLayer};
 use chia_wallet_sdk::types::{run_puzzle, Condition};
 use chia_wallet_sdk::utils::Address as Bech32Address;
 use clvmr::serde::node_from_bytes;
@@ -70,15 +78,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     }
 
     let mut allocator = Allocator::new();
-    let mut recipients = Vec::new();
-    let mut change = Vec::new();
-    let mut fee: u64 = 0;
-
-    // Per-asset value ledgers (None-keyed XCH is tracked separately below).
-    let mut xch_in: u64 = 0;
-    let mut xch_out: u64 = 0;
-    let mut cat_in: BTreeMap<Bytes32, u64> = BTreeMap::new();
-    let mut cat_out: BTreeMap<Bytes32, u64> = BTreeMap::new();
+    let mut ledger = Ledger::default();
 
     for spend in coin_spends {
         let puzzle_ptr = node_from_bytes(&mut allocator, &spend.puzzle_reveal)
@@ -108,109 +108,211 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             Cat::parse(&allocator, spend.coin, puzzle, solution_ptr)
                 .map_err(|e| reject(format!("malformed CAT spend: {e:?}")))?
         {
-            // The CAT's inner p2 MUST be a standard layer whose delegated puzzle is quote-form —
-            // otherwise the signed message (tree-hash-only) would not commit to the actual outputs
-            // (see `committed_delegated_puzzle_message`).
-            if StandardLayer::parse_puzzle(&allocator, inner_puzzle)
-                .map_err(|e| reject(format!("malformed CAT inner puzzle: {e:?}")))?
-                .is_none()
-            {
-                return Err(reject(
-                    "CAT inner puzzle is not a standard layer; refusing to sign",
-                ));
-            }
-            let committed_message = committed_delegated_puzzle_message(&allocator, inner_solution)?;
-
-            let asset = cat.info.asset_id;
-            *cat_in.entry(asset).or_default() += spend.coin.amount;
-            let conditions = run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)?;
-            enforce_sole_agg_sig_me(&conditions, committed_message)?;
-            for condition in &conditions {
-                reject_unexpected_agg_sig(condition)?;
-                if let Some(create) = condition.as_create_coin() {
-                    *cat_out.entry(asset).or_default() += create.amount;
-                    classify(
-                        &mut recipients,
-                        &mut change,
-                        DecodedOutput {
-                            puzzle_hash: create.puzzle_hash,
-                            amount: create.amount,
-                            asset_id: Some(asset),
-                        },
-                        &create.memos,
-                    );
-                }
-            }
+            ledger.account_p2(
+                &mut allocator,
+                spend.coin.amount,
+                Some(cat.info.asset_id),
+                inner_puzzle,
+                inner_solution,
+            )?;
             continue;
         }
 
-        // A standard-layer XCH coin: its run conditions carry the XCH outputs + the fee.
+        // An NFT coin: an owner-controlled singleton. `Nft::parse` unwraps the singleton +
+        // state/ownership layers and hands back the SAME standard-layer p2 puzzle+solution the owner
+        // authorizes the spend through; its mojo amount is native XCH locked in the singleton, so it
+        // folds into the XCH ledger. A transfer recreates the singleton (1 mojo out) to the new
+        // owner; any value melted to an extra output surfaces there and is conserved-checked.
+        if let Some((_nft, inner_puzzle, inner_solution)) =
+            Nft::parse(&allocator, spend.coin, puzzle, solution_ptr)
+                .map_err(|e| reject(format!("malformed NFT spend: {e:?}")))?
+        {
+            ledger.account_p2(
+                &mut allocator,
+                spend.coin.amount,
+                None,
+                inner_puzzle,
+                inner_solution,
+            )?;
+            continue;
+        }
+
+        // A DID coin: an owner-controlled singleton, accounted exactly like an NFT. `Did::parse`
+        // yields the inner p2 spend only when the DID solution is a normal spend; a recovery/augmented
+        // solution (no p2 spend) cannot be value-accounted, so it is refused fail-closed.
+        if let Some((_did, inner_spend)) =
+            Did::parse(&allocator, spend.coin, puzzle, solution_ptr)
+                .map_err(|e| reject(format!("malformed DID spend: {e:?}")))?
+        {
+            let Some((inner_puzzle, inner_solution)) = inner_spend else {
+                return Err(reject(
+                    "DID spend carries no inner p2 spend (recovery/augmented); refusing to sign",
+                ));
+            };
+            ledger.account_p2(
+                &mut allocator,
+                spend.coin.amount,
+                None,
+                inner_puzzle,
+                inner_solution,
+            )?;
+            continue;
+        }
+
+        // A plain standard-layer XCH coin: its own run conditions carry the XCH outputs + the fee.
         if StandardLayer::parse_puzzle(&allocator, puzzle)
             .map_err(|e| reject(format!("malformed standard spend: {e:?}")))?
             .is_some()
         {
-            let committed_message = committed_delegated_puzzle_message(&allocator, solution_ptr)?;
-            xch_in += spend.coin.amount;
-            let conditions = run_conditions(&mut allocator, puzzle_ptr, solution_ptr)?;
-            enforce_sole_agg_sig_me(&conditions, committed_message)?;
-            for condition in &conditions {
-                reject_unexpected_agg_sig(condition)?;
-                if let Some(reserve) = condition.as_reserve_fee() {
-                    fee = fee
-                        .checked_add(reserve.amount)
-                        .ok_or_else(|| reject("fee overflow"))?;
-                    continue;
-                }
-                if let Some(create) = condition.as_create_coin() {
-                    xch_out += create.amount;
-                    classify(
-                        &mut recipients,
-                        &mut change,
-                        DecodedOutput {
-                            puzzle_hash: create.puzzle_hash,
-                            amount: create.amount,
-                            asset_id: None,
-                        },
-                        &create.memos,
-                    );
-                }
-            }
+            ledger.account_p2(&mut allocator, spend.coin.amount, None, puzzle, solution_ptr)?;
             continue;
         }
 
         return Err(reject(
-            "coin spend is neither a standard-layer XCH nor a CAT spend; refusing to sign",
+            "coin spend is not a standard-XCH, CAT, NFT, or DID spend; refusing to sign",
         ));
     }
 
-    // Value must conserve per asset, or the spend leaks/mints value.
-    let xch_out_plus_fee = xch_out
-        .checked_add(fee)
-        .ok_or_else(|| reject("XCH output + fee overflow"))?;
-    if xch_in != xch_out_plus_fee {
-        return Err(reject(format!(
-            "XCH value not conserved: in {xch_in} != out+fee {xch_out_plus_fee}"
-        )));
-    }
-    // Conservation is checked in BOTH directions over the union of assets seen as inputs or outputs:
-    // an output whose asset was never an input is a mint from thin air; an input asset with no (or a
-    // smaller) matching output is a melt/leak. Iterating only one side would miss the other.
-    for asset in cat_in.keys().chain(cat_out.keys()) {
-        let input = cat_in.get(asset).copied().unwrap_or(0);
-        let output = cat_out.get(asset).copied().unwrap_or(0);
-        if input != output {
-            return Err(reject(format!(
-                "CAT {} value not conserved: in {input} != out {output}",
-                hex::encode(asset)
-            )));
+    ledger.into_effect()
+}
+
+/// The mutable value-flow accounting state threaded through every coin spend in a bundle.
+///
+/// Fungible value is tracked per asset (`None`-keyed XCH separately from each CAT tail); NFT/DID
+/// singletons fold into the XCH ledger because a singleton's mojo amount IS native XCH. Recipients
+/// (hinted outputs) and change (un-hinted, owner-retained) are separated for the signer's gate.
+#[derive(Default)]
+struct Ledger {
+    recipients: Vec<DecodedOutput>,
+    change: Vec<DecodedOutput>,
+    fee: u64,
+    xch_in: u64,
+    xch_out: u64,
+    cat_in: BTreeMap<Bytes32, u64>,
+    cat_out: BTreeMap<Bytes32, u64>,
+}
+
+impl Ledger {
+    /// Account one owner-controlled standard-layer p2 spend — the common decode shared by a plain
+    /// XCH send, a CAT inner spend, and an NFT/DID singleton inner spend. `coin_amount` is the mojos
+    /// the (outer) coin carries; `asset` denominates them (`None` = native XCH, incl. singletons).
+    ///
+    /// Fail-closed custody controls, identical for every class (#1058/#1519): the p2 puzzle MUST be a
+    /// standard layer whose delegated puzzle is the canonical quote form, carrying EXACTLY ONE
+    /// `AGG_SIG_ME` committed to that quote's tree hash and no other signature condition — otherwise
+    /// the signed message would not commit to the exact outputs this decode accounts for.
+    fn account_p2(
+        &mut self,
+        allocator: &mut Allocator,
+        coin_amount: u64,
+        asset: Option<Bytes32>,
+        p2_puzzle: Puzzle,
+        p2_solution: clvmr::NodePtr,
+    ) -> WalletResult<()> {
+        if StandardLayer::parse_puzzle(allocator, p2_puzzle)
+            .map_err(|e| reject(format!("malformed standard/p2 puzzle: {e:?}")))?
+            .is_none()
+        {
+            return Err(reject(
+                "spend's owner puzzle is not a standard layer; refusing to sign",
+            ));
         }
+        let committed_message = committed_delegated_puzzle_message(allocator, p2_solution)?;
+
+        self.credit_input(asset, coin_amount)?;
+
+        let conditions = run_conditions(allocator, p2_puzzle.ptr(), p2_solution)?;
+        enforce_sole_agg_sig_me(&conditions, committed_message)?;
+        for condition in &conditions {
+            reject_unexpected_agg_sig(condition)?;
+            // A singleton (NFT/DID) inner spend cannot emit its own fee (it holds only its odd mojo);
+            // a RESERVE_FEE only ever appears in a plain XCH-denominated spend, so folding it into the
+            // XCH fee is correct for every class (a singleton that under-recreates fails conservation).
+            if let Some(reserve) = condition.as_reserve_fee() {
+                self.fee = self
+                    .fee
+                    .checked_add(reserve.amount)
+                    .ok_or_else(|| reject("fee overflow"))?;
+                continue;
+            }
+            if let Some(create) = condition.as_create_coin() {
+                self.debit_output(asset, create.amount)?;
+                classify(
+                    &mut self.recipients,
+                    &mut self.change,
+                    DecodedOutput {
+                        puzzle_hash: create.puzzle_hash,
+                        amount: create.amount,
+                        asset_id: asset,
+                    },
+                    &create.memos,
+                );
+            }
+        }
+        Ok(())
     }
 
-    Ok(SpendEffect {
-        recipients,
-        change,
-        fee,
-    })
+    /// Add `amount` to the input side of `asset`'s ledger (XCH when `None`), overflow-checked.
+    fn credit_input(&mut self, asset: Option<Bytes32>, amount: u64) -> WalletResult<()> {
+        match asset {
+            None => {
+                self.xch_in = self
+                    .xch_in
+                    .checked_add(amount)
+                    .ok_or_else(|| reject("XCH input overflow"))?;
+            }
+            Some(id) => *self.cat_in.entry(id).or_default() += amount,
+        }
+        Ok(())
+    }
+
+    /// Add `amount` to the output side of `asset`'s ledger (XCH when `None`), overflow-checked.
+    fn debit_output(&mut self, asset: Option<Bytes32>, amount: u64) -> WalletResult<()> {
+        match asset {
+            None => {
+                self.xch_out = self
+                    .xch_out
+                    .checked_add(amount)
+                    .ok_or_else(|| reject("XCH output overflow"))?;
+            }
+            Some(id) => *self.cat_out.entry(id).or_default() += amount,
+        }
+        Ok(())
+    }
+
+    /// Enforce per-asset value conservation and produce the [`SpendEffect`]. Value must conserve or
+    /// the spend leaks/mints: XCH `in == out + fee`, and every CAT tail `in == out`.
+    fn into_effect(self) -> WalletResult<SpendEffect> {
+        let xch_out_plus_fee = self
+            .xch_out
+            .checked_add(self.fee)
+            .ok_or_else(|| reject("XCH output + fee overflow"))?;
+        if self.xch_in != xch_out_plus_fee {
+            return Err(reject(format!(
+                "XCH value not conserved: in {} != out+fee {xch_out_plus_fee}",
+                self.xch_in
+            )));
+        }
+        // Conservation is checked in BOTH directions over the union of assets seen as inputs or
+        // outputs: an output whose asset was never an input is a mint from thin air; an input asset
+        // with no (or a smaller) matching output is a melt/leak. Iterating one side would miss the
+        // other.
+        for asset in self.cat_in.keys().chain(self.cat_out.keys()) {
+            let input = self.cat_in.get(asset).copied().unwrap_or(0);
+            let output = self.cat_out.get(asset).copied().unwrap_or(0);
+            if input != output {
+                return Err(reject(format!(
+                    "CAT {} value not conserved: in {input} != out {output}",
+                    hex::encode(asset)
+                )));
+            }
+        }
+        Ok(SpendEffect {
+            recipients: self.recipients,
+            change: self.change,
+            fee: self.fee,
+        })
+    }
 }
 
 /// Re-derive the human-facing [`TransactionSummary`] from `coin_spends` alone — the authoritative
