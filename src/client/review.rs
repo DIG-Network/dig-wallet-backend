@@ -41,9 +41,16 @@ fn render_amount(amount: Amount, is_xch: bool) -> String {
 }
 
 /// Decode an unsigned spend into a human-readable summary for review.
+///
+/// The rendered value flow is re-derived straight from the coin spends
+/// ([`super::verify::derive_summary`], #1058) so the confirm dialog shows what the transaction
+/// ACTUALLY does — the same authoritative summary the signer gates on — never the engine's
+/// (potentially lying) claim. If the spend cannot be independently decoded the engine summary is
+/// shown as a last resort, but [`super::signer::LocalSigner::sign_unsigned`] will then refuse it.
 pub fn decode(unsigned: &UnsignedSpend) -> HumanReadableSummary {
-    let lines = unsigned
-        .summary
+    let summary = super::verify::derive_summary(&unsigned.coin_spends)
+        .unwrap_or_else(|_| unsigned.summary.clone());
+    let lines = summary
         .outputs
         .iter()
         .map(|out| {
@@ -63,7 +70,7 @@ pub fn decode(unsigned: &UnsignedSpend) -> HumanReadableSummary {
 
     HumanReadableSummary {
         lines,
-        fee_line: format!("Fee {} XCH", render_amount(unsigned.summary.fee, true)),
+        fee_line: format!("Fee {} XCH", render_amount(summary.fee, true)),
         coin_spend_count: unsigned.coin_spends.len(),
         required_signature_count: unsigned.required_signatures.len(),
     }

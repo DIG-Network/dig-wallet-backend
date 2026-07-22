@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.14.0] - 2026-07-21
+
+### Bug Fixes
+- **signer:** Sign standard-layer synthetic-key spends (#1368) — `find_key` now also matches the BLS
+  synthetic key (`derive_synthetic`, canonical `DEFAULT_HIDDEN_PUZZLE_HASH`) curried into
+  `p2_delegated_puzzle_or_hidden_puzzle`, so normal XCH/CAT sends can be signed. Previously every
+  standard-layer spend failed with `SigningFailed`.
+
+### Features
+- **signer:** Verify coin spends before signing (#1058) — `client::verify::{analyze, derive_summary}`
+  independently reconstructs a spend's value flow from its `CoinSpend`s via the chia-wallet-sdk
+  drivers. `sign_unsigned` gates on it fail-closed: every change output must return to the wallet,
+  the engine summary must match the re-derived recipients + fee, and any spend that cannot be fully
+  accounted for is refused — closing the blind-signing gap. `client::review::decode` renders the
+  authoritative re-derived summary.
+
 ## [0.13.0] - 2026-07-21
 
 ### Bug Fixes
