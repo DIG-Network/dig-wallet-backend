@@ -360,7 +360,13 @@ Used by dig-app. The subscriber + identity provider + signer.
   change, fee }` parses each coin spend back through the chia-wallet-sdk drivers it was built with
   (`Cat::parse` for a CAT, `StandardLayer` for standard XCH), runs each puzzle+solution to obtain its
   conditions, sorts `CREATE_COIN`s into hinted (recipient) vs un-hinted (change), sums `RESERVE_FEE`,
-  and enforces per-asset value conservation. `derive_summary(&[CoinSpend]) -> TransactionSummary`
+  and enforces per-asset value conservation. Before trusting a reveal it MUST bind the reveal to the
+  coin: `sha256tree(puzzle_reveal)` MUST equal `coin.puzzle_hash`, or the reveal is a substituted
+  puzzle the coin never committed to and the spend is refused (#1518). For every standard-layer coin
+  it MUST also find EXACTLY ONE `AGG_SIG_ME` condition whose message equals `sha256tree(delegated_
+  puzzle)` — zero (nothing binds a signature to the coin), more than one (a second `AGG_SIG_ME` could
+  launder a blank-check signature for another coin through a benign carrier), or a wrong-hash
+  `AGG_SIG_ME` are each refused (#1519). `derive_summary(&[CoinSpend]) -> TransactionSummary`
   wraps it for display. Only the standard-XCH-send and CAT-send classes the engine builds are
   decodable; any coin spend that cannot be FULLY accounted for (a foreign puzzle, undecodable bytes,
   a value leak/mint) is refused fail-closed with `WalletErrorCode::SpendValidationFailed`.
@@ -400,6 +406,13 @@ Used by dig-app. The subscriber + identity provider + signer.
      the same signature a reusable blank check authorizing different outputs. Only a bare quote makes
      `sha256tree(delegated_puzzle)` fully commit to the exact conditions. Non-quote → refused
      fail-closed. Only non-ME agg_sig conditions are additionally rejected (see control 1).
+  5. **Reveal-bound-to-coin (#1518).** `verify::analyze` requires `sha256tree(puzzle_reveal) ==
+     coin.puzzle_hash` for every coin spend before decoding it, so the value flow it derives is always
+     the coin's OWN on-chain-committed program, never a substituted reveal.
+  6. **Sole committed AGG_SIG_ME (#1519).** `verify::analyze` requires each standard-layer coin to
+     carry EXACTLY ONE `AGG_SIG_ME`, committing to `sha256tree(delegated_puzzle)` — the message the
+     re-derived outputs come from. Zero, duplicate, or wrong-hash `AGG_SIG_ME` is refused, so no
+     extra signature can be laundered and the signed message provably matches the reviewed outputs.
   - **Signing scope (fail-closed).** `sign_unsigned` signs ONLY the standard-XCH-send and CAT-send
     classes `client::verify` can decode. An offer (settlement), option, or tip `UnsignedSpend` routed
     through it is refused (`SpendValidationFailed`) until its verify decoder lands.
