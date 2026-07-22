@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.15.0] - 2026-07-22
+
+### Bug Fixes
+- **verify:** Bind puzzle_reveal to coin + require sole committed AGG_SIG_ME (#1518, #1519) (#20)
+
 ## [0.14.0] - 2026-07-22
 
 ### Bug Fixes
