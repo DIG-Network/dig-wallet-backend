@@ -8,18 +8,23 @@
 //! [`crate::engine::signer::RemoteSigner`], for which [`LocalSigner`] is the concrete impl.
 //!
 //! # Custody controls (fail-closed)
-//! Two properties defend the signer against a compromised or buggy engine handing it dangerous
-//! bytes to sign:
+//! The signer defends against a compromised or buggy engine (it is reachable as a `RemoteSigner`
+//! over IPC) handing it dangerous bytes to sign:
 //!
-//! 1. **AGG_SIG_ME binding — refuse `AGG_SIG_UNSAFE`.** Every message the signer signs MUST be
-//!    bound to the network by ending with the network's AGG_SIG_ME additional data (the genesis
-//!    challenge). A consensus-valid `AGG_SIG_ME`-family message always carries this suffix; an
-//!    unbound `AGG_SIG_UNSAFE` message must not (consensus rejects an `UNSAFE` message ending with
-//!    it). Refusing unbound messages stops the engine from obtaining a signature that could be
-//!    replayed against a different coin.
+//! 1. **Only forced standard-layer `AGG_SIG_ME` requirements are ever signed.** `sign_unsigned`
+//!    re-derives the required signatures FROM the verified coin spends and keeps ONLY those whose
+//!    SDK-extracted kind is `AGG_SIG_ME` (`domain_string == Some(me())`). Every other agg_sig kind —
+//!    `AGG_SIG_UNSAFE` (raw, coin-unbound, attacker-chosen message) and the Parent/Puzzle/Amount/…
+//!    families — is refused fail-closed, so the engine cannot launder an arbitrary drain
+//!    authorization through a benign carrier spend. The engine-supplied `required_signatures` field
+//!    is untrusted (only cross-checked), never the signing source. (`verify::analyze` additionally
+//!    rejects any coin spend carrying a non-ME agg_sig condition, defense-in-depth.)
 //! 2. **Key-must-match, fail-closed.** A required signature whose public key the signer cannot
 //!    reproduce from its own derivation is rejected — the signer never fabricates or skips a
 //!    signature.
+//! 3. **Verify-before-sign.** No signature is produced until `verify::analyze` has independently
+//!    accounted for the coin spends' value flow and the reviewed summary matches (see
+//!    [`LocalSigner::sign_unsigned`]).
 
 use async_trait::async_trait;
 use chia::bls::{aggregate, sign as bls_sign, PublicKey, SecretKey, Signature};
@@ -305,13 +310,31 @@ impl LocalSigner {
                     )
                 })?;
 
+        let me_domain = constants.me();
         let mut required = Vec::with_capacity(extracted.len());
         for item in extracted {
             match item {
-                SdkRequiredSignature::Bls(bls) => required.push(crate::types::RequiredSignature {
-                    public_key: bls.public_key,
-                    message: bls.message(),
-                }),
+                SdkRequiredSignature::Bls(bls) => {
+                    // ONLY force-bound AGG_SIG_ME requirements are ever signed. The SDK sets
+                    // `domain_string == Some(me())` exactly for AGG_SIG_ME; it is `None` for
+                    // AGG_SIG_UNSAFE (raw, coin-unbound, attacker-chosen message) and a DIFFERENT
+                    // domain for the ParentAmount/Puzzle/… kinds. Signing an UNSAFE (or any non-ME)
+                    // requirement would let a malicious engine launder an arbitrary AGG_SIG_ME drain
+                    // authorization for another coin through a benign-looking carrier spend — so any
+                    // non-ME agg_sig requirement is refused fail-closed. A standard-XCH/CAT send only
+                    // ever needs the per-coin standard-layer AGG_SIG_ME.
+                    if bls.domain_string != Some(me_domain) {
+                        return Err(WalletError::new(
+                            WalletErrorCode::SpendValidationFailed,
+                            "a non-AGG_SIG_ME signature requirement is not signable (possible \
+                             AGG_SIG_UNSAFE laundering)",
+                        ));
+                    }
+                    required.push(crate::types::RequiredSignature {
+                        public_key: bls.public_key,
+                        message: bls.message(),
+                    });
+                }
                 SdkRequiredSignature::Secp(_) => {
                     return Err(WalletError::new(
                         WalletErrorCode::SpendValidationFailed,
@@ -1116,6 +1139,108 @@ mod tests {
             .sign_unsigned(&unsigned)
             .unwrap_err();
         assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    /// Build a standard-layer self-send coin spend for `label` (conserving, wallet-owned change) whose
+    /// delegated puzzle ALSO emits `extra` conditions — the carrier a malicious engine would use to
+    /// smuggle an agg_sig. Returns the signer + an `UnsignedSpend` with a benign (empty-recipient)
+    /// summary. (#1058 laundering harness.)
+    #[cfg(feature = "engine")]
+    fn carrier_spend_with_conditions(
+        label: &str,
+        extra: chia_wallet_sdk::types::Conditions,
+    ) -> (LocalSigner, UnsignedSpend) {
+        use crate::types::{Amount, TransactionSummary};
+        use chia::protocol::{Bytes32, Coin};
+        use chia::puzzles::{standard::StandardArgs, DeriveSynthetic, Memos};
+        use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
+        use chia_wallet_sdk::types::Conditions;
+
+        let synthetic_pk = master(label)
+            .address_key(0, 0)
+            .derive_synthetic()
+            .public_key();
+        let puzzle_hash = Bytes32::from(StandardArgs::curry_tree_hash(synthetic_pk).to_bytes());
+        let coin = Coin::new(Bytes32::new([3u8; 32]), puzzle_hash, 1_000);
+
+        let mut ctx = SpendContext::new();
+        // A conserving self-send (change back to the wallet, no recipient, no fee) — benign on its
+        // own — plus the smuggled `extra` conditions.
+        let conditions = Conditions::new()
+            .create_coin(puzzle_hash, 1_000, Memos::None)
+            .extend(extra);
+        StandardLayer::new(synthetic_pk)
+            .spend(&mut ctx, coin, conditions)
+            .unwrap();
+        let coin_spends = ctx.take();
+
+        let unsigned = UnsignedSpend {
+            coin_spends,
+            required_signatures: vec![],
+            summary: TransactionSummary {
+                outputs: vec![],
+                fee: Amount(0),
+            },
+        };
+        (mainnet_signer(label), unsigned)
+    }
+
+    /// #1058 CRITICAL (AGG_SIG_UNSAFE laundering): a carrier coin spend that embeds
+    /// `AGG_SIG_UNSAFE(wallet_synthetic_key, M)` — where M is attacker-chosen bytes ending in the
+    /// genesis challenge (so the old suffix heuristic would pass) — MUST be refused fail-closed with
+    /// ZERO signatures. Only forced standard-layer AGG_SIG_ME is ever signed.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn refuses_an_embedded_agg_sig_unsafe() {
+        use chia::puzzles::DeriveSynthetic;
+        use chia_wallet_sdk::types::conditions::AggSigUnsafe;
+        use chia_wallet_sdk::types::{Condition, Conditions};
+
+        let synthetic_pk = master("unsafe-launder")
+            .address_key(0, 0)
+            .derive_synthetic()
+            .public_key();
+        // M = attacker delegated-puzzle hash || target coin id || genesis (ends in genesis).
+        let mut evil = vec![0xABu8; 32];
+        evil.extend_from_slice(&[0xCDu8; 32]);
+        evil.extend_from_slice(&MAINNET_AGG_SIG_ME_EXTRA_DATA);
+        let extra = Conditions::new().with(Condition::AggSigUnsafe(AggSigUnsafe::new(
+            synthetic_pk,
+            evil.into(),
+        )));
+
+        let (signer, unsigned) = carrier_spend_with_conditions("unsafe-launder", extra);
+        let err = signer.sign_unsigned(&unsigned).unwrap_err();
+        assert_eq!(
+            err.code,
+            WalletErrorCode::SpendValidationFailed,
+            "an embedded AGG_SIG_UNSAFE must be refused, never laundered into the signed set"
+        );
+    }
+
+    /// #1058: a carrier spend embedding a non-ME domain-separated agg_sig (AGG_SIG_PARENT) is
+    /// likewise refused — only AGG_SIG_ME is signable.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn refuses_an_embedded_non_me_agg_sig() {
+        use chia::puzzles::DeriveSynthetic;
+        use chia_wallet_sdk::types::conditions::AggSigParent;
+        use chia_wallet_sdk::types::{Condition, Conditions};
+
+        let synthetic_pk = master("parent-launder")
+            .address_key(0, 0)
+            .derive_synthetic()
+            .public_key();
+        let extra = Conditions::new().with(Condition::AggSigParent(AggSigParent::new(
+            synthetic_pk,
+            vec![0x11u8; 8].into(),
+        )));
+
+        let (signer, unsigned) = carrier_spend_with_conditions("parent-launder", extra);
+        assert_eq!(
+            signer.sign_unsigned(&unsigned).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+        );
     }
 
     /// Regression for #1368, CAT path: a CAT send spends each CAT coin through its inner

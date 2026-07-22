@@ -94,6 +94,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             let asset = cat.info.asset_id;
             *cat_in.entry(asset).or_default() += spend.coin.amount;
             for condition in run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)? {
+                reject_unexpected_agg_sig(&condition)?;
                 if let Some(create) = condition.into_create_coin() {
                     *cat_out.entry(asset).or_default() += create.amount;
                     classify(
@@ -118,6 +119,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
         {
             xch_in += spend.coin.amount;
             for condition in run_conditions(&mut allocator, puzzle_ptr, solution_ptr)? {
+                reject_unexpected_agg_sig(&condition)?;
                 if let Some(reserve) = condition.as_reserve_fee() {
                     fee = fee
                         .checked_add(reserve.amount)
@@ -223,6 +225,31 @@ fn classify(
     } else {
         change.push(output);
     }
+}
+
+/// Defense-in-depth (#1058): a standard-XCH/CAT send's only legitimate signature requirement is the
+/// per-coin standard-layer `AGG_SIG_ME`. Any OTHER agg_sig condition emitted by a coin's delegated
+/// puzzle — `AGG_SIG_UNSAFE` (raw attacker-chosen message) or the Parent/Puzzle/Amount/… families —
+/// is anomalous in these classes and could smuggle a drain authorization for another coin; reject it
+/// fail-closed. `AGG_SIG_ME` is permitted (the signer re-derives + signs exactly those). This mirrors
+/// the kind filter in the signer, one layer earlier.
+fn reject_unexpected_agg_sig(condition: &Condition) -> WalletResult<()> {
+    let forbidden = matches!(
+        condition,
+        Condition::AggSigUnsafe(_)
+            | Condition::AggSigParent(_)
+            | Condition::AggSigPuzzle(_)
+            | Condition::AggSigAmount(_)
+            | Condition::AggSigPuzzleAmount(_)
+            | Condition::AggSigParentAmount(_)
+            | Condition::AggSigParentPuzzle(_)
+    );
+    if forbidden {
+        return Err(reject(
+            "unexpected non-AGG_SIG_ME signature condition in a send spend (refusing to sign)",
+        ));
+    }
+    Ok(())
 }
 
 /// Encode a puzzle hash as an `xch1…` bech32m address (the display form recipients are shown in).
