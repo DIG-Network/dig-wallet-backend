@@ -91,6 +91,19 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             Cat::parse(&allocator, spend.coin, puzzle, solution_ptr)
                 .map_err(|e| reject(format!("malformed CAT spend: {e:?}")))?
         {
+            // The CAT's inner p2 MUST be a standard layer whose delegated puzzle is quote-form —
+            // otherwise the signed message (tree-hash-only) would not commit to the actual outputs
+            // (see `require_quote_form_delegated_puzzle`).
+            if StandardLayer::parse_puzzle(&allocator, inner_puzzle)
+                .map_err(|e| reject(format!("malformed CAT inner puzzle: {e:?}")))?
+                .is_none()
+            {
+                return Err(reject(
+                    "CAT inner puzzle is not a standard layer; refusing to sign",
+                ));
+            }
+            require_quote_form_delegated_puzzle(&allocator, inner_solution)?;
+
             let asset = cat.info.asset_id;
             *cat_in.entry(asset).or_default() += spend.coin.amount;
             for condition in run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)? {
@@ -117,6 +130,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             .map_err(|e| reject(format!("malformed standard spend: {e:?}")))?
             .is_some()
         {
+            require_quote_form_delegated_puzzle(&allocator, solution_ptr)?;
             xch_in += spend.coin.amount;
             for condition in run_conditions(&mut allocator, puzzle_ptr, solution_ptr)? {
                 reject_unexpected_agg_sig(&condition)?;
@@ -225,6 +239,39 @@ fn classify(
     } else {
         change.push(output);
     }
+}
+
+/// Require the standard-layer delegated puzzle in `standard_solution` to be the canonical QUOTED,
+/// solution-independent form `(q . conditions)` — CLVM quote, opcode `1` (#1058 CRITICAL#3).
+///
+/// The `p2_delegated_puzzle_or_hidden_puzzle` standard layer signs
+/// `sha256tree(delegated_puzzle) || coin_id || genesis` — it commits to the delegated puzzle's TREE
+/// HASH and the coin, but NOT to the delegated puzzle's SOLUTION. If the delegated puzzle were
+/// solution-malleable (e.g. an echo program that returns its solution as the condition list), the
+/// SAME signed message would authorize DIFFERENT outputs for different solutions — a reusable
+/// blank-check signature over the coin. Only when the delegated puzzle is a bare quote does
+/// `sha256tree(delegated_puzzle)` fully commit to the exact conditions, making "the value flow
+/// `analyze` verified" identical to "what the signature authorizes". The SDK's
+/// `StandardLayer::spend_with_conditions` always emits `clvm_quote!(conditions)`, so legitimate
+/// sends pass; anything else is refused fail-closed BEFORE the conditions are trusted.
+fn require_quote_form_delegated_puzzle(
+    allocator: &Allocator,
+    standard_solution: clvmr::NodePtr,
+) -> WalletResult<()> {
+    let solution = StandardLayer::parse_solution(allocator, standard_solution)
+        .map_err(|e| reject(format!("malformed standard-layer solution: {e:?}")))?;
+    // A quote is a pair whose first element is the atom `1`.
+    let clvmr::SExp::Pair(quote_op, _) = allocator.sexp(solution.delegated_puzzle) else {
+        return Err(reject(
+            "delegated puzzle is not quote-form (not a pair) — signature would not commit to outputs",
+        ));
+    };
+    if allocator.small_number(quote_op) != Some(1) {
+        return Err(reject(
+            "delegated puzzle is not the canonical quote form — signature would not commit to outputs",
+        ));
+    }
+    Ok(())
 }
 
 /// Defense-in-depth (#1058): a standard-XCH/CAT send's only legitimate signature requirement is the

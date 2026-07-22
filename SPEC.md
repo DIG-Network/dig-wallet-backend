@@ -392,6 +392,14 @@ Used by dig-app. The subscriber + identity provider + signer.
      UNTRUSTED (only cross-checked, never the signing source), so a malicious engine cannot use it as
      a signing oracle to obtain an `AGG_SIG_ME` over an arbitrary delegated puzzle. No `bls_sign`
      runs until the coin spends are independently accounted for — the signer never blind-signs.
+  4. **Quote-form delegated puzzle.** `verify::analyze` requires every standard-layer spend's
+     delegated puzzle (from the standard-layer solution) to be the canonical quoted, solution-
+     independent form `(q . conditions)` (CLVM quote, opcode `1`), on both the XCH and CAT-inner
+     paths. The standard layer signs `sha256tree(delegated_puzzle) || coin_id || genesis`, which does
+     NOT commit to the delegated puzzle's solution; a solution-malleable delegated puzzle would make
+     the same signature a reusable blank check authorizing different outputs. Only a bare quote makes
+     `sha256tree(delegated_puzzle)` fully commit to the exact conditions. Non-quote → refused
+     fail-closed. Only non-ME agg_sig conditions are additionally rejected (see control 1).
   - **Signing scope (fail-closed).** `sign_unsigned` signs ONLY the standard-XCH-send and CAT-send
     classes `client::verify` can decode. An offer (settlement), option, or tip `UnsignedSpend` routed
     through it is refused (`SpendValidationFailed`) until its verify decoder lands.

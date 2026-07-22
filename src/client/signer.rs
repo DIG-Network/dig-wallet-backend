@@ -1243,6 +1243,62 @@ mod tests {
         );
     }
 
+    /// #1058 CRITICAL#3 (solution-malleable delegated puzzle = reusable blank-check signature): the
+    /// standard layer signs `sha256tree(delegated_puzzle) || coin_id || genesis`, which does NOT
+    /// commit to the delegated puzzle's SOLUTION. A malicious engine spends coin C with a
+    /// SOLUTION-ECHO delegated puzzle (program `1`, which returns its solution as the condition list)
+    /// and a BENIGN solution (self-send); `analyze` sees benign outputs and the extracted AGG_SIG_ME
+    /// is over the puzzle TREE HASH only. The attacker then re-spends C with the SAME echo puzzle but
+    /// an EVIL solution (pay attacker) — the required signature is byte-identical, so the obtained
+    /// signature is a blank check that drains C. The signer MUST refuse: a delegated puzzle that is
+    /// not the canonical quote form `(1 . conditions)` is rejected fail-closed, ZERO signatures.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn refuses_a_solution_malleable_delegated_puzzle() {
+        use crate::types::{Amount, TransactionSummary};
+        use chia::protocol::{Bytes32, Coin};
+        use chia::puzzles::{standard::StandardArgs, DeriveSynthetic, Memos};
+        use chia_wallet_sdk::driver::{Spend, SpendContext, StandardLayer};
+        use chia_wallet_sdk::types::Conditions;
+
+        let synthetic_pk = master("malleable")
+            .address_key(0, 0)
+            .derive_synthetic()
+            .public_key();
+        let puzzle_hash = Bytes32::from(StandardArgs::curry_tree_hash(synthetic_pk).to_bytes());
+        let coin = Coin::new(Bytes32::new([3u8; 32]), puzzle_hash, 1_000);
+
+        let mut ctx = SpendContext::new();
+        // D_echo = the CLVM program `1` (returns its solution/environment verbatim as conditions):
+        // solution-malleable, NOT quote-form.
+        let echo_puzzle = ctx.alloc(&1u8).unwrap();
+        // A benign solution: a conserving self-send back to the wallet.
+        let benign = Conditions::new().create_coin(puzzle_hash, 1_000, Memos::None);
+        let benign_solution = ctx.alloc(&benign).unwrap();
+        let spend = StandardLayer::new(synthetic_pk)
+            .delegated_inner_spend(&mut ctx, Spend::new(echo_puzzle, benign_solution))
+            .unwrap();
+        ctx.spend(coin, spend).unwrap();
+        let coin_spends = ctx.take();
+
+        let unsigned = UnsignedSpend {
+            coin_spends,
+            required_signatures: vec![],
+            summary: TransactionSummary {
+                outputs: vec![],
+                fee: Amount(0),
+            },
+        };
+        let err = mainnet_signer("malleable")
+            .sign_unsigned(&unsigned)
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            WalletErrorCode::SpendValidationFailed,
+            "a non-quote (solution-malleable) delegated puzzle must be refused"
+        );
+    }
+
     /// Regression for #1368, CAT path: a CAT send spends each CAT coin through its inner
     /// `StandardLayer`, so the extracted required signature likewise names the SYNTHETIC key. The
     /// signer must reproduce it and the aggregate must verify.
