@@ -24,6 +24,7 @@
 use async_trait::async_trait;
 use chia::bls::{aggregate, sign as bls_sign, PublicKey, SecretKey, Signature};
 use chia::protocol::SpendBundle;
+use chia::puzzles::DeriveSynthetic;
 
 use crate::types::{
     IdentityRef, Network, SignedBundle, UnsignedSpend, WalletError, WalletErrorCode, WalletResult,
@@ -130,11 +131,30 @@ impl LocalSigner {
 
     /// Find the secret key matching `target` among the active profile's derived address keys,
     /// searching indices `0..address_gap`. `None` when no derived key matches (fail-closed).
+    ///
+    /// For each derived address key TWO candidates are tried, in order:
+    ///
+    /// 1. the RAW derived key — matches an `AGG_SIG_UNSAFE`/non-standard requirement keyed directly
+    ///    on the wallet's derivation, and
+    /// 2. the standard-layer SYNTHETIC key — `derive_synthetic()` against the canonical
+    ///    [`DEFAULT_HIDDEN_PUZZLE_HASH`](chia::puzzles::DEFAULT_HIDDEN_PUZZLE_HASH). This is the key
+    ///    `p2_delegated_puzzle_or_hidden_puzzle` (`StandardLayer`) curries into a coin's puzzle, so
+    ///    the required signature a normal XCH/CAT send extracts names the SYNTHETIC public key, never
+    ///    the raw one (#1368). When it matches, the synthetic SECRET key is returned — the one that
+    ///    actually authorizes the spend.
+    ///
+    /// The synthetic derivation comes from chia-puzzle-types' [`DeriveSynthetic`] — the crate's own
+    /// vetted BLS offset, never hand-rolled here.
     fn find_key(&self, target: &PublicKey) -> Option<SecretKey> {
         let profile = self.identity.profile_ix;
-        (0..self.address_gap)
-            .map(|ix| self.master.address_key(profile, ix))
-            .find(|sk| &sk.public_key() == target)
+        (0..self.address_gap).find_map(|ix| {
+            let raw = self.master.address_key(profile, ix);
+            if &raw.public_key() == target {
+                return Some(raw);
+            }
+            let synthetic = raw.derive_synthetic();
+            (&synthetic.public_key() == target).then_some(synthetic)
+        })
     }
 
     /// The custody core: verify every required signature is a network-bound message the signer can
@@ -526,6 +546,227 @@ mod tests {
         // And decap works with the same holder.
         let peer = mainnet_signer("both-peer");
         assert!(signer.decap(&peer.identity_public_key_bytes()).is_ok());
+    }
+
+    /// Regression for #1368: a real standard-layer XCH send requires the BLS SYNTHETIC key (the one
+    /// curried into `p2_delegated_puzzle_or_hidden_puzzle`), NOT the raw derived key. The signer MUST
+    /// match the synthetic key, sign, and produce an aggregate that verifies against the synthetic
+    /// public key. Before the fix `find_key` only compared the raw derived key, so this returned
+    /// `SigningFailed` and normal XCH sends could not be signed at all.
+    #[cfg(feature = "engine")]
+    #[tokio::test]
+    async fn local_signer_signs_standard_layer_synthetic_key() {
+        use crate::engine::build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
+        use crate::types::{Address, AssetId, Amount, SendXchRequest};
+        use chia::protocol::Coin;
+        use chia::puzzles::{standard::StandardArgs, DeriveSynthetic};
+        use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature as SdkRequiredSignature};
+        use chia_wallet_sdk::utils::Address as Bech32Address;
+        use clvmr::Allocator;
+        use std::sync::Arc;
+
+        const LABEL: &str = "synthetic-standard-layer";
+
+        // The synthetic standard-layer key that actually controls a real wallet coin.
+        let synthetic_pk = master(LABEL).address_key(0, 0).derive_synthetic().public_key();
+        let puzzle_hash =
+            chia::protocol::Bytes32::from(StandardArgs::curry_tree_hash(synthetic_pk).to_bytes());
+        let coin = Coin::new(chia::protocol::Bytes32::new([3u8; 32]), puzzle_hash, 1_000);
+
+        // A minimal SpendInputs provider exposing that one coin + its synthetic public key.
+        struct OneCoin {
+            coin: Coin,
+            puzzle_hash: chia::protocol::Bytes32,
+            synthetic_pk: PublicKey,
+        }
+        impl SpendInputs for OneCoin {
+            fn spendable_xch(&self, _: &IdentityRef) -> WalletResult<Vec<Coin>> {
+                Ok(vec![self.coin])
+            }
+            fn spendable_cat(
+                &self,
+                _: &IdentityRef,
+                _: &AssetId,
+            ) -> WalletResult<Vec<chia_wallet_sdk::driver::Cat>> {
+                Ok(vec![])
+            }
+            fn synthetic_key(&self, ph: chia::protocol::Bytes32) -> Option<PublicKey> {
+                (ph == self.puzzle_hash).then_some(self.synthetic_pk)
+            }
+            fn change_puzzle_hash(&self, _: &IdentityRef) -> WalletResult<chia::protocol::Bytes32> {
+                Ok(self.puzzle_hash)
+            }
+        }
+
+        let inputs = Arc::new(OneCoin {
+            coin,
+            puzzle_hash,
+            synthetic_pk,
+        });
+        let builder = SdkSpendBuilder::new(inputs, Network::Mainnet, 500);
+
+        // A real recipient address.
+        let recipient = Address(
+            Bech32Address::new(chia::protocol::Bytes32::new([7u8; 32]), "xch".into())
+                .encode()
+                .unwrap(),
+        );
+        let unsigned = builder
+            .build_send_xch(SendXchRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                to: recipient,
+                amount: Amount(600),
+                fee: Amount(10),
+            })
+            .await
+            .expect("engine builds a standard-layer XCH send");
+
+        // The extracted required signatures name the SYNTHETIC key (that is the whole point).
+        assert!(!unsigned.required_signatures.is_empty());
+
+        // The signer holds the master key and must reproduce the synthetic key to sign.
+        let signer = mainnet_signer(LABEL);
+        let signed = signer
+            .sign(unsigned.clone())
+            .await
+            .expect("signer must sign a standard-layer synthetic-key spend (#1368)");
+
+        // The aggregate verifies against every (synthetic public key, message) pair — proof the
+        // produced signature is the RIGHT one, not merely that no error was returned.
+        let mut allocator = Allocator::new();
+        let constants = AggSigConstants::new(chia::protocol::Bytes32::new(
+            dig_constants::CHIA_L1_MAINNET_AGG_SIG_ME,
+        ));
+        let extracted = SdkRequiredSignature::from_coin_spends(
+            &mut allocator,
+            &unsigned.coin_spends,
+            &constants,
+        )
+        .unwrap();
+        let pairs: Vec<(PublicKey, Vec<u8>)> = extracted
+            .into_iter()
+            .map(|item| match item {
+                SdkRequiredSignature::Bls(bls) => (bls.public_key, bls.message()),
+                SdkRequiredSignature::Secp(_) => panic!("unexpected secp"),
+            })
+            .collect();
+        assert!(aggregate_verify(
+            &signed.bundle.aggregated_signature,
+            pairs.iter().map(|(pk, m)| (pk, m.as_slice())),
+        ));
+        // Sanity: at least one required key is the synthetic key, not the raw derived key.
+        let raw_pk = master(LABEL).address_public_key(0, 0);
+        assert!(
+            pairs.iter().any(|(pk, _)| *pk == synthetic_pk),
+            "the spend must require the synthetic key"
+        );
+        assert!(
+            pairs.iter().all(|(pk, _)| *pk != raw_pk),
+            "a standard-layer spend never requires the raw derived key"
+        );
+    }
+
+    /// Regression for #1368, CAT path: a CAT send spends each CAT coin through its inner
+    /// `StandardLayer`, so the extracted required signature likewise names the SYNTHETIC key. The
+    /// signer must reproduce it and the aggregate must verify.
+    #[cfg(feature = "engine")]
+    #[tokio::test]
+    async fn local_signer_signs_cat_send_synthetic_key() {
+        use crate::engine::build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
+        use crate::types::{Address, AssetId, Amount, SendCatRequest};
+        use chia::protocol::{Bytes32, Coin};
+        use chia::puzzles::{standard::StandardArgs, DeriveSynthetic};
+        use chia_wallet_sdk::driver::{Cat, SpendContext};
+        use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature as SdkRequiredSignature};
+        use chia_wallet_sdk::types::Conditions;
+        use chia_wallet_sdk::utils::Address as Bech32Address;
+        use clvmr::Allocator;
+        use std::sync::Arc;
+
+        const LABEL: &str = "synthetic-cat-layer";
+
+        let synthetic_pk = master(LABEL).address_key(0, 0).derive_synthetic().public_key();
+        let wallet_ph = Bytes32::from(StandardArgs::curry_tree_hash(synthetic_pk).to_bytes());
+
+        // Mint a real CAT whose inner p2 puzzle is controlled by the synthetic key.
+        let mut mint_ctx = SpendContext::new();
+        let genesis = Coin::new(Bytes32::new([5u8; 32]), wallet_ph, 1_000);
+        let hint = mint_ctx.hint(wallet_ph).unwrap();
+        let create = Conditions::new().create_coin(wallet_ph, 1_000, hint);
+        let (_, cats) =
+            Cat::issue_with_coin(&mut mint_ctx, genesis.coin_id(), 1_000, create).unwrap();
+        let cat = cats[0];
+
+        struct CatInputs {
+            cat: Cat,
+            wallet_ph: Bytes32,
+            synthetic_pk: PublicKey,
+        }
+        impl SpendInputs for CatInputs {
+            fn spendable_xch(&self, _: &IdentityRef) -> WalletResult<Vec<Coin>> {
+                Ok(vec![])
+            }
+            fn spendable_cat(&self, _: &IdentityRef, _: &AssetId) -> WalletResult<Vec<Cat>> {
+                Ok(vec![self.cat])
+            }
+            fn synthetic_key(&self, ph: Bytes32) -> Option<PublicKey> {
+                (ph == self.wallet_ph).then_some(self.synthetic_pk)
+            }
+            fn change_puzzle_hash(&self, _: &IdentityRef) -> WalletResult<Bytes32> {
+                Ok(self.wallet_ph)
+            }
+        }
+
+        let builder = SdkSpendBuilder::new(
+            Arc::new(CatInputs {
+                cat,
+                wallet_ph,
+                synthetic_pk,
+            }),
+            Network::Mainnet,
+            500,
+        );
+
+        let recipient = Address(
+            Bech32Address::new(Bytes32::new([7u8; 32]), "xch".into())
+                .encode()
+                .unwrap(),
+        );
+        let unsigned = builder
+            .build_send_cat(SendCatRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                asset_id: AssetId("tail".into()),
+                to: recipient,
+                amount: Amount(600),
+                fee: Amount(0),
+            })
+            .await
+            .expect("engine builds a CAT send");
+        assert!(!unsigned.required_signatures.is_empty());
+
+        let signer = mainnet_signer(LABEL);
+        let signed = signer
+            .sign(unsigned.clone())
+            .await
+            .expect("signer must sign a CAT synthetic-key spend (#1368)");
+
+        let mut allocator = Allocator::new();
+        let constants =
+            AggSigConstants::new(Bytes32::new(dig_constants::CHIA_L1_MAINNET_AGG_SIG_ME));
+        let pairs: Vec<(PublicKey, Vec<u8>)> =
+            SdkRequiredSignature::from_coin_spends(&mut allocator, &unsigned.coin_spends, &constants)
+                .unwrap()
+                .into_iter()
+                .map(|item| match item {
+                    SdkRequiredSignature::Bls(bls) => (bls.public_key, bls.message()),
+                    SdkRequiredSignature::Secp(_) => panic!("unexpected secp"),
+                })
+                .collect();
+        assert!(aggregate_verify(
+            &signed.bundle.aggregated_signature,
+            pairs.iter().map(|(pk, m)| (pk, m.as_slice())),
+        ));
+        assert!(pairs.iter().any(|(pk, _)| *pk == synthetic_pk));
     }
 
     /// signer == engine byte-KAT (signer half). The signer requires every message to be bound to
