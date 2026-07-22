@@ -22,7 +22,8 @@
 //! the trait here lets the signer be built + tested against a key source without hand-rolling a
 //! keystore.
 
-use chia::bls::{DerivableKey, PublicKey, SecretKey};
+use chia::bls::{master_to_wallet_unhardened, DerivableKey, PublicKey, SecretKey};
+use chia::puzzles::DeriveSynthetic;
 use zeroize::Zeroizing;
 
 use crate::types::{WalletError, WalletResult};
@@ -90,6 +91,31 @@ impl MasterKey {
         self.address_key(profile_ix, address_ix).public_key()
     }
 
+    /// Derive the CANONICAL Chia wallet SIGNING (money) key at wallet index `index`:
+    /// `master_to_wallet_unhardened(master, index).derive_synthetic()` — the unhardened wallet child
+    /// `m/12381/8444/2/index`, made synthetic against the canonical `DEFAULT_HIDDEN_PUZZLE_HASH`.
+    ///
+    /// This is the ONE derivation that controls real funds: the SYNTHETIC public key is what curries
+    /// the standard transaction puzzle, so its puzzle-tree-hash is the wallet's on-chain XCH address.
+    /// It is byte-identical to dig-account's `WalletKey` (`master_to_wallet_unhardened(seed, ix)
+    /// .derive_synthetic()`), the pre-cutover dig-app `WalletKey`, and every standard Chia wallet
+    /// (incl. Sage) — so a spend the money-signer authorizes lands at the SAME address every other
+    /// wallet reading the same seed sees. This is DISTINCT from the legacy profile path
+    /// [`address_key`](MasterKey::address_key) (`m/44'/8444'/…`), which is a different, never-funded
+    /// key set; wiring a consumer's money spends over that legacy path fund-LOCKS coins at the
+    /// canonical address (see the cross-round-trip golden in tests).
+    ///
+    /// Derived transiently per call so no long-lived copy of the money key is held.
+    pub fn wallet_signing_key(&self, index: u32) -> SecretKey {
+        master_to_wallet_unhardened(&self.master(), index).derive_synthetic()
+    }
+
+    /// The SYNTHETIC public key of the canonical wallet money key at `index` — the key that curries
+    /// the standard puzzle (and therefore identifies the wallet's on-chain address). Public material.
+    pub fn wallet_public_key(&self, index: u32) -> PublicKey {
+        self.wallet_signing_key(index).public_key()
+    }
+
     /// The dig-identity secret key at the canonical hardened path `m/12381'/8444'/9'/0'`
     /// (dig-identity SPEC §6a.1). This is a SINGLE per-wallet key — DISTINCT from the Chia wallet
     /// keys ([`address_key`](MasterKey::address_key), coin index `2`): it secures no coins, only the
@@ -147,6 +173,8 @@ pub trait MasterKeySource: Send + Sync {
 mod tests {
     use super::*;
     use chia::bls::{sign as bls_sign, verify as bls_verify};
+    use chia::puzzles::standard::StandardArgs;
+    use chia_wallet_sdk::utils::Address as Bech32Address;
     use sha2::{Digest, Sha256};
 
     /// A deterministic 32-byte test seed derived by hashing a label — NOT an integer-literal
@@ -222,6 +250,91 @@ mod tests {
     // Pinned from the first green run of `profile_zero_matches_golden_vector` — see that test.
     const GOLDEN_PROFILE_0_PUBKEY: &str =
         "8414b105c32eaac1095ad7f54ab41353c252d4567e5859b6cd69303ebcbc4f0ccf75917a70e1e1cbeddb838adbc2ee05";
+
+    // --- Canonical wallet (money) key — CROSS round-trip golden against dig-account -------------
+    //
+    // The all-`0x42` seed's canonical synthetic wallet key at index 0. These constants are
+    // COPIED VERBATIM from dig-account's frozen `WalletKey` golden (crates/40-application/
+    // dig-account/src/keys/wallet_key.rs — pk 884cc9a2… / ph e05ec4f5… / addr xch1up0vfat…), the
+    // ecosystem's canonical money-key contract. If `wallet_signing_key` ever drifts from that
+    // derivation the coins the money-signer controls diverge from where funds actually live (a
+    // fund-lock), so this cross-crate vector is the guard.
+    const SEED_0X42: [u8; 32] = [0x42; 32];
+    const DIG_ACCOUNT_GOLDEN_SYNTHETIC_PK: &str =
+        "884cc9a2b28a0aefe62ab1ccc6c5e638e48224d1a18a015260b40587e07c9132e929c3c3c1135494cd11cc70b36d7c34";
+    const DIG_ACCOUNT_GOLDEN_PUZZLE_HASH: &str =
+        "e05ec4f5685b878461988e9f26d3cb88556942d3c716c176d72eeeddfd9994a3";
+    const DIG_ACCOUNT_GOLDEN_ADDRESS: &str =
+        "xch1up0vfatgtwrcgcvc360jd57t3p2kjskncutvzakh9mhdmlvejj3shn8wln";
+
+    /// CROSS ROUND-TRIP GOLDEN: the SAME seed produces the SAME synthetic money key + puzzle hash +
+    /// address as dig-account's `WalletKey`. This is the release-first contract PR1 exists to hold —
+    /// a consumer wiring `WalletOps → LocalSigner` over `wallet_signing_key` controls exactly the
+    /// address dig-account (and Sage, and dig-app) computes for the same seed. A mismatch = fund-lock.
+    #[test]
+    fn wallet_signing_key_matches_dig_account_golden() {
+        let key = MasterKey::from_seed_bytes(SEED_0X42);
+        let pk = key.wallet_public_key(0);
+        assert_eq!(
+            hex::encode(pk.to_bytes()),
+            DIG_ACCOUNT_GOLDEN_SYNTHETIC_PK,
+            "canonical synthetic wallet pubkey drifted from dig-account's WalletKey golden (fund-lock)"
+        );
+        let puzzle_hash = StandardArgs::curry_tree_hash(pk);
+        assert_eq!(
+            hex::encode(puzzle_hash.to_bytes()),
+            DIG_ACCOUNT_GOLDEN_PUZZLE_HASH,
+        );
+        let address = Bech32Address::new(puzzle_hash.into(), "xch".to_string())
+            .encode()
+            .unwrap();
+        assert_eq!(address, DIG_ACCOUNT_GOLDEN_ADDRESS);
+    }
+
+    /// Non-vacuity: the LEGACY profile path (`m/44'/8444'/0'/0`) — the pre-fix money path — does NOT
+    /// match the canonical golden. This is exactly the drift the fix removes: signing a consumer's
+    /// money spends over the legacy set locks funds at the canonical address.
+    #[test]
+    fn legacy_profile_key_does_not_match_the_canonical_golden() {
+        let key = MasterKey::from_seed_bytes(SEED_0X42);
+        assert_ne!(
+            hex::encode(key.address_public_key(0, 0).to_bytes()),
+            DIG_ACCOUNT_GOLDEN_SYNTHETIC_PK,
+            "legacy profile path must be distinct from the canonical money key (that IS the drift)"
+        );
+    }
+
+    /// Non-vacuity: dropping `.derive_synthetic()` (the exact pre-fix bug shape) breaks the golden.
+    #[test]
+    fn dropping_synthetic_breaks_the_canonical_golden() {
+        let master = SecretKey::from_seed(&SEED_0X42);
+        let non_synthetic = master_to_wallet_unhardened(&master, 0).public_key();
+        assert_ne!(
+            hex::encode(non_synthetic.to_bytes()),
+            DIG_ACCOUNT_GOLDEN_SYNTHETIC_PK,
+        );
+    }
+
+    /// Distinct wallet indices derive distinct canonical money keys.
+    #[test]
+    fn distinct_wallet_indices_yield_distinct_canonical_keys() {
+        let key = MasterKey::from_seed_bytes(seed_from_label("canon-idx"));
+        assert_ne!(
+            key.wallet_public_key(0).to_bytes(),
+            key.wallet_public_key(1).to_bytes(),
+        );
+    }
+
+    /// The canonical wallet key actually signs + verifies (it is a usable BLS key).
+    #[test]
+    fn canonical_wallet_key_signs_and_verifies() {
+        let key = MasterKey::from_seed_bytes(seed_from_label("canon-sign"));
+        let sk = key.wallet_signing_key(0);
+        assert_eq!(sk.public_key(), key.wallet_public_key(0));
+        let msg = seed_from_label("canon-payload");
+        let sig = bls_sign(&sk, &msg);
+        assert!(bls_verify(&sig, &sk.public_key(), &msg));
+    }
 
     // --- G1-ECDH decap (dig-message recipient open) -------------------------------------------
 
