@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 
 use chia::clvm_traits::FromClvm;
+use chia::clvm_utils::tree_hash;
 use chia::protocol::{Bytes32, CoinSpend};
 use chia::puzzles::Memos;
 use chia_wallet_sdk::driver::{Cat, Layer, Puzzle, StandardLayer};
@@ -84,6 +85,22 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             .map_err(|e| reject(format!("undecodable puzzle reveal: {e:?}")))?;
         let solution_ptr = node_from_bytes(&mut allocator, &spend.solution)
             .map_err(|e| reject(format!("undecodable solution: {e:?}")))?;
+
+        // (#1518) Bind the reveal to the coin BEFORE trusting anything it decodes to. A coin commits
+        // on-chain only to its puzzle HASH; the `puzzle_reveal` is caller-supplied bytes. If the
+        // reveal does not hash to `coin.puzzle_hash` it is a substituted puzzle the coin never
+        // authorized — a malicious engine could pair a benign-looking reveal (that `analyze` accounts
+        // for cleanly) with a coin whose real puzzle does something else entirely. Reject fail-closed
+        // so every value flow this module derives is the coin's OWN authorized program.
+        let revealed_hash = Bytes32::new(tree_hash(&allocator, puzzle_ptr).to_bytes());
+        if revealed_hash != spend.coin.puzzle_hash {
+            return Err(reject(format!(
+                "puzzle reveal hashes to {} but the coin commits to {} (substituted puzzle)",
+                hex::encode(revealed_hash),
+                hex::encode(spend.coin.puzzle_hash)
+            )));
+        }
+
         let puzzle = Puzzle::parse(&allocator, puzzle_ptr);
 
         // A CAT coin: the value flows through its INNER p2 conditions, denominated in the asset.
@@ -93,7 +110,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
         {
             // The CAT's inner p2 MUST be a standard layer whose delegated puzzle is quote-form —
             // otherwise the signed message (tree-hash-only) would not commit to the actual outputs
-            // (see `require_quote_form_delegated_puzzle`).
+            // (see `committed_delegated_puzzle_message`).
             if StandardLayer::parse_puzzle(&allocator, inner_puzzle)
                 .map_err(|e| reject(format!("malformed CAT inner puzzle: {e:?}")))?
                 .is_none()
@@ -102,13 +119,15 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
                     "CAT inner puzzle is not a standard layer; refusing to sign",
                 ));
             }
-            require_quote_form_delegated_puzzle(&allocator, inner_solution)?;
+            let committed_message = committed_delegated_puzzle_message(&allocator, inner_solution)?;
 
             let asset = cat.info.asset_id;
             *cat_in.entry(asset).or_default() += spend.coin.amount;
-            for condition in run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)? {
-                reject_unexpected_agg_sig(&condition)?;
-                if let Some(create) = condition.into_create_coin() {
+            let conditions = run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)?;
+            enforce_sole_agg_sig_me(&conditions, committed_message)?;
+            for condition in &conditions {
+                reject_unexpected_agg_sig(condition)?;
+                if let Some(create) = condition.as_create_coin() {
                     *cat_out.entry(asset).or_default() += create.amount;
                     classify(
                         &mut recipients,
@@ -130,17 +149,19 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             .map_err(|e| reject(format!("malformed standard spend: {e:?}")))?
             .is_some()
         {
-            require_quote_form_delegated_puzzle(&allocator, solution_ptr)?;
+            let committed_message = committed_delegated_puzzle_message(&allocator, solution_ptr)?;
             xch_in += spend.coin.amount;
-            for condition in run_conditions(&mut allocator, puzzle_ptr, solution_ptr)? {
-                reject_unexpected_agg_sig(&condition)?;
+            let conditions = run_conditions(&mut allocator, puzzle_ptr, solution_ptr)?;
+            enforce_sole_agg_sig_me(&conditions, committed_message)?;
+            for condition in &conditions {
+                reject_unexpected_agg_sig(condition)?;
                 if let Some(reserve) = condition.as_reserve_fee() {
                     fee = fee
                         .checked_add(reserve.amount)
                         .ok_or_else(|| reject("fee overflow"))?;
                     continue;
                 }
-                if let Some(create) = condition.into_create_coin() {
+                if let Some(create) = condition.as_create_coin() {
                     xch_out += create.amount;
                     classify(
                         &mut recipients,
@@ -241,8 +262,9 @@ fn classify(
     }
 }
 
-/// Require the standard-layer delegated puzzle in `standard_solution` to be the canonical QUOTED,
-/// solution-independent form `(q . conditions)` — CLVM quote, opcode `1` (#1058 CRITICAL#3).
+/// The AGG_SIG_ME message a standard-layer coin's signature MUST commit to — `sha256tree` of its
+/// delegated puzzle — returned ONLY after proving that puzzle is the canonical QUOTED,
+/// solution-independent form `(q . conditions)` (CLVM quote, opcode `1`, #1058 CRITICAL#3).
 ///
 /// The `p2_delegated_puzzle_or_hidden_puzzle` standard layer signs
 /// `sha256tree(delegated_puzzle) || coin_id || genesis` — it commits to the delegated puzzle's TREE
@@ -254,10 +276,14 @@ fn classify(
 /// `analyze` verified" identical to "what the signature authorizes". The SDK's
 /// `StandardLayer::spend_with_conditions` always emits `clvm_quote!(conditions)`, so legitimate
 /// sends pass; anything else is refused fail-closed BEFORE the conditions are trusted.
-fn require_quote_form_delegated_puzzle(
+///
+/// The returned 32-byte tree hash is the exact message the coin's sole AGG_SIG_ME MUST carry (the
+/// standard puzzle emits `(AGG_SIG_ME synthetic_key sha256tree(delegated_puzzle))`); the caller
+/// enforces that with [`enforce_sole_agg_sig_me`] (#1519).
+fn committed_delegated_puzzle_message(
     allocator: &Allocator,
     standard_solution: clvmr::NodePtr,
-) -> WalletResult<()> {
+) -> WalletResult<[u8; 32]> {
     let solution = StandardLayer::parse_solution(allocator, standard_solution)
         .map_err(|e| reject(format!("malformed standard-layer solution: {e:?}")))?;
     // A quote is a pair whose first element is the atom `1`.
@@ -269,6 +295,47 @@ fn require_quote_form_delegated_puzzle(
     if allocator.small_number(quote_op) != Some(1) {
         return Err(reject(
             "delegated puzzle is not the canonical quote form — signature would not commit to outputs",
+        ));
+    }
+    Ok(tree_hash(allocator, solution.delegated_puzzle).to_bytes())
+}
+
+/// Enforce that a standard-layer coin's run conditions carry EXACTLY ONE `AGG_SIG_ME` and that it
+/// commits to `expected_message` — `sha256tree(delegated_puzzle)`, from
+/// [`committed_delegated_puzzle_message`] (#1519).
+///
+/// A legitimate standard/CAT send is authorized by precisely one signature: the per-coin
+/// standard-layer `AGG_SIG_ME` the `p2_delegated_puzzle_or_hidden_puzzle` puzzle emits over the
+/// delegated puzzle's tree hash. Three anomalies are refused fail-closed here, because each severs
+/// "the value flow `analyze` verified" from "what the signature authorizes":
+///
+/// - **Zero `AGG_SIG_ME`** — nothing binds a signature to this coin; the spend the human reviewed is
+///   not the thing being authorized.
+/// - **More than one `AGG_SIG_ME`** — a delegated puzzle may emit an EXTRA `AGG_SIG_ME` over an
+///   attacker-chosen message for the SAME wallet key, laundering a blank-check signature for another
+///   coin through this benign carrier (the extra ME shares the coin's genesis/coin-id binding, so
+///   the signer's per-message suffix check alone would not catch it).
+/// - **A wrong-hash `AGG_SIG_ME`** — a single ME whose message is NOT the committed delegated-puzzle
+///   hash signs something other than the conditions `analyze` accounted for.
+fn enforce_sole_agg_sig_me(
+    conditions: &[Condition],
+    expected_message: [u8; 32],
+) -> WalletResult<()> {
+    let mut agg_sig_me = conditions.iter().filter_map(Condition::as_agg_sig_me);
+    let Some(sole) = agg_sig_me.next() else {
+        return Err(reject(
+            "no AGG_SIG_ME condition — nothing binds a signature to this coin (refusing to sign)",
+        ));
+    };
+    if agg_sig_me.next().is_some() {
+        return Err(reject(
+            "more than one AGG_SIG_ME condition in a send spend (possible blank-check laundering)",
+        ));
+    }
+    if sole.message.as_ref() != expected_message.as_slice() {
+        return Err(reject(
+            "AGG_SIG_ME does not commit to the delegated-puzzle hash the outputs derive from \
+             (refusing to sign)",
         ));
     }
     Ok(())
@@ -475,6 +542,113 @@ mod tests {
         let spend = CoinSpend::new(coin, vec![0xff, 0xff].into(), vec![0xff, 0xff].into());
         assert_eq!(
             analyze(&[spend]).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+        );
+    }
+
+    /// #1518: a spend whose `puzzle_reveal` does NOT hash to the coin's committed `puzzle_hash` is a
+    /// substituted puzzle the coin never authorized — refused fail-closed BEFORE any value is derived
+    /// from it. (A legit spend is built, then the coin's committed puzzle hash is swapped so the
+    /// unchanged reveal no longer matches.)
+    #[tokio::test]
+    async fn substituted_puzzle_reveal_is_refused_1518() {
+        let unsigned = builder(vec![wallet_coin(1000, 1)], vec![])
+            .build_send_xch(xch_request(600, 10))
+            .await
+            .unwrap();
+        let mut spends = unsigned.coin_spends;
+        // Point the coin at a DIFFERENT committed puzzle hash while leaving the reveal untouched.
+        let original = spends[0].coin;
+        spends[0].coin = Coin::new(
+            original.parent_coin_info,
+            Bytes32::new([0x99; 32]),
+            original.amount,
+        );
+        assert_eq!(
+            analyze(&spends).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+        );
+    }
+
+    /// #1519: a real standard-layer spend whose delegated puzzle emits a SECOND `AGG_SIG_ME` (over an
+    /// attacker-chosen message for the same wallet key) — laundering a blank-check signature for
+    /// another coin through this benign carrier — is refused: exactly one `AGG_SIG_ME` is permitted.
+    #[tokio::test]
+    async fn a_second_embedded_agg_sig_me_is_refused_1519() {
+        use chia::protocol::Coin;
+        use chia::puzzles::Memos;
+        use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
+        use chia_wallet_sdk::types::conditions::AggSigMe;
+        use chia_wallet_sdk::types::Conditions;
+
+        let ph = wallet_ph();
+        let coin = Coin::new(Bytes32::new([3u8; 32]), ph, 1_000);
+        let mut ctx = SpendContext::new();
+        // A conserving self-send (benign) PLUS a smuggled extra AGG_SIG_ME.
+        let conditions =
+            Conditions::new()
+                .create_coin(ph, 1_000, Memos::None)
+                .with(Condition::AggSigMe(AggSigMe::new(
+                    test_public_key(),
+                    vec![0xABu8; 32].into(),
+                )));
+        StandardLayer::new(test_public_key())
+            .spend(&mut ctx, coin, conditions)
+            .unwrap();
+        assert_eq!(
+            analyze(&ctx.take()).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+        );
+    }
+
+    // ---- #1519 sole-AGG_SIG_ME enforcer, exercised directly for the zero / wrong-hash branches a
+    // real standard layer (which always emits exactly one correct AGG_SIG_ME) cannot produce. ----
+
+    use chia::protocol::Bytes;
+    use chia_wallet_sdk::types::conditions::AggSigMe;
+
+    fn agg_sig_me(message: [u8; 32]) -> Condition {
+        Condition::AggSigMe(AggSigMe::new(
+            test_public_key(),
+            Bytes::from(message.to_vec()),
+        ))
+    }
+
+    /// #1519: exactly one AGG_SIG_ME committing to the expected delegated-puzzle hash is accepted.
+    #[test]
+    fn sole_matching_agg_sig_me_is_accepted_1519() {
+        let expected = [0x11u8; 32];
+        assert!(enforce_sole_agg_sig_me(&[agg_sig_me(expected)], expected).is_ok());
+    }
+
+    /// #1519: zero AGG_SIG_ME — nothing binds a signature to the coin — is refused.
+    #[test]
+    fn zero_agg_sig_me_is_refused_1519() {
+        assert_eq!(
+            enforce_sole_agg_sig_me(&[], [0x11u8; 32]).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+        );
+    }
+
+    /// #1519: two AGG_SIG_ME conditions are refused (blank-check laundering surface).
+    #[test]
+    fn duplicate_agg_sig_me_is_refused_1519() {
+        let expected = [0x11u8; 32];
+        assert_eq!(
+            enforce_sole_agg_sig_me(&[agg_sig_me(expected), agg_sig_me(expected)], expected)
+                .unwrap_err()
+                .code,
+            WalletErrorCode::SpendValidationFailed,
+        );
+    }
+
+    /// #1519: a sole AGG_SIG_ME whose message is NOT the committed delegated-puzzle hash is refused.
+    #[test]
+    fn wrong_hash_agg_sig_me_is_refused_1519() {
+        assert_eq!(
+            enforce_sole_agg_sig_me(&[agg_sig_me([0xAAu8; 32])], [0x11u8; 32])
+                .unwrap_err()
+                .code,
             WalletErrorCode::SpendValidationFailed,
         );
     }
