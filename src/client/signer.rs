@@ -64,18 +64,32 @@ pub trait IdentitySigner: Send + Sync {
     async fn sign(&self, unsigned: UnsignedSpend) -> WalletResult<SignedBundle>;
 }
 
+/// Which HD derivation the signer's money keys use to match + own coins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalletKeyScheme {
+    /// The legacy profile path `m/44'/8444'/{profile_ix}'/{ix}` (#997) — a DISTINCT, never-funded
+    /// address set. Retained only for pre-canonical internal callers; NEVER controls real funds.
+    LegacyProfile,
+    /// The CANONICAL Chia wallet path `master_to_wallet_unhardened(master, ix).derive_synthetic()`
+    /// (`m/12381/8444/2/ix`, unhardened + synthetic) — byte-identical to dig-account's `WalletKey`,
+    /// the pre-cutover dig-app wallet, and every standard Chia wallet (incl. Sage). This is the set
+    /// funds ACTUALLY live at, so a consumer's money spends MUST sign through this scheme.
+    CanonicalWallet,
+}
+
 /// A signer that holds the master HD key in-process (dig-app side).
 ///
 /// Holds a [`MasterKey`] entirely within the client seam — it never crosses to the engine. On
-/// [`sign_unsigned`](LocalSigner::sign_unsigned) it derives the active profile's address keys,
-/// matches each [`crate::types::RequiredSignature`] to a derived key, signs the (network-bound) message with
-/// augmented BLS, and aggregates. Deliberately no `Debug`/`Serialize`/`Clone`: the held key never
-/// leaks.
+/// [`sign_unsigned`](LocalSigner::sign_unsigned) it derives the active wallet's address keys (via
+/// its [`WalletKeyScheme`]), matches each [`crate::types::RequiredSignature`] to a derived key,
+/// signs the (network-bound) message with augmented BLS, and aggregates. Deliberately no
+/// `Debug`/`Serialize`/`Clone`: the held key never leaks.
 pub struct LocalSigner {
     identity: IdentityRef,
     master: MasterKey,
     agg_sig_me_extra_data: [u8; 32],
     address_gap: u32,
+    scheme: WalletKeyScheme,
 }
 
 impl LocalSigner {
@@ -98,11 +112,29 @@ impl LocalSigner {
             master,
             agg_sig_me_extra_data,
             address_gap: DEFAULT_ADDRESS_GAP,
+            scheme: WalletKeyScheme::LegacyProfile,
         })
     }
 
+    /// Create a signer over the CANONICAL Chia wallet money keys
+    /// (`master_to_wallet_unhardened(master, ix).derive_synthetic()`) — the derivation that controls
+    /// the address funds actually live at (byte-identical to dig-account's `WalletKey`, the
+    /// pre-cutover dig-app wallet, and Sage). **This is the constructor money-spending consumers
+    /// (dig-account, dig-node) MUST use**: it makes [`find_key`](LocalSigner::find_key) search — and
+    /// [`owns_puzzle_hash`](LocalSigner::owns_puzzle_hash) recognize — the canonical synthetic
+    /// address set across the address gap, so the signer can authorize a spend of the wallet's real
+    /// coins (the legacy [`new`](LocalSigner::new) profile path is a distinct, never-funded set).
+    pub fn new_canonical(
+        identity: IdentityRef,
+        master: MasterKey,
+        network: Network,
+    ) -> WalletResult<Self> {
+        Ok(Self::new(identity, master, network)?.with_canonical_wallet_keys())
+    }
+
     /// Create a signer bound to an explicit AGG_SIG_ME additional data (e.g. a simulator or custom
-    /// network genesis challenge).
+    /// network genesis challenge). Defaults to the legacy profile scheme; chain
+    /// [`with_canonical_wallet_keys`](LocalSigner::with_canonical_wallet_keys) for the money path.
     pub fn with_agg_sig_me_extra_data(
         identity: IdentityRef,
         master: MasterKey,
@@ -113,7 +145,16 @@ impl LocalSigner {
             master,
             agg_sig_me_extra_data,
             address_gap: DEFAULT_ADDRESS_GAP,
+            scheme: WalletKeyScheme::LegacyProfile,
         }
+    }
+
+    /// Switch this signer to the CANONICAL Chia wallet money-key scheme (see
+    /// [`new_canonical`](LocalSigner::new_canonical)). The derivation that controls real funds.
+    #[must_use]
+    pub fn with_canonical_wallet_keys(mut self) -> Self {
+        self.scheme = WalletKeyScheme::CanonicalWallet;
+        self
     }
 
     /// Override the address gap limit — how many derived address keys the signer will try to match
@@ -153,28 +194,42 @@ impl LocalSigner {
     /// The synthetic derivation comes from chia-puzzle-types' [`DeriveSynthetic`] — the crate's own
     /// vetted BLS offset, never hand-rolled here.
     fn find_key(&self, target: &PublicKey) -> Option<SecretKey> {
-        let profile = self.identity.profile_ix;
-        (0..self.address_gap).find_map(|ix| {
-            let raw = self.master.address_key(profile, ix);
-            if &raw.public_key() == target {
-                return Some(raw);
+        match self.scheme {
+            // Canonical: a standard spend is always authorized by the SYNTHETIC money key
+            // (`master_to_wallet_unhardened(master, ix).derive_synthetic()`); the raw unhardened key
+            // never signs a wallet coin (and `verify` rejects `AGG_SIG_UNSAFE`), so match only the
+            // synthetic — the key funds actually live under.
+            WalletKeyScheme::CanonicalWallet => (0..self.address_gap).find_map(|ix| {
+                let synthetic = self.master.wallet_signing_key(ix);
+                (&synthetic.public_key() == target).then_some(synthetic)
+            }),
+            WalletKeyScheme::LegacyProfile => {
+                let profile = self.identity.profile_ix;
+                (0..self.address_gap).find_map(|ix| {
+                    let raw = self.master.address_key(profile, ix);
+                    if &raw.public_key() == target {
+                        return Some(raw);
+                    }
+                    let synthetic = raw.derive_synthetic();
+                    (&synthetic.public_key() == target).then_some(synthetic)
+                })
             }
-            let synthetic = raw.derive_synthetic();
-            (&synthetic.public_key() == target).then_some(synthetic)
-        })
+        }
     }
 
     /// True when `puzzle_hash` is a standard-layer puzzle this wallet controls — i.e. the curry of
     /// the standard puzzle over the SYNTHETIC key of some derived address within the gap. Used to
     /// prove every change output of a spend returns to the wallet (never a foreign address).
     fn owns_puzzle_hash(&self, puzzle_hash: Bytes32) -> bool {
-        let profile = self.identity.profile_ix;
         (0..self.address_gap).any(|ix| {
-            let synthetic = self
-                .master
-                .address_key(profile, ix)
-                .derive_synthetic()
-                .public_key();
+            let synthetic = match self.scheme {
+                WalletKeyScheme::CanonicalWallet => self.master.wallet_public_key(ix),
+                WalletKeyScheme::LegacyProfile => self
+                    .master
+                    .address_key(self.identity.profile_ix, ix)
+                    .derive_synthetic()
+                    .public_key(),
+            };
             Bytes32::from(StandardArgs::curry_tree_hash(synthetic).to_bytes()) == puzzle_hash
         })
     }
@@ -529,10 +584,75 @@ mod tests {
         }
     }
 
+    fn canonical_mainnet_signer(label: &str) -> LocalSigner {
+        LocalSigner::new_canonical(
+            IdentityRef::new(WalletId(1)),
+            master(label),
+            Network::Mainnet,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn public_key_is_the_profile_account_key() {
         let signer = mainnet_signer("pubkey");
         assert_eq!(signer.public_key(), master("pubkey").profile_public_key(0));
+    }
+
+    /// A canonical signer signs for the CANONICAL wallet money key — the key funds actually live
+    /// under (`master_to_wallet_unhardened(master, ix).derive_synthetic()`). This is the control the
+    /// money path depends on: without it a consumer's spend of a real coin cannot be authorized.
+    #[test]
+    fn canonical_signer_signs_the_canonical_wallet_key() {
+        let signer = canonical_mainnet_signer("canon-sign");
+        let money_pk = master("canon-sign").wallet_public_key(0);
+        let message = bound_message("canonical-spend");
+
+        let signed = signer
+            .produce_signatures(&spend_needing(vec![RequiredSignature {
+                public_key: money_pk,
+                message: message.clone(),
+            }]))
+            .unwrap();
+
+        assert!(bls_verify(
+            &signed.bundle.aggregated_signature,
+            &money_pk,
+            &message
+        ));
+    }
+
+    /// FUND-LOCK GUARD: a LEGACY (`m/44'`) signer CANNOT sign for the canonical wallet key — its
+    /// derivation set is disjoint from where funds live, so wiring the money path over the legacy
+    /// scheme fails closed (`SigningFailed`) rather than silently locking coins. This is exactly the
+    /// drift PR1 removes; the canonical constructor above is the fix.
+    #[test]
+    fn legacy_signer_cannot_sign_the_canonical_wallet_key() {
+        let signer = mainnet_signer("canon-sign").with_address_gap(8);
+        let money_pk = master("canon-sign").wallet_public_key(0);
+
+        let err = signer
+            .produce_signatures(&spend_needing(vec![RequiredSignature {
+                public_key: money_pk,
+                message: bound_message("canonical-spend"),
+            }]))
+            .unwrap_err();
+
+        assert_eq!(err.code, WalletErrorCode::SigningFailed);
+    }
+
+    /// A canonical signer RECOGNIZES the canonical wallet address as its own (so a self-send's change
+    /// passes the no-exfiltration gate); a legacy signer does not.
+    #[test]
+    fn canonical_signer_owns_the_canonical_puzzle_hash() {
+        let canonical = canonical_mainnet_signer("canon-own");
+        let legacy = mainnet_signer("canon-own");
+        let money_ph = Bytes32::from(
+            StandardArgs::curry_tree_hash(master("canon-own").wallet_public_key(0)).to_bytes(),
+        );
+
+        assert!(canonical.owns_puzzle_hash(money_ph));
+        assert!(!legacy.owns_puzzle_hash(money_ph));
     }
 
     #[test]

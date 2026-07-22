@@ -525,16 +525,33 @@ All of the following live behind the `client` seam and NEVER in the engine:
 - **At-rest encryption:** the seed/keystore is encrypted at rest (app-data location per the ecosystem
   data-location rule). Concrete scheme specified when the custody lane lands.
 - **BIP-39** mnemonic import/export.
-- **Master-key derivation (#997):** the master seed derives per-profile keys via the hardened path
-  `m/44'/8444'/{profile_ix}'` (BIP-32/44 hardened, Chia coin type 8444); a profile's receive/signing
-  keys are unhardened children of that account node. This lives in `client::hd::MasterKey`
-  (`Zeroizing` seed, wiped on drop; no `Debug`/`Serialize`/`Clone` exposing the secret).
+- **Canonical wallet (money) key — the funded key (#1522):** the derivation that controls real funds
+  is `master_to_wallet_unhardened(SecretKey::from_seed(seed), index).derive_synthetic()` — the
+  unhardened wallet child `m/12381/8444/2/index` made synthetic against the canonical
+  `DEFAULT_HIDDEN_PUZZLE_HASH`. The SYNTHETIC public key curries the standard transaction puzzle, so
+  its puzzle-tree-hash is the wallet's on-chain XCH address. This is **byte-identical to dig-account's
+  `WalletKey`, the pre-cutover dig-app wallet, and every standard Chia wallet (incl. Sage)** —
+  cross-pinned by a golden vector (§9) against dig-account's frozen vector (all-`0x42` seed → pk
+  `884cc9a2…` / puzzle-hash `e05ec4f5…` / addr `xch1up0vfat…`). Exposed as
+  `MasterKey::wallet_signing_key(index)` / `wallet_public_key(index)`. A money-spending consumer MUST
+  sign through this key set (`LocalSigner::new_canonical` / `with_canonical_wallet_keys`); signing over
+  the legacy path below fund-LOCKS coins at the canonical address.
+- **Legacy profile derivation (#997):** the master seed also derives per-profile keys via the hardened
+  path `m/44'/8444'/{profile_ix}'` (BIP-32/44 hardened, Chia coin type 8444); a profile's
+  receive/signing keys are unhardened children of that account node. This is a DISTINCT, never-funded
+  key set (`MasterKey::address_key`, `LocalSigner::new`'s default `WalletKeyScheme::LegacyProfile`),
+  retained only for pre-canonical internal callers — it does NOT control wallet funds. This lives in
+  `client::hd::MasterKey` (`Zeroizing` seed, wiped on drop; no `Debug`/`Serialize`/`Clone` exposing the
+  secret).
 - **Master-key source seam:** the unlocked `MasterKey` is produced by a `MasterKeySource`
   implementation. At-rest encryption is NOT re-implemented here — `dig-keystore`
   (`Keystore<L1WalletBls>`, DIGLW1 / AES-256-GCM / Argon2id) is the canonical keystore and provides
   the `MasterKeySource`. Implementations MUST fail-closed on a locked/absent/corrupt store.
-- **Signing:** `LocalSigner` matches each `RequiredSignature.public_key` to a derived key, signs the
-  `message` with augmented BLS, and aggregates into the `SignedBundle`.
+- **Signing:** `LocalSigner` matches each `RequiredSignature.public_key` to a derived key — per its
+  `WalletKeyScheme`, either the canonical synthetic wallet keys (`new_canonical`, the funded set) or
+  the legacy profile keys (`new`) — signs the `message` with augmented BLS, and aggregates into the
+  `SignedBundle`. `find_key` (which secret authorizes a spend) and `owns_puzzle_hash` (which change
+  outputs return to the wallet) both search the scheme's address set across the address gap.
 - **Identity key + G1-ECDH decap:** a SINGLE per-wallet dig-identity key derives at the hardened path
   `m/12381'/8444'/9'/0'` (dig-identity SPEC §6a.1) — DISTINCT from the Chia wallet keys; it secures no
   coins. Its 48-byte compressed G1 public key is the value published to slot `0x0010`. The recipient
