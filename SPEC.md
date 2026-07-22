@@ -355,17 +355,54 @@ Used by dig-app. The subscriber + identity provider + signer.
 - **`client::subscribe`** — `filter_events(events, filter)` (the pure filter core), `Subscription`
   (a live filtered stream over the engine broadcast), and the `CatchUp::catch_up(since, filter)`
   backfill trait. §5.
+- **`client::verify`** — INDEPENDENT re-derivation of a spend's value flow from its `CoinSpend`s
+  alone (never the engine-supplied summary). `analyze(&[CoinSpend]) -> SpendEffect { recipients,
+  change, fee }` parses each coin spend back through the chia-wallet-sdk drivers it was built with
+  (`Cat::parse` for a CAT, `StandardLayer` for standard XCH), runs each puzzle+solution to obtain its
+  conditions, sorts `CREATE_COIN`s into hinted (recipient) vs un-hinted (change), sums `RESERVE_FEE`,
+  and enforces per-asset value conservation. `derive_summary(&[CoinSpend]) -> TransactionSummary`
+  wraps it for display. Only the standard-XCH-send and CAT-send classes the engine builds are
+  decodable; any coin spend that cannot be FULLY accounted for (a foreign puzzle, undecodable bytes,
+  a value leak/mint) is refused fail-closed with `WalletErrorCode::SpendValidationFailed`.
 - **`client::review::decode(&UnsignedSpend) -> HumanReadableSummary`** — deterministic, side-effect-free
   decode of a spend into human-readable lines ("Send 1.5 XCH to xch1… · Fee 0.0001 XCH", coin-spend
-  and required-signature counts) for the native-confirm UI. The user reviews; they do not trust
-  blindly.
+  and required-signature counts) for the native-confirm UI. The rendered value flow is re-derived via
+  `client::verify::derive_summary` (the authoritative summary), so the confirm dialog shows what the
+  transaction ACTUALLY does. The user reviews; they do not trust blindly.
 - **`client::signer`** — `IdentitySigner { identity(), sign(UnsignedSpend) -> SignedBundle }` and
   `LocalSigner` (holds a `chia::bls::SecretKey`, exposes only `public_key()` + `identity()` +
   `identity_public_key_bytes()` + `decap(peer_g1)`). `LocalSigner` also implements the engine's
   `RemoteSigner` (both `sign` and `dh`), registered over IPC. **This is the ONLY module that touches
   secret material, compiled only under `client`.** The HD/keystore/mnemonic primitives (#997
   master-HD → profile derivation, the dig-identity key at `m/12381'/8444'/9'/0'`, at-rest encryption,
-  BIP-39) live behind this seam (§8).
+  BIP-39) live behind this seam (§8). Custody controls, all fail-closed:
+  1. **Synthetic-key matching (#1368).** A standard-layer (`p2_delegated_puzzle_or_hidden_puzzle`)
+     spend requires the BLS SYNTHETIC key curried into the coin's puzzle, not the raw derived key.
+     `find_key` matches BOTH the raw derived key and its `derive_synthetic()` (against the canonical
+     `DEFAULT_HIDDEN_PUZZLE_HASH`, via chia-puzzle-types' `DeriveSynthetic`), returning the synthetic
+     secret key when it authorizes the spend. A required signature whose key cannot be reproduced is
+     refused.
+  2. **AGG_SIG_ME binding.** Every signed message MUST end with the network genesis challenge; an
+     unbound (`AGG_SIG_UNSAFE`) message is refused.
+  3. **Verify-before-sign (#1058).** `sign_unsigned` FIRST re-derives the spend via `client::verify`,
+     requires every change output to return to a wallet-owned puzzle hash (no exfiltration), and
+     requires the engine-supplied summary to match the re-derived recipients + fee. The required
+     signatures actually signed are RE-DERIVED from the verified coin spends via
+     `SdkRequiredSignature::from_coin_spends` — the engine-supplied `required_signatures` field is
+     UNTRUSTED (only cross-checked, never the signing source), so a malicious engine cannot use it as
+     a signing oracle to obtain an `AGG_SIG_ME` over an arbitrary delegated puzzle. No `bls_sign`
+     runs until the coin spends are independently accounted for — the signer never blind-signs.
+  4. **Quote-form delegated puzzle.** `verify::analyze` requires every standard-layer spend's
+     delegated puzzle (from the standard-layer solution) to be the canonical quoted, solution-
+     independent form `(q . conditions)` (CLVM quote, opcode `1`), on both the XCH and CAT-inner
+     paths. The standard layer signs `sha256tree(delegated_puzzle) || coin_id || genesis`, which does
+     NOT commit to the delegated puzzle's solution; a solution-malleable delegated puzzle would make
+     the same signature a reusable blank check authorizing different outputs. Only a bare quote makes
+     `sha256tree(delegated_puzzle)` fully commit to the exact conditions. Non-quote → refused
+     fail-closed. Only non-ME agg_sig conditions are additionally rejected (see control 1).
+  - **Signing scope (fail-closed).** `sign_unsigned` signs ONLY the standard-XCH-send and CAT-send
+    classes `client::verify` can decode. An offer (settlement), option, or tip `UnsignedSpend` routed
+    through it is refused (`SpendValidationFailed`) until its verify decoder lands.
 - **`client::identity::IdentityProvider`** — `active_identity()`, `tracked_public_keys()`. Supplies the
   engine public material only. `HdIdentity` additionally exposes `identity_public_key_bytes()` (the
   48-byte G1 identity key published to slot `0x0010`) and `decap(peer_g1)` (the dig-message recipient
