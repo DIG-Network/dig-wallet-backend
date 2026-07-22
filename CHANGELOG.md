@@ -4,24 +4,15 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.16.0] - 2026-07-22
+
+### Features
+- **signer:** Canonical Chia wallet money-key derivation for LocalSigner (#21)
+
 ## [0.15.0] - 2026-07-22
 
 ### Bug Fixes
 - **verify:** Bind puzzle_reveal to coin + require sole committed AGG_SIG_ME (#1518, #1519) (#20)
-
-## [0.16.0] - 2026-07-22
-
-### Features
-- **signer:** Canonical Chia wallet money-key derivation for `LocalSigner` (#1522). Adds
-  `MasterKey::wallet_signing_key` / `wallet_public_key` and `LocalSigner::new_canonical` /
-  `with_canonical_wallet_keys` over `master_to_wallet_unhardened(seed, ix).derive_synthetic()` — the
-  synthetic wallet path byte-identical to dig-account's `WalletKey`, the pre-cutover dig-app wallet,
-  and every standard Chia wallet (incl. Sage). `find_key` + `owns_puzzle_hash` search the canonical
-  synthetic address set under this scheme, so a money-spending consumer controls the address funds
-  actually live at (the legacy `m/44'` profile path is a distinct, never-funded set kept for internal
-  callers). Cross-round-trip golden pins the derivation against dig-account's frozen vector; a drift
-  = fund-lock and the golden fails. Additive — all v0.15.0 signing invariants (re-derive-from-coin-
-  spends, AGG_SIG_ME-only, quote-form, reveal-bound-to-coin, sole-committed-ME) preserved.
 
 ## [0.14.0] - 2026-07-22
 
