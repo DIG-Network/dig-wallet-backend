@@ -370,6 +370,13 @@ Used by dig-app. The subscriber + identity provider + signer.
   wraps it for display. Only the standard-XCH-send and CAT-send classes the engine builds are
   decodable; any coin spend that cannot be FULLY accounted for (a foreign puzzle, undecodable bytes,
   a value leak/mint) is refused fail-closed with `WalletErrorCode::SpendValidationFailed`.
+  Every value accumulation on the conservation path — XCH inputs, XCH outputs, per-asset CAT inputs,
+  per-asset CAT outputs, reserved fees, and `outputs + fee` — MUST be TOTAL arithmetic over the full
+  `u64` range: a sum that is not representable MUST be refused with
+  `WalletErrorCode::SpendValidationFailed`, and MUST NOT wrap, saturate, or panic (#1708). Both
+  operands are attacker-reachable — output amounts come from `CREATE_COIN` conditions, bounded by no
+  coin amount — and conservation is decided by comparing these totals, so a wrapped total reports a
+  spend that creates more than `u64::MAX` as conserved, and a saturated one is equally fail-open.
 - **`client::review::decode(&UnsignedSpend) -> HumanReadableSummary`** — deterministic, side-effect-free
   decode of a spend into human-readable lines ("Send 1.5 XCH to xch1… · Fee 0.0001 XCH", coin-spend
   and required-signature counts) for the native-confirm UI. The rendered value flow is re-derived via

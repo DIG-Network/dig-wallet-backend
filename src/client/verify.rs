@@ -122,13 +122,15 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             let committed_message = committed_delegated_puzzle_message(&allocator, inner_solution)?;
 
             let asset = cat.info.asset_id;
-            *cat_in.entry(asset).or_default() += spend.coin.amount;
+            let cat_in_total = cat_in.entry(asset).or_default();
+            *cat_in_total = accumulate(*cat_in_total, spend.coin.amount, "CAT input total")?;
             let conditions = run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)?;
             enforce_sole_agg_sig_me(&conditions, committed_message)?;
             for condition in &conditions {
                 reject_unexpected_agg_sig(condition)?;
                 if let Some(create) = condition.as_create_coin() {
-                    *cat_out.entry(asset).or_default() += create.amount;
+                    let cat_out_total = cat_out.entry(asset).or_default();
+                    *cat_out_total = accumulate(*cat_out_total, create.amount, "CAT output total")?;
                     classify(
                         &mut recipients,
                         &mut change,
@@ -150,19 +152,17 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             .is_some()
         {
             let committed_message = committed_delegated_puzzle_message(&allocator, solution_ptr)?;
-            xch_in += spend.coin.amount;
+            xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
             let conditions = run_conditions(&mut allocator, puzzle_ptr, solution_ptr)?;
             enforce_sole_agg_sig_me(&conditions, committed_message)?;
             for condition in &conditions {
                 reject_unexpected_agg_sig(condition)?;
                 if let Some(reserve) = condition.as_reserve_fee() {
-                    fee = fee
-                        .checked_add(reserve.amount)
-                        .ok_or_else(|| reject("fee overflow"))?;
+                    fee = accumulate(fee, reserve.amount, "reserved fee total")?;
                     continue;
                 }
                 if let Some(create) = condition.as_create_coin() {
-                    xch_out += create.amount;
+                    xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
                     classify(
                         &mut recipients,
                         &mut change,
@@ -184,9 +184,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     }
 
     // Value must conserve per asset, or the spend leaks/mints value.
-    let xch_out_plus_fee = xch_out
-        .checked_add(fee)
-        .ok_or_else(|| reject("XCH output + fee overflow"))?;
+    let xch_out_plus_fee = accumulate(xch_out, fee, "XCH output + fee total")?;
     if xch_in != xch_out_plus_fee {
         return Err(reject(format!(
             "XCH value not conserved: in {xch_in} != out+fee {xch_out_plus_fee}"
@@ -378,6 +376,35 @@ fn encode_xch_address(puzzle_hash: Bytes32) -> WalletResult<Address> {
 /// cannot fully account for.
 fn reject(message: impl Into<String>) -> WalletError {
     WalletError::new(WalletErrorCode::SpendValidationFailed, message)
+}
+
+/// Add `amount` to a running value total, refusing the spend if the sum is not representable.
+///
+/// # Why this is not an ordinary overflow (#1708)
+/// Both operands are attacker-reachable: input amounts come from a caller-supplied unsigned
+/// skeleton whose coins need not exist on chain, and OUTPUT amounts come from `CREATE_COIN`
+/// conditions the puzzle emits, so they are bounded by nothing at all. A wrapped total is not
+/// merely a wrong number — [`analyze`] compares these totals to decide whether value is
+/// CONSERVED, so `u64::MAX + 1_001` wrapping to `1_000` makes a spend that creates more than
+/// `u64::MAX` mojos look exactly like a conserving `1_000`-mojo transfer.
+///
+/// Neither of the two tempting shortcuts is acceptable here:
+/// - wrapping/`saturating_add` fails **open** — it manufactures a representable total for an
+///   unrepresentable spend, which is precisely the bypass;
+/// - a bare `+=` fails by **panicking** in debug builds, a caller-triggerable abort in a custody
+///   path.
+///
+/// So an unrepresentable total is a deterministic, fail-closed refusal
+/// ([`WalletErrorCode::SpendValidationFailed`], the catalogued code for "this spend did not pass
+/// pre-broadcast validation"). No honest Chia spend approaches this bound: the entire XCH supply
+/// is roughly three orders of magnitude below `u64::MAX` mojos.
+fn accumulate(total: u64, amount: u64, what: &str) -> WalletResult<u64> {
+    total.checked_add(amount).ok_or_else(|| {
+        reject(format!(
+            "{what} exceeds u64::MAX and so cannot be totalled; refusing to sign a spend whose \
+             value conservation cannot be decided"
+        ))
+    })
 }
 
 #[cfg(all(test, feature = "engine"))]
@@ -651,6 +678,154 @@ mod tests {
                 .code,
             WalletErrorCode::SpendValidationFailed,
         );
+    }
+
+    // ---- #1708: value conservation must be TOTAL arithmetic, never modulo 2^64. ----
+    //
+    // Every fixture below is built so the unchecked-`+=` implementation WRAPS to a total that
+    // satisfies conservation — i.e. the nearest wrong implementation returns `Ok` on a spend that
+    // moves more than `u64::MAX`. Asserting merely "not a panic" would pass against wrapping, so
+    // each test asserts the REFUSAL, and each is paired with a truthful non-wrapping control that
+    // must still be accepted (so a guard that rejects everything cannot masquerade as the fix).
+
+    /// Spend `coin` under the wallet's standard layer with hand-chosen conditions.
+    fn standard_spend(coin: Coin, conditions: Conditions) -> Vec<CoinSpend> {
+        let mut ctx = SpendContext::new();
+        StandardLayer::new(test_public_key())
+            .spend(&mut ctx, coin, conditions)
+            .unwrap();
+        ctx.take()
+    }
+
+    /// #1708: OUTPUT amounts come from CLVM `CREATE_COIN` conditions, not from coin amounts, so no
+    /// input-side bound reaches them. `u64::MAX + 1_001` wraps to `1_000`, which equals the single
+    /// `1_000`-mojo input — so the wrapping implementation reports value CONSERVED on a spend that
+    /// creates more than `u64::MAX` mojos. Must be refused.
+    #[test]
+    fn xch_output_total_that_wraps_is_refused_1708() {
+        let spends = standard_spend(
+            wallet_coin(1_000, 1),
+            Conditions::new()
+                .create_coin(Bytes32::new([0xA1; 32]), u64::MAX, Memos::None)
+                .create_coin(Bytes32::new([0xA2; 32]), 1_001, Memos::None),
+        );
+        let err =
+            analyze(&spends).expect_err("a spend creating more than u64::MAX must be refused");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+        assert!(
+            err.message.contains("cannot be totalled"),
+            "expected an overflow refusal, got: {}",
+            err.message
+        );
+    }
+
+    /// #1708 control: the SAME two-output shape with truthful amounts still analyzes cleanly, so
+    /// the overflow guard cannot be satisfied by rejecting every multi-output spend.
+    #[test]
+    fn xch_output_total_that_fits_is_accepted_1708() {
+        let spends = standard_spend(
+            wallet_coin(1_000, 1),
+            Conditions::new()
+                .create_coin(Bytes32::new([0xA1; 32]), 600, Memos::None)
+                .create_coin(Bytes32::new([0xA2; 32]), 400, Memos::None),
+        );
+        let effect = analyze(&spends).expect("a conserving two-output spend is valid");
+        assert_eq!(effect.change.len(), 2);
+        assert_eq!(effect.fee, 0);
+    }
+
+    /// #1708: INPUT amounts wrap too. Two coins of `u64::MAX` and `1_001`, each creating its own
+    /// amount back, wrap BOTH sides to `1_000` — conservation passes under the wrapping
+    /// implementation on a spend that moves `2^64 + 1_000` mojos. Must be refused.
+    #[test]
+    fn xch_input_total_that_wraps_is_refused_1708() {
+        let ph = wallet_ph();
+        let mut spends = standard_spend(
+            Coin::new(Bytes32::new([0xB1; 32]), ph, u64::MAX),
+            Conditions::new().create_coin(ph, u64::MAX, Memos::None),
+        );
+        spends.extend(standard_spend(
+            Coin::new(Bytes32::new([0xB2; 32]), ph, 1_001),
+            Conditions::new().create_coin(ph, 1_001, Memos::None),
+        ));
+        let err = analyze(&spends).expect_err("an unrepresentable input total must be refused");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+        assert!(
+            err.message.contains("cannot be totalled"),
+            "expected an overflow refusal, got: {}",
+            err.message
+        );
+    }
+
+    /// #1708 control: two coins whose amounts DO fit are accepted, proving the input guard is
+    /// keyed on representability and not on "more than one coin".
+    #[test]
+    fn xch_input_total_that_fits_is_accepted_1708() {
+        let ph = wallet_ph();
+        let mut spends = standard_spend(
+            Coin::new(Bytes32::new([0xB1; 32]), ph, u64::MAX - 2_000),
+            Conditions::new().create_coin(ph, u64::MAX - 2_000, Memos::None),
+        );
+        spends.extend(standard_spend(
+            Coin::new(Bytes32::new([0xB2; 32]), ph, 1_001),
+            Conditions::new().create_coin(ph, 1_001, Memos::None),
+        ));
+        assert_eq!(analyze(&spends).unwrap().change.len(), 2);
+    }
+
+    /// Spend `cat` with hand-chosen inner p2 conditions (the CAT ring the verifier re-derives).
+    fn cat_spend(cat: Cat, conditions: Conditions) -> Vec<CoinSpend> {
+        use chia_wallet_sdk::driver::{CatSpend, SpendWithConditions};
+        let mut ctx = SpendContext::new();
+        let inner = StandardLayer::new(test_public_key())
+            .spend_with_conditions(&mut ctx, conditions)
+            .unwrap();
+        Cat::spend_all(&mut ctx, &[CatSpend::new(cat, inner)]).unwrap();
+        ctx.take()
+    }
+
+    /// #1708: the CAT output total wraps exactly as the XCH one does — and a CAT's per-asset
+    /// conservation is the only thing standing between a signature and a minted asset.
+    #[test]
+    fn cat_output_total_that_wraps_is_refused_1708() {
+        let spends = cat_spend(
+            issued_cat(1_000),
+            Conditions::new()
+                .create_coin(Bytes32::new([0xC1; 32]), u64::MAX, Memos::None)
+                .create_coin(Bytes32::new([0xC2; 32]), 1_001, Memos::None),
+        );
+        let err = analyze(&spends).expect_err("a CAT spend minting past u64::MAX must be refused");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+        assert!(
+            err.message.contains("cannot be totalled"),
+            "expected an overflow refusal, got: {}",
+            err.message
+        );
+    }
+
+    /// #1708 control: the same two-output CAT shape with truthful amounts still conserves.
+    #[test]
+    fn cat_output_total_that_fits_is_accepted_1708() {
+        let spends = cat_spend(
+            issued_cat(1_000),
+            Conditions::new()
+                .create_coin(Bytes32::new([0xC1; 32]), 600, Memos::None)
+                .create_coin(Bytes32::new([0xC2; 32]), 400, Memos::None),
+        );
+        assert_eq!(analyze(&spends).unwrap().change.len(), 2);
+    }
+
+    /// #1708: the accumulator itself, exercised at and one past its bound. A bound tested only from
+    /// below can confirm nothing — `u64::MAX` must total, `u64::MAX + 1` must refuse. This also
+    /// covers the CAT INPUT accumulation, for which no fixture exists: two CAT coins of the same
+    /// asset summing past `u64::MAX` would have to be issued from a single tail, and every tail this
+    /// crate can construct issues a supply that fits in a `u64` by construction.
+    #[test]
+    fn accumulate_is_total_at_and_past_its_bound_1708() {
+        assert_eq!(accumulate(u64::MAX - 1, 1, "t").unwrap(), u64::MAX);
+        let err = accumulate(u64::MAX, 1, "CAT input total").unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+        assert!(err.message.starts_with("CAT input total exceeds u64::MAX"));
     }
 
     /// A standard spend whose coin claims MORE value than the coin actually holds breaks
