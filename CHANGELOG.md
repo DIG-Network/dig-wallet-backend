@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.16.1] - 2026-07-28
+
+### Bug Fixes
+- **verify:** Make value-conservation arithmetic total, never modulo 2^64 (#22)
+
 ## [0.16.0] - 2026-07-22
 
 ### Features
