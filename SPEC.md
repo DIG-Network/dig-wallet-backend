@@ -531,7 +531,14 @@ All of the following live behind the `client` seam and NEVER in the engine:
   selects the profile. The derivation is deterministic and specified with golden vectors (§9).
 - **At-rest encryption:** the seed/keystore is encrypted at rest (app-data location per the ecosystem
   data-location rule). Concrete scheme specified when the custody lane lands.
-- **BIP-39** mnemonic import/export.
+- **BIP-39** mnemonic import/export. The `seed` this crate consumes is the **EXPANDED 64-byte BIP-39
+  seed** (`entropy -> 24 English words -> to_seed("")`, empty passphrase — the Chia convention), NOT the
+  32-byte entropy. `MasterKey::from_seed_bytes` is length-agnostic and MUST NOT truncate or re-expand;
+  producing the expanded seed is the caller's job (`dig-session`
+  `UnlockedMasterSeed::master_seed()`). Feeding the entropy instead does not fail — it derives a
+  different, plausible wallet, so a phrase would silently resolve to the wrong account in every other
+  wallet (dig_ecosystem #1759). Pinned by a golden vector (§9) against the address **Sage** shows for a
+  fixed public 24-word phrase, with the entropy-as-seed address pinned as the excluded regression.
 - **Canonical wallet (money) key — the funded key (#1522):** the derivation that controls real funds
   is `master_to_wallet_unhardened(SecretKey::from_seed(seed), index).derive_synthetic()` — the
   unhardened wallet child `m/12381/8444/2/index` made synthetic against the canonical
