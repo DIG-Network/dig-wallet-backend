@@ -291,6 +291,61 @@ mod tests {
         assert_eq!(address, DIG_ACCOUNT_GOLDEN_ADDRESS);
     }
 
+    /// The canonical public BIP-39 test mnemonic (24 words of all-zero entropy) and the address
+    /// **Sage** shows for it at wallet index 0. Frozen literals, produced independently via
+    /// `chia-wallet-sdk`; neither side is computed live, so a `bip39`/`chia-bls` bump cannot move both
+    /// together and mask a regression.
+    const SAGE_TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon          abandon abandon abandon abandon abandon abandon abandon abandon          abandon abandon abandon abandon abandon abandon abandon art";
+    const SAGE_TEST_ADDRESS_0: &str =
+        "xch16grurcglcwcv6arjarr720yd9wqhp9gkx3k8h25lhwg8pl7vl6ysuax0gy";
+
+    /// The address the pre-#1759 DIG derivation produced for the same words, by feeding the 32-byte
+    /// BIP-39 ENTROPY to `SecretKey::from_seed` instead of the expanded 64-byte seed. Kept only so the
+    /// regression can be named and excluded.
+    const PRE_1759_ENTROPY_AS_SEED_ADDRESS_0: &str =
+        "xch1jcvy96pjkh7wn5zvx6atwztru6kmhhyekd52td566leshf0d4tvsrtxr7a";
+
+    fn wallet_address_0(seed: &[u8]) -> String {
+        let key = MasterKey::from_seed_bytes(seed.to_vec());
+        let puzzle_hash = StandardArgs::curry_tree_hash(key.wallet_public_key(0));
+        Bech32Address::new(puzzle_hash.into(), "xch".to_string())
+            .encode()
+            .expect("a 32-byte puzzle hash always bech32m-encodes")
+    }
+
+    /// CONFIRMING GOLDEN (dig_ecosystem #1759): fed the BIP-39-EXPANDED seed for a 24-word phrase,
+    /// this crate's money path already lands on the address Sage shows. No production change was
+    /// needed here — the divergence was upstream, in what the SEED bytes were — and this test pins
+    /// that so a later "fix" cannot be applied twice.
+    ///
+    /// It also exercises the shape consumers now pass: `from_seed_bytes` with **64** bytes.
+    #[test]
+    fn expanded_bip39_seed_lands_on_the_sage_address() {
+        let mnemonic =
+            bip39::Mnemonic::parse_in_normalized(bip39::Language::English, SAGE_TEST_PHRASE)
+                .expect("a well-known valid BIP-39 test vector");
+        let expanded = mnemonic.to_seed("");
+        assert_eq!(expanded.len(), 64, "a BIP-39 seed is 64 bytes");
+
+        assert_eq!(
+            wallet_address_0(&expanded),
+            SAGE_TEST_ADDRESS_0,
+            "the canonical money path must land on the address Sage derives from these 24 words"
+        );
+
+        // Non-vacuity: the fixture can still exhibit the pre-#1759 bug (entropy-as-seed), and the
+        // expanded seed does not. Without this leg the assertion above could pass for a crate that
+        // ignored the distinction entirely.
+        let entropy = mnemonic.to_entropy();
+        assert_eq!(entropy.len(), 32);
+        assert_eq!(
+            wallet_address_0(&entropy),
+            PRE_1759_ENTROPY_AS_SEED_ADDRESS_0,
+            "fixture check: entropy-as-seed must still reproduce the pre-#1759 address"
+        );
+        assert_ne!(SAGE_TEST_ADDRESS_0, PRE_1759_ENTROPY_AS_SEED_ADDRESS_0);
+    }
+
     /// Non-vacuity: the LEGACY profile path (`m/44'/8444'/0'/0`) — the pre-fix money path — does NOT
     /// match the canonical golden. This is exactly the drift the fix removes: signing a consumer's
     /// money spends over the legacy set locks funds at the canonical address.
