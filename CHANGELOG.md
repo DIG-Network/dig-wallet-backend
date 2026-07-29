@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.16.2] - 2026-07-29
+
+### Testing
+- **hd:** Pin the money path to Sage's address for a 24-word phrase (#23)
+
 ## [0.16.1] - 2026-07-28
 
 ### Bug Fixes
