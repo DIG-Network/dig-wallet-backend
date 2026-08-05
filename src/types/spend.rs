@@ -6,8 +6,8 @@
 //! [`SignedBundle`] which the engine broadcasts. Neither object contains a secret key —
 //! the signature is produced client-side and only the resulting public signature comes back.
 
-use chia::bls::PublicKey;
-use chia::protocol::{CoinSpend, SpendBundle};
+use chia_bls::PublicKey;
+use chia_protocol::{CoinSpend, SpendBundle};
 use serde::{Deserialize, Serialize};
 
 use super::value::TransactionSummary;
@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn signed_bundle_round_trips() {
         let signed = SignedBundle {
-            bundle: SpendBundle::new(vec![], chia::bls::Signature::default()),
+            bundle: SpendBundle::new(vec![], chia_bls::Signature::default()),
         };
         let json = serde_json::to_string(&signed).unwrap();
         let back: SignedBundle = serde_json::from_str(&json).unwrap();

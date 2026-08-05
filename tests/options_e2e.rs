@@ -12,8 +12,8 @@
 
 use std::sync::Arc;
 
-use chia::bls::PublicKey;
-use chia::protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
+use chia_bls::PublicKey;
+use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_sdk_test::{sign_transaction, Simulator};
 use chia_wallet_sdk::driver::{Cat, SpendContext};
 use dig_options::{create, OptionTerms, OptionType, Owner};
@@ -58,7 +58,7 @@ fn wire(coin: &Coin) -> WireCoin {
     }
 }
 
-fn program_hex(program: &chia::protocol::Program) -> String {
+fn program_hex(program: &chia_protocol::Program) -> String {
     hex::encode(Vec::<u8>::from(program.clone()))
 }
 

@@ -1,7 +1,7 @@
 //! `client::signer` — the SIGNING interface (SPEC §4, §8). dig-app holds the key HERE.
 //!
 //! This module and [`super::hd`] are the ONLY places the crate touches secret material
-//! (`chia::bls::SecretKey`), compiled ONLY under the `client` feature. dig-app implements
+//! (`chia_bls::SecretKey`), compiled ONLY under the `client` feature. dig-app implements
 //! [`IdentitySigner`] with a [`LocalSigner`] that holds the master key and, when the engine needs
 //! a spend signed, matches each [`crate::types::RequiredSignature`] to a derived key, signs, and aggregates.
 //! The key never leaves dig-app — the engine only ever calls OUT to a
@@ -27,9 +27,9 @@
 //!    [`LocalSigner::sign_unsigned`]).
 
 use async_trait::async_trait;
-use chia::bls::{aggregate, sign as bls_sign, PublicKey, SecretKey, Signature};
-use chia::protocol::{Bytes32, SpendBundle};
-use chia::puzzles::{standard::StandardArgs, DeriveSynthetic};
+use chia_bls::{aggregate, sign as bls_sign, PublicKey, SecretKey, Signature};
+use chia_protocol::{Bytes32, SpendBundle};
+use chia_puzzle_types::{standard::StandardArgs, DeriveSynthetic};
 
 use crate::types::{
     IdentityRef, Network, SignedBundle, TransactionSummary, UnsignedSpend, WalletError,
@@ -185,7 +185,7 @@ impl LocalSigner {
     /// 1. the RAW derived key — matches an `AGG_SIG_UNSAFE`/non-standard requirement keyed directly
     ///    on the wallet's derivation, and
     /// 2. the standard-layer SYNTHETIC key — `derive_synthetic()` against the canonical
-    ///    [`DEFAULT_HIDDEN_PUZZLE_HASH`](chia::puzzles::DEFAULT_HIDDEN_PUZZLE_HASH). This is the key
+    ///    [`DEFAULT_HIDDEN_PUZZLE_HASH`](chia_puzzle_types::standard::DEFAULT_HIDDEN_PUZZLE_HASH). This is the key
     ///    `p2_delegated_puzzle_or_hidden_puzzle` (`StandardLayer`) curries into a coin's puzzle, so
     ///    the required signature a normal XCH/CAT send extracts names the SYNTHETIC public key, never
     ///    the raw one (#1368). When it matches, the synthetic SECRET key is returned — the one that
@@ -350,7 +350,7 @@ impl LocalSigner {
     /// and is refused. This is the trusted source of truth for what to sign.
     fn required_signatures_from(
         &self,
-        coin_spends: &[chia::protocol::CoinSpend],
+        coin_spends: &[chia_protocol::CoinSpend],
     ) -> WalletResult<Vec<crate::types::RequiredSignature>> {
         use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature as SdkRequiredSignature};
 
@@ -417,7 +417,7 @@ impl LocalSigner {
                 )
             })?;
             signatures.push(bls_sign(&key, &required.message));
-            // NOTE: `chia::bls::SecretKey` (chia-bls 0.26) exposes no `Zeroize`/`Drop` scrub, so the
+            // NOTE: `chia_bls::SecretKey` (chia-bls 0.26) exposes no `Zeroize`/`Drop` scrub, so the
             // transient derived key cannot be wiped here; it is dropped immediately at end of scope.
             // The master SEED it derives from IS zeroized (see `hd::MasterKey`). Upgrading chia-bls
             // to a zeroizing `SecretKey` is a tracked follow-up.
@@ -536,7 +536,7 @@ impl crate::engine::signer::RemoteSigner for LocalSigner {
 mod tests {
     use super::*;
     use crate::types::{Amount, RequiredSignature, TransactionSummary, WalletErrorCode, WalletId};
-    use chia::bls::{aggregate_verify, verify as bls_verify};
+    use chia_bls::{aggregate_verify, verify as bls_verify};
     use sha2::{Digest, Sha256};
 
     /// A deterministic test seed hashed from a label (not an integer-literal key — dodges the
@@ -917,8 +917,8 @@ mod tests {
     async fn local_signer_signs_standard_layer_synthetic_key() {
         use crate::engine::build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
         use crate::types::{Address, Amount, AssetId, SendXchRequest};
-        use chia::protocol::Coin;
-        use chia::puzzles::{standard::StandardArgs, DeriveSynthetic};
+        use chia_protocol::Coin;
+        use chia_puzzle_types::{standard::StandardArgs, DeriveSynthetic};
         use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature as SdkRequiredSignature};
         use chia_wallet_sdk::utils::Address as Bech32Address;
         use clvmr::Allocator;
@@ -932,13 +932,13 @@ mod tests {
             .derive_synthetic()
             .public_key();
         let puzzle_hash =
-            chia::protocol::Bytes32::from(StandardArgs::curry_tree_hash(synthetic_pk).to_bytes());
-        let coin = Coin::new(chia::protocol::Bytes32::new([3u8; 32]), puzzle_hash, 1_000);
+            chia_protocol::Bytes32::from(StandardArgs::curry_tree_hash(synthetic_pk).to_bytes());
+        let coin = Coin::new(chia_protocol::Bytes32::new([3u8; 32]), puzzle_hash, 1_000);
 
         // A minimal SpendInputs provider exposing that one coin + its synthetic public key.
         struct OneCoin {
             coin: Coin,
-            puzzle_hash: chia::protocol::Bytes32,
+            puzzle_hash: chia_protocol::Bytes32,
             synthetic_pk: PublicKey,
         }
         impl SpendInputs for OneCoin {
@@ -952,10 +952,10 @@ mod tests {
             ) -> WalletResult<Vec<chia_wallet_sdk::driver::Cat>> {
                 Ok(vec![])
             }
-            fn synthetic_key(&self, ph: chia::protocol::Bytes32) -> Option<PublicKey> {
+            fn synthetic_key(&self, ph: chia_protocol::Bytes32) -> Option<PublicKey> {
                 (ph == self.puzzle_hash).then_some(self.synthetic_pk)
             }
-            fn change_puzzle_hash(&self, _: &IdentityRef) -> WalletResult<chia::protocol::Bytes32> {
+            fn change_puzzle_hash(&self, _: &IdentityRef) -> WalletResult<chia_protocol::Bytes32> {
                 Ok(self.puzzle_hash)
             }
         }
@@ -969,7 +969,7 @@ mod tests {
 
         // A real recipient address.
         let recipient = Address(
-            Bech32Address::new(chia::protocol::Bytes32::new([7u8; 32]), "xch".into())
+            Bech32Address::new(chia_protocol::Bytes32::new([7u8; 32]), "xch".into())
                 .encode()
                 .unwrap(),
         );
@@ -996,7 +996,7 @@ mod tests {
         // The aggregate verifies against every (synthetic public key, message) pair — proof the
         // produced signature is the RIGHT one, not merely that no error was returned.
         let mut allocator = Allocator::new();
-        let constants = AggSigConstants::new(chia::protocol::Bytes32::new(
+        let constants = AggSigConstants::new(chia_protocol::Bytes32::new(
             dig_constants::CHIA_L1_MAINNET_AGG_SIG_ME,
         ));
         let extracted = SdkRequiredSignature::from_coin_spends(
@@ -1036,8 +1036,8 @@ mod tests {
     async fn owned_xch_send(label: &str, amount: u64, fee: u64) -> (LocalSigner, UnsignedSpend) {
         use crate::engine::build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
         use crate::types::{Address, Amount, AssetId, SendXchRequest};
-        use chia::protocol::{Bytes32, Coin};
-        use chia::puzzles::{standard::StandardArgs, DeriveSynthetic};
+        use chia_protocol::{Bytes32, Coin};
+        use chia_puzzle_types::{standard::StandardArgs, DeriveSynthetic};
         use chia_wallet_sdk::utils::Address as Bech32Address;
         use std::sync::Arc;
 
@@ -1117,7 +1117,7 @@ mod tests {
         // The coin spends really pay xch1(7…). Rewrite the summary to CLAIM a benign recipient.
         let benign = crate::types::Address(
             chia_wallet_sdk::utils::Address::new(
-                chia::protocol::Bytes32::new([9u8; 32]),
+                chia_protocol::Bytes32::new([9u8; 32]),
                 "xch".into(),
             )
             .encode()
@@ -1182,7 +1182,7 @@ mod tests {
     #[cfg(feature = "engine")]
     #[tokio::test]
     async fn refuses_a_required_signature_not_derived_from_the_coin_spends() {
-        use chia::puzzles::DeriveSynthetic;
+        use chia_puzzle_types::DeriveSynthetic;
 
         let (signer, mut unsigned) = owned_xch_send("oracle", 600, 10).await;
 
@@ -1217,7 +1217,7 @@ mod tests {
     #[test]
     fn refuses_an_offer_class_settlement_spend() {
         use crate::types::{Amount, SpendOutput, TransactionSummary};
-        use chia::protocol::{Coin, CoinSpend};
+        use chia_protocol::{Coin, CoinSpend};
 
         // The canonical, immutable Chia settlement-payments puzzle (chia_puzzles::SETTLEMENT_PAYMENT
         // V1) — an offer/settlement coin's puzzle, which is neither standard-layer nor CAT.
@@ -1234,8 +1234,8 @@ mod tests {
         )
         .unwrap();
         let coin = Coin::new(
-            chia::protocol::Bytes32::new([1u8; 32]),
-            chia::protocol::Bytes32::new([2u8; 32]),
+            chia_protocol::Bytes32::new([1u8; 32]),
+            chia_protocol::Bytes32::new([2u8; 32]),
             1_000,
         );
         let spend = CoinSpend::new(coin, settlement_puzzle.into(), vec![0x80].into());
@@ -1271,8 +1271,8 @@ mod tests {
         extra: chia_wallet_sdk::types::Conditions,
     ) -> (LocalSigner, UnsignedSpend) {
         use crate::types::{Amount, TransactionSummary};
-        use chia::protocol::{Bytes32, Coin};
-        use chia::puzzles::{standard::StandardArgs, DeriveSynthetic, Memos};
+        use chia_protocol::{Bytes32, Coin};
+        use chia_puzzle_types::{standard::StandardArgs, DeriveSynthetic, Memos};
         use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
         use chia_wallet_sdk::types::Conditions;
 
@@ -1312,7 +1312,7 @@ mod tests {
     #[cfg(feature = "engine")]
     #[test]
     fn refuses_an_embedded_agg_sig_unsafe() {
-        use chia::puzzles::DeriveSynthetic;
+        use chia_puzzle_types::DeriveSynthetic;
         use chia_wallet_sdk::types::conditions::AggSigUnsafe;
         use chia_wallet_sdk::types::{Condition, Conditions};
 
@@ -1343,7 +1343,7 @@ mod tests {
     #[cfg(feature = "engine")]
     #[test]
     fn refuses_an_embedded_non_me_agg_sig() {
-        use chia::puzzles::DeriveSynthetic;
+        use chia_puzzle_types::DeriveSynthetic;
         use chia_wallet_sdk::types::conditions::AggSigParent;
         use chia_wallet_sdk::types::{Condition, Conditions};
 
@@ -1376,8 +1376,8 @@ mod tests {
     #[test]
     fn refuses_a_solution_malleable_delegated_puzzle() {
         use crate::types::{Amount, TransactionSummary};
-        use chia::protocol::{Bytes32, Coin};
-        use chia::puzzles::{standard::StandardArgs, DeriveSynthetic, Memos};
+        use chia_protocol::{Bytes32, Coin};
+        use chia_puzzle_types::{standard::StandardArgs, DeriveSynthetic, Memos};
         use chia_wallet_sdk::driver::{Spend, SpendContext, StandardLayer};
         use chia_wallet_sdk::types::Conditions;
 
@@ -1427,8 +1427,8 @@ mod tests {
     async fn local_signer_signs_cat_send_synthetic_key() {
         use crate::engine::build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
         use crate::types::{Address, Amount, AssetId, SendCatRequest};
-        use chia::protocol::{Bytes32, Coin};
-        use chia::puzzles::{standard::StandardArgs, DeriveSynthetic};
+        use chia_protocol::{Bytes32, Coin};
+        use chia_puzzle_types::{standard::StandardArgs, DeriveSynthetic};
         use chia_wallet_sdk::driver::{Cat, SpendContext};
         use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature as SdkRequiredSignature};
         use chia_wallet_sdk::types::Conditions;
@@ -1450,7 +1450,7 @@ mod tests {
         let hint = mint_ctx.hint(wallet_ph).unwrap();
         let create = Conditions::new().create_coin(wallet_ph, 1_000, hint);
         let (_, cats) =
-            Cat::issue_with_coin(&mut mint_ctx, genesis.coin_id(), 1_000, create).unwrap();
+            Cat::single_issuance(&mut mint_ctx, genesis.coin_id(), None, 1_000, create).unwrap();
         let cat = cats[0];
 
         struct CatInputs {

@@ -20,9 +20,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chia::bls::PublicKey;
-use chia::protocol::{Bytes32, Coin, CoinSpend};
-use chia::puzzles::Memos;
+use chia_bls::PublicKey;
+use chia_protocol::{Bytes32, Coin, CoinSpend};
+use chia_puzzle_types::Memos;
 use chia_wallet_sdk::driver::{Cat, CatSpend, SpendContext, SpendWithConditions, StandardLayer};
 use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature as SdkRequiredSignature};
 use chia_wallet_sdk::types::Conditions;
@@ -458,7 +458,7 @@ pub(crate) fn spend_failed(message: impl Into<String>) -> WalletError {
 mod tests {
     use super::*;
     use crate::types::{Amount, WalletId};
-    use chia::puzzles::standard::StandardArgs;
+    use chia_puzzle_types::standard::StandardArgs;
 
     /// The BLS12-381 G1 generator, compressed — a valid, non-infinity public key. Used to curry
     /// a standard puzzle in tests WITHOUT any secret material (the key-isolation invariant
@@ -537,7 +537,7 @@ mod tests {
         let genesis = wallet_coin(amount, 42);
         let hint = ctx.hint(wallet_puzzle_hash()).unwrap();
         let create = Conditions::new().create_coin(wallet_puzzle_hash(), amount, hint);
-        let (_, cats) = Cat::issue_with_coin(&mut ctx, genesis.coin_id(), amount, create).unwrap();
+        let (_, cats) = Cat::single_issuance(&mut ctx, genesis.coin_id(), None, amount, create).unwrap();
         cats[0]
     }
 

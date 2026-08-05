@@ -21,8 +21,8 @@
 
 use std::sync::Arc;
 
-use chia::bls::PublicKey;
-use chia::protocol::{Bytes32, Coin};
+use chia_bls::PublicKey;
+use chia_protocol::{Bytes32, Coin};
 use chia_wallet_sdk::driver::Cat;
 use chia_wallet_sdk::utils::Address as Bech32Address;
 use indexmap::IndexMap;
@@ -233,7 +233,7 @@ impl OfferBuilder {
     /// signed-offline spend before it can leave the engine.
     fn finish_unsigned(
         &self,
-        coin_spends: Vec<chia::protocol::CoinSpend>,
+        coin_spends: Vec<chia_protocol::CoinSpend>,
         summary: TransactionSummary,
     ) -> WalletResult<UnsignedSpend> {
         let required_signatures = self.builder.required_signatures(&coin_spends)?;
@@ -589,7 +589,7 @@ fn map_offer_error(error: dig_offers::Error) -> WalletError {
 mod tests {
     use super::*;
     use crate::types::{Amount, WalletId};
-    use chia::protocol::CoinSpend;
+    use chia_protocol::CoinSpend;
     use chia_sdk_test::{sign_transaction, BlsPairWithCoin, Simulator};
     use chia_wallet_sdk::driver::{SpendContext as SdkCtx, StandardLayer};
     use chia_wallet_sdk::types::Conditions;
@@ -652,9 +652,10 @@ mod tests {
         let mut ctx = SdkCtx::new();
         let funding = sim.new_coin(owner.puzzle_hash, amount);
         let hint = ctx.hint(owner.puzzle_hash).unwrap();
-        let (issue, cats) = Cat::issue_with_coin(
+        let (issue, cats) = Cat::single_issuance(
             &mut ctx,
             funding.coin_id(),
+            None,
             amount,
             Conditions::new().create_coin(owner.puzzle_hash, amount, hint),
         )
@@ -673,7 +674,7 @@ mod tests {
     fn client_sign(coin_spends: &[CoinSpend], owner: &BlsPairWithCoin) -> SignedBundle {
         let signature = sign_transaction(coin_spends, std::slice::from_ref(&owner.sk)).unwrap();
         SignedBundle {
-            bundle: chia::protocol::SpendBundle::new(coin_spends.to_vec(), signature),
+            bundle: chia_protocol::SpendBundle::new(coin_spends.to_vec(), signature),
         }
     }
 
@@ -1149,9 +1150,9 @@ mod tests {
             .assemble_make(AssembleOfferRequest {
                 build_id: crate::types::OfferBuildId("nope".into()),
                 signed: SignedBundle {
-                    bundle: chia::protocol::SpendBundle::new(
+                    bundle: chia_protocol::SpendBundle::new(
                         vec![],
-                        chia::bls::Signature::default(),
+                        chia_bls::Signature::default(),
                     ),
                 },
             })

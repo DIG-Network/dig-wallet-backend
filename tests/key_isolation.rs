@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 /// Identifiers that denote secret key / seed material. None may appear in the scanned trees.
 ///
-/// Substring matching also catches `as`-aliased re-exports: `use chia::bls::SecretKey as Sk;` and
+/// Substring matching also catches `as`-aliased re-exports: `use chia_bls::SecretKey as Sk;` and
 /// `type Foo = SecretKey;` both contain the forbidden token, so aliasing a secret type under a
 /// benign name is caught at its declaration site (and `types` is scanned, so a re-export there is
 /// caught before the engine could import the alias).

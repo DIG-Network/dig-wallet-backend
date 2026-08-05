@@ -22,8 +22,8 @@
 //! the trait here lets the signer be built + tested against a key source without hand-rolling a
 //! keystore.
 
-use chia::bls::{master_to_wallet_unhardened, DerivableKey, PublicKey, SecretKey};
-use chia::puzzles::DeriveSynthetic;
+use chia_bls::{master_to_wallet_unhardened, DerivableKey, PublicKey, SecretKey};
+use chia_puzzle_types::DeriveSynthetic;
 use zeroize::Zeroizing;
 
 use crate::types::{WalletError, WalletResult};
@@ -172,8 +172,8 @@ pub trait MasterKeySource: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chia::bls::{sign as bls_sign, verify as bls_verify};
-    use chia::puzzles::standard::StandardArgs;
+    use chia_bls::{sign as bls_sign, verify as bls_verify};
+    use chia_puzzle_types::standard::StandardArgs;
     use chia_wallet_sdk::utils::Address as Bech32Address;
     use sha2::{Digest, Sha256};
 

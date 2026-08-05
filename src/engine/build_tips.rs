@@ -14,8 +14,8 @@
 //! gated by a tip.
 
 use async_trait::async_trait;
-use chia::bls::PublicKey;
-use chia::protocol::Bytes32;
+use chia_bls::PublicKey;
+use chia_protocol::Bytes32;
 use chia_wallet_sdk::driver::Cat;
 use dig_cat::CatError;
 use dig_tips::{
@@ -218,7 +218,7 @@ impl SdkSpendBuilder {
     /// and summarize the single CAT payment (a tip reserves no separate XCH fee).
     fn finish_tip(
         &self,
-        coin_spends: Vec<chia::protocol::CoinSpend>,
+        coin_spends: Vec<chia_protocol::CoinSpend>,
         recipient_ph: Bytes32,
         amount: Amount,
         asset_id: AssetId,
@@ -331,9 +331,9 @@ mod tests {
     use super::*;
     use crate::engine::build::SpendInputs;
     use crate::types::{Network, WalletId};
-    use chia::protocol::Coin;
-    use chia::puzzles::standard::StandardArgs;
-    use chia::puzzles::LineageProof;
+    use chia_protocol::Coin;
+    use chia_puzzle_types::standard::StandardArgs;
+    use chia_puzzle_types::LineageProof;
     use chia_wallet_sdk::driver::{CatInfo, SpendContext};
     use chia_wallet_sdk::types::Conditions;
     use std::sync::Arc;
@@ -393,7 +393,7 @@ mod tests {
         let genesis = Coin::new(Bytes32::new([seed; 32]), wallet_puzzle_hash(), amount);
         let hint = ctx.hint(wallet_puzzle_hash()).unwrap();
         let create = Conditions::new().create_coin(wallet_puzzle_hash(), amount, hint);
-        let (_, cats) = Cat::issue_with_coin(&mut ctx, genesis.coin_id(), amount, create).unwrap();
+        let (_, cats) = Cat::single_issuance(&mut ctx, genesis.coin_id(), None, amount, create).unwrap();
         cats[0]
     }
 

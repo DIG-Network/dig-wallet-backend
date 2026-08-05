@@ -23,8 +23,8 @@
 //! a substituted option, a tampered underlying coin, or a wrong strike/term is rejected.
 
 use async_trait::async_trait;
-use chia::bls::PublicKey;
-use chia::protocol::{Bytes32, Coin, Program};
+use chia_bls::PublicKey;
+use chia_protocol::{Bytes32, Coin, Program};
 use dig_options::{
     create, exercise, parse_child, rehydrate, transfer, CreatedOption, OptionTerms, OptionType,
     Owner, RehydratedTerms, SpendContext, StrikePayment,
@@ -506,8 +506,8 @@ mod tests {
     use super::*;
     use crate::engine::build::SpendInputs;
     use crate::types::{IdentityRef, Network, WalletId};
-    use chia::bls::PublicKey;
-    use chia::puzzles::standard::StandardArgs;
+    use chia_bls::PublicKey;
+    use chia_puzzle_types::standard::StandardArgs;
     use chia_wallet_sdk::driver::Cat;
     use std::sync::Arc;
 

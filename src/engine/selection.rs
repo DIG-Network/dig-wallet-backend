@@ -23,7 +23,7 @@
 //! (mirrors dig-store's `digstore-chain::selection`): a caller must be able to tell "merge and
 //! retry" apart from "you simply don't have the money".
 
-use chia::protocol::Coin;
+use chia_protocol::Coin;
 
 use crate::types::{WalletError, WalletErrorCode, WalletResult};
 
@@ -152,7 +152,7 @@ fn ordered_high_value_first(coins: &[Coin]) -> Vec<Coin> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chia::protocol::Bytes32;
+    use chia_protocol::Bytes32;
 
     /// A coin with a distinct id per `seed` and the given `amount`.
     fn coin(amount: u64, seed: u8) -> Coin {
