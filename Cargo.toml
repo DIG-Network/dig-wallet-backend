@@ -139,3 +139,4 @@ bip39 = "2.0"
 
 [package.metadata.docs.rs]
 all-features = true
+
