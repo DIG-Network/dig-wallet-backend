@@ -13,7 +13,7 @@
 //! AGG_SIG_ME spend signature (which instead ends with the network genesis challenge, see
 //! [`super::signer`]) — a signature obtained for one purpose cannot be replayed as the other.
 
-use chia::bls::{sign as bls_sign, PublicKey, Signature};
+use chia_bls::{sign as bls_sign, PublicKey, Signature};
 
 use crate::types::{IdentityRef, WalletError, WalletResult};
 
@@ -126,7 +126,7 @@ fn domain_framed_message(domain: &str, payload: &[u8]) -> WalletResult<Vec<u8>> 
 mod tests {
     use super::*;
     use crate::types::{WalletErrorCode, WalletId};
-    use chia::bls::verify as bls_verify;
+    use chia_bls::verify as bls_verify;
     use sha2::{Digest, Sha256};
 
     fn seed_from_label(label: &str) -> Vec<u8> {

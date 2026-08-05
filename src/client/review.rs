@@ -159,12 +159,12 @@ mod tests {
     async fn decode_of_a_real_spend_is_verified() {
         use crate::engine::build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
         use crate::types::{IdentityRef, Network, SendXchRequest, WalletId};
-        use chia::protocol::{Bytes32, Coin};
-        use chia::puzzles::standard::StandardArgs;
+        use chia_protocol::{Bytes32, Coin};
+        use chia_puzzle_types::standard::StandardArgs;
         use chia_wallet_sdk::utils::Address as Bech32Address;
         use std::sync::Arc;
 
-        fn pk() -> chia::bls::PublicKey {
+        fn pk() -> chia_bls::PublicKey {
             let mut g = [0u8; 48];
             for (i, b) in [
                 0x97u8, 0xf1, 0xd3, 0xa7, 0x31, 0x97, 0xd7, 0x94, 0x26, 0x95, 0x63, 0x8c, 0x4f,
@@ -177,7 +177,7 @@ mod tests {
             {
                 g[i] = b;
             }
-            chia::bls::PublicKey::from_bytes(&g).unwrap()
+            chia_bls::PublicKey::from_bytes(&g).unwrap()
         }
         fn ph() -> Bytes32 {
             Bytes32::from(StandardArgs::curry_tree_hash(pk()).to_bytes())
@@ -194,7 +194,7 @@ mod tests {
             ) -> crate::types::WalletResult<Vec<chia_wallet_sdk::driver::Cat>> {
                 Ok(vec![])
             }
-            fn synthetic_key(&self, p: Bytes32) -> Option<chia::bls::PublicKey> {
+            fn synthetic_key(&self, p: Bytes32) -> Option<chia_bls::PublicKey> {
                 (p == ph()).then(pk)
             }
             fn change_puzzle_hash(&self, _: &IdentityRef) -> crate::types::WalletResult<Bytes32> {

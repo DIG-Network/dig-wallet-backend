@@ -13,7 +13,7 @@
 //!
 //! ## The key-isolation invariant (SPEC §1d)
 //! The private key lives ONLY behind [`client::signer`] (compiled under the `client` feature). No
-//! engine-seam type is or transitively exposes a `chia::bls::SecretKey`, mnemonic, or seed. This
+//! engine-seam type is or transitively exposes a `chia_bls::SecretKey`, mnemonic, or seed. This
 //! is enforced two ways: the engine seam compiles standalone with no secret-key path
 //! (`--no-default-features --features engine`), and `tests/key_isolation.rs` asserts the engine
 //! source names no secret type.

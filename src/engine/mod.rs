@@ -8,7 +8,7 @@
 //! bundles ([`broadcast::Broadcaster`]).
 //!
 //! # Key-isolation invariant (SPEC §1.4)
-//! No type in this seam's public API is or transitively exposes a `chia::bls::SecretKey`,
+//! No type in this seam's public API is or transitively exposes a `chia_bls::SecretKey`,
 //! mnemonic, or seed. This is enforced primarily by `tests/key_isolation.rs`, which asserts the
 //! engine + shared-`types` SOURCE names no secret identifier (the real API-isolation enforcer).
 //! CI additionally builds this seam standalone without the client/signing feature

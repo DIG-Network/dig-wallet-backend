@@ -234,7 +234,7 @@ mod tests {
         let finalize = FinalizeTakeRequest {
             build_id: OfferBuildId("build-7".into()),
             signed: SignedBundle {
-                bundle: chia::protocol::SpendBundle::new(vec![], chia::bls::Signature::default()),
+                bundle: chia_protocol::SpendBundle::new(vec![], chia_bls::Signature::default()),
             },
         };
         let json = serde_json::to_string(&finalize).unwrap();

@@ -16,13 +16,13 @@
 
 use std::collections::BTreeMap;
 
-use chia::clvm_traits::FromClvm;
-use chia::clvm_utils::tree_hash;
-use chia::protocol::{Bytes32, CoinSpend};
-use chia::puzzles::Memos;
+use chia_protocol::{Bytes32, CoinSpend};
+use chia_puzzle_types::Memos;
 use chia_wallet_sdk::driver::{Cat, Layer, Puzzle, StandardLayer};
 use chia_wallet_sdk::types::{run_puzzle, Condition};
 use chia_wallet_sdk::utils::Address as Bech32Address;
+use clvm_traits::FromClvm;
+use clvm_utils::tree_hash;
 use clvmr::serde::node_from_bytes;
 use clvmr::Allocator;
 
@@ -104,10 +104,15 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
         let puzzle = Puzzle::parse(&allocator, puzzle_ptr);
 
         // A CAT coin: the value flows through its INNER p2 conditions, denominated in the asset.
-        if let Some((cat, inner_puzzle, inner_solution)) =
-            Cat::parse(&allocator, spend.coin, puzzle, solution_ptr)
-                .map_err(|e| reject(format!("malformed CAT spend: {e:?}")))?
+        if let Some(parsed) = Cat::parse(&allocator, spend.coin, puzzle, solution_ptr)
+            .map_err(|e| reject(format!("malformed CAT spend: {e:?}")))?
         {
+            // 0.34's `Cat::parse` returns a `ParsedCat` struct in place of the old
+            // `(Cat, inner_puzzle, inner_solution)` tuple; `p2_puzzle`/`p2_solution` are the
+            // exact same inner p2 puzzle/solution the tuple carried (non-revocable CAT path).
+            let cat = parsed.cat;
+            let inner_puzzle = parsed.p2_puzzle;
+            let inner_solution = parsed.p2_solution;
             // The CAT's inner p2 MUST be a standard layer whose delegated puzzle is quote-form —
             // otherwise the signed message (tree-hash-only) would not commit to the actual outputs
             // (see `committed_delegated_puzzle_message`).
@@ -412,15 +417,15 @@ mod tests {
     use super::*;
     use crate::engine::build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
     use crate::types::{IdentityRef, Network, SendCatRequest, SendXchRequest, WalletId};
-    use chia::protocol::Coin;
-    use chia::puzzles::standard::StandardArgs;
+    use chia_protocol::Coin;
+    use chia_puzzle_types::standard::StandardArgs;
     use chia_wallet_sdk::driver::{Cat, SpendContext};
     use chia_wallet_sdk::types::Conditions;
     use std::sync::Arc;
 
     /// The compressed BLS12-381 G1 generator — a valid, non-infinity public key used to curry a
     /// standard puzzle in tests without any secret material (mirrors src/engine/build.rs).
-    fn test_public_key() -> chia::bls::PublicKey {
+    fn test_public_key() -> chia_bls::PublicKey {
         let mut g = [0u8; 48];
         for (i, b) in [
             0x97u8, 0xf1, 0xd3, 0xa7, 0x31, 0x97, 0xd7, 0x94, 0x26, 0x95, 0x63, 0x8c, 0x4f, 0xa9,
@@ -433,7 +438,7 @@ mod tests {
         {
             g[i] = b;
         }
-        chia::bls::PublicKey::from_bytes(&g).expect("valid G1 generator")
+        chia_bls::PublicKey::from_bytes(&g).expect("valid G1 generator")
     }
 
     fn wallet_ph() -> Bytes32 {
@@ -449,7 +454,8 @@ mod tests {
         let genesis = wallet_coin(amount, 42);
         let hint = ctx.hint(wallet_ph()).unwrap();
         let create = Conditions::new().create_coin(wallet_ph(), amount, hint);
-        let (_, cats) = Cat::issue_with_coin(&mut ctx, genesis.coin_id(), amount, create).unwrap();
+        let (_, cats) =
+            Cat::single_issuance(&mut ctx, genesis.coin_id(), None, amount, create).unwrap();
         cats[0]
     }
 
@@ -465,7 +471,7 @@ mod tests {
         fn spendable_cat(&self, _: &IdentityRef, _: &AssetId) -> WalletResult<Vec<Cat>> {
             Ok(self.cats.clone())
         }
-        fn synthetic_key(&self, ph: Bytes32) -> Option<chia::bls::PublicKey> {
+        fn synthetic_key(&self, ph: Bytes32) -> Option<chia_bls::PublicKey> {
             (ph == wallet_ph()).then(test_public_key)
         }
         fn change_puzzle_hash(&self, _: &IdentityRef) -> WalletResult<Bytes32> {
@@ -602,8 +608,8 @@ mod tests {
     /// another coin through this benign carrier — is refused: exactly one `AGG_SIG_ME` is permitted.
     #[tokio::test]
     async fn a_second_embedded_agg_sig_me_is_refused_1519() {
-        use chia::protocol::Coin;
-        use chia::puzzles::Memos;
+        use chia_protocol::Coin;
+        use chia_puzzle_types::Memos;
         use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
         use chia_wallet_sdk::types::conditions::AggSigMe;
         use chia_wallet_sdk::types::Conditions;
@@ -631,7 +637,7 @@ mod tests {
     // ---- #1519 sole-AGG_SIG_ME enforcer, exercised directly for the zero / wrong-hash branches a
     // real standard layer (which always emits exactly one correct AGG_SIG_ME) cannot produce. ----
 
-    use chia::protocol::Bytes;
+    use chia_protocol::Bytes;
     use chia_wallet_sdk::types::conditions::AggSigMe;
 
     fn agg_sig_me(message: [u8; 32]) -> Condition {

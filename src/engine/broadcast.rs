@@ -80,8 +80,8 @@ impl Broadcaster for MempoolBroadcaster {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chia::bls::Signature;
-    use chia::protocol::SpendBundle;
+    use chia_bls::Signature;
+    use chia_protocol::SpendBundle;
     use std::sync::Mutex;
 
     fn signed() -> SignedBundle {
