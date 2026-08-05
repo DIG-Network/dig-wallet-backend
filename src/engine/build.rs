@@ -537,7 +537,8 @@ mod tests {
         let genesis = wallet_coin(amount, 42);
         let hint = ctx.hint(wallet_puzzle_hash()).unwrap();
         let create = Conditions::new().create_coin(wallet_puzzle_hash(), amount, hint);
-        let (_, cats) = Cat::single_issuance(&mut ctx, genesis.coin_id(), None, amount, create).unwrap();
+        let (_, cats) =
+            Cat::single_issuance(&mut ctx, genesis.coin_id(), None, amount, create).unwrap();
         cats[0]
     }
 

@@ -1150,10 +1150,7 @@ mod tests {
             .assemble_make(AssembleOfferRequest {
                 build_id: crate::types::OfferBuildId("nope".into()),
                 signed: SignedBundle {
-                    bundle: chia_protocol::SpendBundle::new(
-                        vec![],
-                        chia_bls::Signature::default(),
-                    ),
+                    bundle: chia_protocol::SpendBundle::new(vec![], chia_bls::Signature::default()),
                 },
             })
             .unwrap_err();

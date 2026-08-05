@@ -16,13 +16,13 @@
 
 use std::collections::BTreeMap;
 
-use clvm_traits::FromClvm;
-use clvm_utils::tree_hash;
 use chia_protocol::{Bytes32, CoinSpend};
 use chia_puzzle_types::Memos;
 use chia_wallet_sdk::driver::{Cat, Layer, Puzzle, StandardLayer};
 use chia_wallet_sdk::types::{run_puzzle, Condition};
 use chia_wallet_sdk::utils::Address as Bech32Address;
+use clvm_traits::FromClvm;
+use clvm_utils::tree_hash;
 use clvmr::serde::node_from_bytes;
 use clvmr::Allocator;
 
@@ -454,7 +454,8 @@ mod tests {
         let genesis = wallet_coin(amount, 42);
         let hint = ctx.hint(wallet_ph()).unwrap();
         let create = Conditions::new().create_coin(wallet_ph(), amount, hint);
-        let (_, cats) = Cat::single_issuance(&mut ctx, genesis.coin_id(), None, amount, create).unwrap();
+        let (_, cats) =
+            Cat::single_issuance(&mut ctx, genesis.coin_id(), None, amount, create).unwrap();
         cats[0]
     }
 
