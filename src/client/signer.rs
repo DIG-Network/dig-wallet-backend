@@ -417,7 +417,7 @@ impl LocalSigner {
                 )
             })?;
             signatures.push(bls_sign(&key, &required.message));
-            // NOTE: `chia_bls::SecretKey` (chia-bls 0.26) exposes no `Zeroize`/`Drop` scrub, so the
+            // NOTE: `chia_bls::SecretKey` (chia-bls 0.36.1) exposes no `Zeroize`/`Drop` scrub, so the
             // transient derived key cannot be wiped here; it is dropped immediately at end of scope.
             // The master SEED it derives from IS zeroized (see `hd::MasterKey`). Upgrading chia-bls
             // to a zeroizing `SecretKey` is a tracked follow-up.
