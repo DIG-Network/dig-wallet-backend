@@ -234,11 +234,14 @@ impl LocalSigner {
         })
     }
 
-    /// Independently VERIFY the coin spends before signing (SPEC §4, #1058): re-derive the value
-    /// flow from the coin spends themselves ([`verify::analyze`]), require every change output to
-    /// return to this wallet, and require the engine-supplied summary to match the re-derived truth.
-    /// Fail-closed — a spend that cannot be fully accounted for is refused, so the signer never
-    /// blindly signs bytes it did not verify.
+    /// Independently VERIFY the coin spends before signing (SPEC §4, #1058, #1511): re-derive the
+    /// value flow from the coin spends themselves ([`verify::analyze`]), then split the outputs by
+    /// KEY OWNERSHIP ([`reclassify_by_ownership`](LocalSigner::reclassify_by_ownership)) — every
+    /// output this wallet can derive a key for is change, every other output is a recipient — and
+    /// require the engine-supplied summary to equal exactly those recipients + the fee. Fail-closed —
+    /// a spend that cannot be fully accounted for, or whose recipients do not match the reviewed
+    /// summary byte-for-byte, is refused, so the signer never blindly signs bytes it did not verify
+    /// and no non-owned output can leave the wallet unreviewed.
     fn verify_before_signing(&self, unsigned: &UnsignedSpend) -> WalletResult<()> {
         // Re-derive the value flow, then split it by KEY OWNERSHIP: every output this wallet can
         // derive a key for is change (value returning home); everything else is a recipient. This is
@@ -1243,7 +1246,7 @@ mod tests {
         );
     }
 
-    /// #1058 scoping: offer/option/tip spends (non-standard puzzles verify cannot yet decode) routed
+    /// #1058 scoping: offer/option spends (non-standard puzzles verify cannot yet decode) routed
     /// through `sign_unsigned` are refused fail-closed until their decoders land. Uses the REAL Chia
     /// settlement-payments puzzle (the offer-settlement class) as the coin's puzzle.
     #[cfg(feature = "engine")]
