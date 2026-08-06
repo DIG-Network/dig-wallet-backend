@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.21.0] - 2026-08-06
+
+### Features
+- **client:** Add `decode_verified` — a no-fallback spend decode for the pre-sign consent path that fails closed instead of degrading to the engine's untrusted summary (#2209)
+
 ## [0.20.0] - 2026-08-06
 
 ### Features

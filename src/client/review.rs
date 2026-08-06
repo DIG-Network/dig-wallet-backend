@@ -5,7 +5,7 @@
 //! XCH") so the user reviews rather than trusts blindly. Decoding is deterministic and
 //! side-effect free.
 
-use crate::types::{Amount, UnsignedSpend};
+use crate::types::{Amount, TransactionSummary, UnsignedSpend, WalletResult};
 
 /// Mojos per one XCH (12 decimal places).
 const MOJOS_PER_XCH: u64 = 1_000_000_000_000;
@@ -45,17 +45,58 @@ fn render_amount(amount: Amount, is_xch: bool) -> String {
     format!("{whole}.{trimmed}")
 }
 
-/// Decode an unsigned spend into a human-readable summary for review.
+/// Decode an unsigned spend into a human-readable summary for DISPLAY-ONLY review — MAY be unverified.
 ///
 /// The rendered value flow is re-derived straight from the coin spends
 /// ([`super::verify::derive_summary`], #1058) so the confirm dialog shows what the transaction
 /// ACTUALLY does — the same authoritative summary the signer gates on — never the engine's
 /// (potentially lying) claim. If the spend cannot be independently decoded the engine summary is
-/// shown as a last resort, but [`super::signer::LocalSigner::sign_unsigned`] will then refuse it.
+/// shown as a last resort with [`HumanReadableSummary::verified`] `= false`.
+///
+/// # Never use this ahead of signing
+/// This lenient mode can silently degrade from "what the bundle DOES" to "what the (untrusted)
+/// builder CLAIMS it does". It is safe ONLY for a display surface that renders + honours the
+/// `verified` flag. Any path that precedes signing / a pre-sign consent prompt MUST use
+/// [`decode_verified`] instead, which has NO fallback and fails closed (#2209). The naming makes the
+/// unsafe choice the loud one: a caller that reaches for `decode` is opting into a possibly-unverified
+/// screen.
 pub fn decode(unsigned: &UnsignedSpend) -> HumanReadableSummary {
-    let derived = super::verify::derive_summary(&unsigned.coin_spends);
-    let verified = derived.is_ok();
-    let summary = derived.unwrap_or_else(|_| unsigned.summary.clone());
+    match super::verify::derive_summary(&unsigned.coin_spends) {
+        Ok(summary) => render(unsigned, &summary, true),
+        // Fall back to the engine's (untrusted) claim, flagged unverified. The signer refuses to
+        // sign such a spend regardless (`verify_before_signing` re-runs `analyze` fail-closed).
+        Err(_) => render(unsigned, &unsigned.summary, false),
+    }
+}
+
+/// Decode an unsigned spend for a pre-sign CONSENT prompt — NO fallback, fails closed (#2209).
+///
+/// Unlike [`decode`], this mode has no unverified branch: if the value flow cannot be independently
+/// re-derived from the coin spends ([`super::verify::derive_summary`]) it returns `Err`, and NEVER
+/// renders the engine's (untrusted) claim. Use it on any path that leads to signing, so the screen a
+/// user consents to is always the one the interpreter proved — never the one the builder asserted.
+///
+/// # The single-interpreter invariant
+/// Exactly ONE component interprets what a spend means: [`super::verify::analyze`] (via
+/// [`super::verify::derive_summary`]). The signer gates on it ([`super::signer::LocalSigner::
+/// verify_before_signing`]) and the consent prompt renders from it here — so the screen the user
+/// approves and the bytes the signer authorizes derive from the SAME source, by construction. The
+/// lenient [`decode`] fallback quietly swaps that interpreter for the builder's claim at the worst
+/// moment; `decode_verified` refuses to. The returned summary is always `verified`.
+pub fn decode_verified(unsigned: &UnsignedSpend) -> WalletResult<HumanReadableSummary> {
+    let summary = super::verify::derive_summary(&unsigned.coin_spends)?;
+    Ok(render(unsigned, &summary, true))
+}
+
+/// Render a re-derived (or, for the lenient path, fallback) [`TransactionSummary`] into the
+/// human-readable confirm lines. `verified` records whether `summary` came from the independent
+/// re-derivation ([`decode_verified`] always passes `true`; [`decode`] passes `false` for its
+/// engine-claim fallback).
+fn render(
+    unsigned: &UnsignedSpend,
+    summary: &TransactionSummary,
+    verified: bool,
+) -> HumanReadableSummary {
     let lines = summary
         .outputs
         .iter()
@@ -86,7 +127,7 @@ pub fn decode(unsigned: &UnsignedSpend) -> HumanReadableSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Address, AssetId, SpendOutput, TransactionSummary};
+    use crate::types::{Address, AssetId, SpendOutput};
 
     fn unsigned(outputs: Vec<SpendOutput>, fee: Amount) -> UnsignedSpend {
         UnsignedSpend {
@@ -150,6 +191,52 @@ mod tests {
             !summary.verified,
             "an undecodable spend is not independently verified"
         );
+    }
+
+    /// The no-fallback [`decode_verified`] REFUSES exactly where the lenient [`decode`] silently
+    /// degrades to the engine's (untrusted) claim (`verified: false`).
+    ///
+    /// The bundle is a REAL coin spend whose re-derivation genuinely fails — a non-standard puzzle
+    /// (the identity program `1`, solution `()`) the chia-wallet-sdk drivers cannot account for, run
+    /// through the same [`super::verify::analyze`] wire the signer gates on. It is not a mock rigged
+    /// to report failure: `analyze` runs the actual puzzle and rejects it fail-closed.
+    #[test]
+    fn decode_verified_refuses_where_lenient_decode_is_unverified() {
+        use crate::types::WalletErrorCode;
+        use chia_protocol::{Bytes32, Coin, CoinSpend};
+
+        // A coin spend the drivers cannot decode: the identity puzzle `1` is neither a standard
+        // layer, a CAT, an option, nor a settlement puzzle, so `analyze` refuses it.
+        let coin = Coin::new(Bytes32::new([1u8; 32]), Bytes32::new([2u8; 32]), 100);
+        let bad_spend = CoinSpend::new(coin, vec![0x01].into(), vec![0x80].into());
+        let unsigned = UnsignedSpend {
+            coin_spends: vec![bad_spend],
+            required_signatures: vec![],
+            summary: TransactionSummary {
+                outputs: vec![SpendOutput {
+                    address: Address("xch1attacker".into()),
+                    amount: Amount(MOJOS_PER_XCH),
+                    asset_id: None,
+                }],
+                fee: Amount(0),
+            },
+        };
+
+        // The lenient decoder degrades to the engine's untrusted claim, flagged unverified.
+        let lenient = decode(&unsigned);
+        assert!(
+            !lenient.verified,
+            "the lenient decoder falls back to the engine claim, flagged unverified"
+        );
+        assert_eq!(
+            lenient.lines,
+            vec!["Send 1 XCH to xch1attacker".to_string()]
+        );
+
+        // The no-fallback decoder REFUSES — it never renders the untrusted engine claim.
+        let err = decode_verified(&unsigned)
+            .expect_err("decode_verified must fail when re-derivation fails, never fall back");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
     }
 
     /// A real, decodable spend is rendered from the re-derived (authoritative) summary and flagged
@@ -218,5 +305,11 @@ mod tests {
         let summary = decode(&unsigned);
         assert!(summary.verified);
         assert_eq!(summary.lines.len(), 1);
+
+        // The no-fallback consent decoder SUCCEEDS on a genuinely decodable spend and matches the
+        // lenient render byte-for-byte (same interpreter, same output).
+        let verified = decode_verified(&unsigned).expect("a decodable spend verifies");
+        assert!(verified.verified);
+        assert_eq!(verified, summary);
     }
 }

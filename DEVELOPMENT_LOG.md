@@ -3,6 +3,18 @@
 High-signal, durable realizations from developing this crate. Concise facts with context — NOT a
 change diary.
 
+## Consent decode must require the interpreter, never the builder's claim (#2209)
+
+A spend decode that falls back to the engine-supplied summary when re-derivation fails is fine for a
+DISPLAY surface that renders a `verified` flag, but NOT for a pre-sign consent prompt: it silently
+degrades from "what the bundle DOES" (re-derived by `verify::analyze`) to "what the untrusted builder
+CLAIMS it does" at the exact moment assurance matters, and a caller that forgets to check `verified`
+gets a plausible-but-unverified screen. The rule: if two code paths must agree about the MEANING of
+something, exactly one may interpret it — the fallback quietly swaps interpreters. Hence two modes:
+lenient `decode` (display-only, may be unverified) and `decode_verified` (no fallback, fails closed).
+The signing gate (`verify_before_signing`) and the consent prompt both derive from the one interpreter
+`verify::analyze`, so the approved screen and the signed bytes share a source by construction.
+
 ## chia-wallet-sdk 0.34 — offer requested payments are DIRECT to the payee
 
 In the SDK 0.34 offer model, a take funds the maker's requested payments as ordinary coins created

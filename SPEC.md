@@ -431,11 +431,24 @@ Used by dig-app. The subscriber + identity provider + signer.
   operands are attacker-reachable — output amounts come from `CREATE_COIN` conditions, bounded by no
   coin amount — and conservation is decided by comparing these totals, so a wrapped total reports a
   spend that creates more than `u64::MAX` as conserved, and a saturated one is equally fail-open.
-- **`client::review::decode(&UnsignedSpend) -> HumanReadableSummary`** — deterministic, side-effect-free
-  decode of a spend into human-readable lines ("Send 1.5 XCH to xch1… · Fee 0.0001 XCH", coin-spend
-  and required-signature counts) for the native-confirm UI. The rendered value flow is re-derived via
-  `client::verify::derive_summary` (the authoritative summary), so the confirm dialog shows what the
-  transaction ACTUALLY does. The user reviews; they do not trust blindly.
+- **Spend decode — two modes, ONE interpreter (#2209).** Both modes render the human-readable confirm
+  lines ("Send 1.5 XCH to xch1… · Fee 0.0001 XCH", coin-spend and required-signature counts) from the
+  value flow re-derived by `client::verify::derive_summary` (→ `analyze`, the SINGLE authoritative
+  interpreter of what a spend means). They differ ONLY in what happens when re-derivation fails:
+  - **`client::review::decode(&UnsignedSpend) -> HumanReadableSummary`** — DISPLAY-ONLY, MAY be
+    unverified. On re-derivation failure it falls back to the engine's (untrusted) claimed summary
+    with `HumanReadableSummary::verified = false`. A caller MUST render + honour that flag. It MUST NOT
+    be used ahead of signing.
+  - **`client::review::decode_verified(&UnsignedSpend) -> WalletResult<HumanReadableSummary>`** — the
+    NO-FALLBACK mode for any path that leads to signing / a pre-sign consent prompt. If the value flow
+    cannot be independently re-derived it returns `Err(SpendValidationFailed)`; it NEVER renders the
+    engine's claim. The returned summary is always `verified`.
+  - **Single-interpreter invariant (MUST NOT drift):** the screen a user consents to before signing
+    and the bytes `LocalSigner::verify_before_signing` gates on both derive from `verify::analyze` — the
+    same interpreter, by construction. The consent/signing path uses the no-fallback `decode_verified`
+    (or the signer's own `analyze`-backed gate), so it can never silently swap the interpreter for the
+    builder's claim. Only the lenient `decode` may degrade, and only for a display surface that shows
+    the `verified` flag.
 - **`client::signer`** — `IdentitySigner { identity(), sign(UnsignedSpend) -> SignedBundle }` and
   `LocalSigner` (holds a `chia::bls::SecretKey`, exposes only `public_key()` + `identity()` +
   `identity_public_key_bytes()` + `decap(peer_g1)`). `LocalSigner` also implements the engine's
