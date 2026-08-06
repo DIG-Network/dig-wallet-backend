@@ -265,43 +265,11 @@ impl LocalSigner {
             }
         }
 
-        // MR-9 (#1511 PR-C — the option-exercise crux). When an exercise unlocks the underlying it
-        // lands on a BARE settlement coin that ANYONE can claim; consensus forces the strike payment to
-        // the creator but does NOT force the underlying claim back to the holder — that leg is
-        // builder-enforced only. So before signing (and paying the strike) the wallet MUST prove, for
-        // each unlocked amount, that the bundle reclaims it to a WALLET-OWNED puzzle hash. Absent this,
-        // a compromised engine could drop or re-route the underlying-claim leg and strand the unlocked
-        // underlying for a mempool watcher to steal while the wallet has paid the strike for nothing.
-        self.assert_option_underlying_reclaimed(&effect)?;
-
         // The reviewed summary MUST equal exactly the outputs that leave the wallet — recipients (by
         // address) and settlement sinks (by amount+asset) — otherwise the engine could show a benign
         // summary while the bytes send value elsewhere. With change split off by ownership above, this
         // is the whole no-silent-exfiltration guarantee.
         self.assert_reviewed_summary_matches(&unsigned.summary, &effect)
-    }
-
-    /// MR-9 (#1511 PR-C): every underlying amount an option EXERCISE unlocked into the settlement puzzle
-    /// MUST be reclaimed IN-BUNDLE to a puzzle hash THIS wallet owns. For each required claim amount,
-    /// require a claimed-settlement payout of exactly that amount whose destination
-    /// [`owns_puzzle_hash`](LocalSigner::owns_puzzle_hash) recognizes as the wallet's — else refuse
-    /// fail-closed. Non-option spends carry no underlying claims, so this is a no-op for them.
-    fn assert_option_underlying_reclaimed(&self, effect: &SpendEffect) -> WalletResult<()> {
-        for &amount in &effect.option_underlying_claims {
-            let reclaimed = effect
-                .settlement_claim_payouts
-                .iter()
-                .any(|payout| payout.amount == amount && self.owns_puzzle_hash(payout.puzzle_hash));
-            if !reclaimed {
-                return Err(WalletError::new(
-                    WalletErrorCode::SpendValidationFailed,
-                    "an option exercise unlocks the underlying but does not reclaim it to a \
-                     wallet-owned puzzle hash (the unlocked underlying would be stranded on an \
-                     anyone-can-claim settlement coin); refusing to sign",
-                ));
-            }
-        }
-        Ok(())
     }
 
     /// Split a re-derived [`SpendEffect`] by KEY OWNERSHIP: an output whose puzzle hash this wallet
@@ -321,19 +289,14 @@ impl LocalSigner {
             }
         }
         // `protocol_sink` is untouched by ownership: it is value the wallet intentionally commits to a
-        // consensus-enforced settlement structure (an offer's offered/paid assets, an option's unlocked
-        // underlying), neither returning home nor going to a chosen recipient. Its canonical-hash
-        // invariant is enforced separately in `verify_before_signing` before any signature is produced.
-        // The option-only fields (underlying claims, settlement payouts, strike bindings) pass through
-        // unchanged — they are consumed by the MR-9 wallet-owned-claim gate, not the recipient split.
+        // consensus-enforced settlement structure (an offer's offered/paid assets), neither returning
+        // home nor going to a chosen recipient. Its canonical-hash invariant is enforced separately in
+        // `verify_before_signing` before any signature is produced.
         SpendEffect {
             recipients,
             change,
             protocol_sink: effect.protocol_sink,
             fee: effect.fee,
-            option_underlying_claims: effect.option_underlying_claims,
-            settlement_claim_payouts: effect.settlement_claim_payouts,
-            strike_announcement_bindings: effect.strike_announcement_bindings,
         }
     }
 
@@ -447,13 +410,17 @@ impl LocalSigner {
     /// The custody core (SPEC §4). Signs the spend classes the engine builds and
     /// [`verify`](super::verify) can independently decode — a standard-layer XCH send, a CAT send, a
     /// $DIG **tip** (a single-key CAT payment; #1511 PR-A), the three **offer** shapes make / take /
-    /// cancel (#1511 PR-B), and the covered-option **transfer** + **exercise** (#1511 PR-C), whose
-    /// offered/paid/unlocked assets are accounted as a settlement `protocol_sink`. Settlement-layer
-    /// coins the wallet claims carry no signature and skip the signed-coin guards. For an option
-    /// EXERCISE the signer additionally asserts the unlocked underlying is reclaimed to a wallet-owned
-    /// puzzle hash (MR-9, [`assert_option_underlying_reclaimed`](LocalSigner::assert_option_underlying_reclaimed)).
-    /// Option **mint** routed here is still refused fail-closed (its cross-seam summary decode is tracked
-    /// in #2243); that flow does not sign through `LocalSigner` today.
+    /// cancel (#1511 PR-B), and the covered-option **transfer** (#1511 PR-C), whose offered/paid assets
+    /// are accounted as a settlement `protocol_sink`. Settlement-layer coins the wallet claims carry no
+    /// signature and skip the signed-coin guards.
+    ///
+    /// Two option actions are REFUSED fail-closed and do NOT sign through `LocalSigner`: **mint** (its
+    /// cross-seam summary decode is deferred to #2243), and **exercise** — the exercising holder's
+    /// underlying-reclaim leg is NOT consensus-forced (`dig_options::exercise` lands the unlocked
+    /// underlying on a bare anyone-can-claim settlement coin with no reclaim binding), so a compromised
+    /// engine could strip it after the wallet funds the strike and sweep the underlying. Exercise cannot
+    /// be safely signable until a dig-options puzzle change binds the reclaim to the holder (deferred to
+    /// #2245). [`verify::analyze`] detects an exercise bundle (its locked-underlying leg) and refuses it.
     ///
     /// Fail-closed, in order: (1) independently verify the coin spends' value flow (#1058); (2)
     /// RE-DERIVE the authoritative required signatures FROM the verified coin spends — the
@@ -2641,14 +2608,14 @@ mod tests {
         );
     }
 
-    // ---- PR-C (#1511): covered-option TRANSFER + EXERCISE sign through `LocalSigner` ----
+    // ---- PR-C (#1511): covered-option TRANSFER signs through `LocalSigner`; EXERCISE + MINT refused ----
     //
-    // An option transfer re-homes the singleton through the current owner's inner standard layer; an
-    // exercise spends the singleton (melt), unlocks the underlying to the settlement puzzle, and pays
-    // the strike — with the unlocked underlying reclaimed to the holder in the same bundle. `analyze`
-    // decodes both purely through chia-wallet-sdk drivers; the signer adds the MR-9 wallet-owned
-    // underlying-claim gate. The goldens below build REAL option spends via the engine `OptionBuilder`,
-    // sign through `LocalSigner::sign_unsigned`, and settle on the simulator. MINT stays refused (#2243).
+    // An option transfer re-homes the singleton through the current owner's inner standard layer (the
+    // sole signed `AGG_SIG_ME`); `analyze` decodes it purely through chia-wallet-sdk drivers and the
+    // golden below builds a REAL transfer via the engine `OptionBuilder`, signs through
+    // `LocalSigner::sign_unsigned`, and settles on the simulator. EXERCISE and MINT are both REFUSED
+    // fail-closed: exercise's underlying-reclaim leg is not consensus-forced (deferred #2245), and
+    // mint's cross-seam decode is deferred (#2243).
 
     #[cfg(feature = "engine")]
     use crate::engine::build_options::OptionBuilder;
@@ -2744,15 +2711,22 @@ mod tests {
         (handle, on_chain)
     }
 
-    /// PR-C GOLDEN probe: a two-party exercise (creator is FOREIGN, holder is the wallet) built by the
-    /// engine signs through `LocalSigner::sign_unsigned` and settles on the simulator.
+    /// PR-C: option EXERCISE is REFUSED at the signer, fail-closed, producing ZERO signatures. Exercise
+    /// is not safely `LocalSigner`-signable: the exercising holder's underlying-reclaim leg is NOT
+    /// consensus-forced — `dig_options::exercise` lands the unlocked underlying on a bare
+    /// anyone-can-claim settlement coin with no reclaim binding — so a compromised engine could strip
+    /// that leg AFTER the wallet funds the strike-funding coin (the wallet pays the strike while an
+    /// attacker sweeps the underlying). It stays refused until a dig-options puzzle change binds the
+    /// reclaim to the holder (deferred to #2245). Mirrors `option_mint_is_still_refused`. The engine
+    /// still BUILDS a valid exercise (proving the refusal is the signer's deliberate policy, not a build
+    /// failure); `sign_unsigned` refuses it.
     #[cfg(feature = "engine")]
     #[tokio::test]
-    async fn golden_option_exercise_signs_and_settles() {
+    async fn option_exercise_is_refused() {
         use crate::types::{Amount, ExerciseOptionRequest};
 
         let mut sim = chia_sdk_test::Simulator::new();
-        let holder = offer_party("opt-exercise-holder");
+        let holder = offer_party("opt-exercise-refused");
         let creator_ph = Bytes32::new([0xC1; 32]); // foreign creator (not the wallet)
         let (underlying, strike) = (1_000u64, 250u64);
         let (handle, on_chain) = mint_option_on_sim(
@@ -2774,25 +2748,14 @@ mod tests {
                 fee: Amount(0),
             })
             .await
-            .unwrap();
+            .expect("the engine still builds a valid exercise bundle");
 
-        // The re-derived key-aware summary equals the builder's (the STRIKE leaving to the creator).
-        assert!(
-            same_summary(
-                &holder
-                    .signer
-                    .reviewable_summary(&unsigned.coin_spends)
-                    .unwrap(),
-                &unsigned.summary,
-            ),
-            "the re-derived exercise summary must equal the builder's (strike → creator)",
+        let err = holder.signer.sign_unsigned(&unsigned).unwrap_err();
+        assert_eq!(
+            err.code,
+            WalletErrorCode::SpendValidationFailed,
+            "option exercise must be refused fail-closed at the signer (deferred #2245)",
         );
-        let signed = holder
-            .signer
-            .sign_unsigned(&unsigned)
-            .expect("a genuine option exercise must sign through LocalSigner (#1511 PR-C)");
-        sim.new_transaction(signed.bundle)
-            .expect("the atomic exercise bundle must be accepted by the simulator");
     }
 
     /// PR-C GOLDEN: a covered-option TRANSFER re-homes the singleton through the owner's inner standard
@@ -2868,100 +2831,6 @@ mod tests {
             party.signer.sign_unsigned(&unsigned).unwrap_err().code,
             WalletErrorCode::SpendValidationFailed,
             "option mint must still be refused at the signer (#2243)",
-        );
-    }
-
-    /// PR-C NEGATIVE — MR-9 (THE CRUX): an exercise whose underlying-claim settlement leg is DROPPED
-    /// (the unlocked underlying left stranded on an anyone-can-claim settlement coin) is REFUSED, and
-    /// NO signature is produced — the truthful control is `golden_option_exercise_signs_and_settles`.
-    #[cfg(feature = "engine")]
-    #[tokio::test]
-    async fn exercise_with_a_dropped_underlying_claim_is_refused_mr9() {
-        use crate::types::{Amount, ExerciseOptionRequest};
-
-        let mut sim = chia_sdk_test::Simulator::new();
-        let holder = offer_party("opt-mr9");
-        let (underlying, strike) = (1_000u64, 250u64);
-        let (handle, on_chain) = mint_option_on_sim(
-            &mut sim,
-            &holder,
-            Bytes32::new([0xC1; 32]),
-            holder.wallet_ph,
-            underlying,
-            strike,
-            10_000,
-        );
-        let strike_coin = sim.new_coin(holder.wallet_ph, strike);
-        let mut unsigned = option_builder(&holder, vec![strike_coin])
-            .build_exercise_option(ExerciseOptionRequest {
-                identity: IdentityRef::new(WalletId(1)),
-                handle,
-                on_chain,
-                fee: Amount(0),
-            })
-            .await
-            .unwrap();
-
-        // Drop the settlement coin spend that reclaims the unlocked underlying (amount == underlying)
-        // to the holder — exactly the builder-enforced-only leg an attacker would strip to strand it.
-        let before = unsigned.coin_spends.len();
-        unsigned
-            .coin_spends
-            .retain(|cs| !(cs.coin.puzzle_hash == settlement_ph() && cs.coin.amount == underlying));
-        assert_eq!(
-            before - unsigned.coin_spends.len(),
-            1,
-            "exactly the underlying-claim leg dropped"
-        );
-
-        assert_eq!(
-            holder.signer.sign_unsigned(&unsigned).unwrap_err().code,
-            WalletErrorCode::SpendValidationFailed,
-            "an exercise that does not reclaim the unlocked underlying to the wallet must be refused",
-        );
-    }
-
-    /// PR-C NEGATIVE — MR-10: an exercise whose STRIKE settlement leg is DROPPED (so the strike is not
-    /// settled to the option's committed requested payment) is REFUSED — the underlying spend asserts a
-    /// strike-payment announcement no claimed settlement coin satisfies. Control: the golden exercise.
-    #[cfg(feature = "engine")]
-    #[tokio::test]
-    async fn exercise_with_a_dropped_strike_leg_is_refused_mr10() {
-        use crate::types::{Amount, ExerciseOptionRequest};
-
-        let mut sim = chia_sdk_test::Simulator::new();
-        let holder = offer_party("opt-mr10");
-        let (underlying, strike) = (1_000u64, 250u64);
-        let (handle, on_chain) = mint_option_on_sim(
-            &mut sim,
-            &holder,
-            Bytes32::new([0xC1; 32]),
-            holder.wallet_ph,
-            underlying,
-            strike,
-            10_000,
-        );
-        let strike_coin = sim.new_coin(holder.wallet_ph, strike);
-        let mut unsigned = option_builder(&holder, vec![strike_coin])
-            .build_exercise_option(ExerciseOptionRequest {
-                identity: IdentityRef::new(WalletId(1)),
-                handle,
-                on_chain,
-                fee: Amount(0),
-            })
-            .await
-            .unwrap();
-
-        // Drop the strike settlement claim (amount == strike): the strike is no longer provably settled
-        // to the creator per the option's committed requested payment.
-        unsigned
-            .coin_spends
-            .retain(|cs| !(cs.coin.puzzle_hash == settlement_ph() && cs.coin.amount == strike));
-
-        assert_eq!(
-            holder.signer.sign_unsigned(&unsigned).unwrap_err().code,
-            WalletErrorCode::SpendValidationFailed,
-            "an exercise whose strike is not settled to the committed requested payment must be refused",
         );
     }
 

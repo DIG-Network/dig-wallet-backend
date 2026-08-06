@@ -12,34 +12,34 @@
 //! (a single-key CAT payment — recipient + change, no separate XCH fee — that flows through the SAME
 //! [`Cat::parse`] path), the three **offer** shapes (make / take / cancel), whose value the wallet
 //! commits to the consensus-enforced **settlement-payments** puzzle (#1511 PR-B), and the covered-option
-//! **transfer** + **exercise** (#1511 PR-C — see below). A settlement output is accounted into a THIRD
+//! **transfer** (#1511 PR-C — see below). A settlement output is accounted into a THIRD
 //! bucket, [`SpendEffect::protocol_sink`] — value intentionally handed to a recognized canonical
 //! structural puzzle, not to a free address — so an attacker address can never be laundered as a "sink".
-//! Settlement-layer coins the wallet CLAIMS (take/cancel/exercise) are decoded through [`SettlementLayer`]
+//! Settlement-layer coins the wallet CLAIMS (take/cancel) are decoded through [`SettlementLayer`]
 //! and carry NO signature (claimed by announcement), so they skip the wallet-signed-coin guards; only the
 //! wallet's own standard/CAT coins (and an option singleton's inner standard layer) are signed. Any coin
 //! spend the drivers cannot fully parse+account for — a foreign puzzle, a value leak, a minted CAT, a
 //! "settlement" output to a non-canonical hash — yields [`WalletErrorCode::SpendValidationFailed`]; the
-//! signer refuses to sign it. Covered-option **mint** reaching the signer is still refused (its cross-seam
-//! decode is tracked in #2243) — that is intended.
+//! signer refuses to sign it. Covered-option **mint** and **exercise** reaching the signer are refused —
+//! that is intended (see below).
 //!
-//! # Covered options — transfer + exercise (#1511 PR-C)
+//! # Covered options — transfer signs; exercise + mint refused (#1511 PR-C)
 //! An option spend is decoded ONLY through chia-wallet-sdk drivers ([`OptionContract`],
 //! [`P2OneOfManyLayer`], [`SettlementLayer`]), never bespoke CLVM:
-//! - **transfer** re-homes the option singleton: [`OptionContract::parse`] reaches the current owner's
-//!   inner standard layer (the sole signed `AGG_SIG_ME`), which emits an odd-amount `CREATE_COIN`
-//!   re-homing the singleton to the new owner (a recipient the human reviews).
-//! - **exercise** spends the option singleton (through its exercise path — the inner standard layer
-//!   `melt`s it), the locked underlying (a [`P2OneOfManyLayer`] coin whose exercise path unlocks the
-//!   underlying to the settlement puzzle), and TWO settlement legs: the strike → creator and the
-//!   unlocked underlying → holder. The underlying-claim leg is **builder-enforced only** (consensus
-//!   forces the strike, NOT the underlying claim), so [`LocalSigner`](super::signer::LocalSigner)
-//!   asserts a claim of exactly the unlocked amount routes to a WALLET-OWNED puzzle hash before signing
-//!   ([`SpendEffect::option_underlying_claims`], threat MR-9) — else the unlocked underlying would strand
-//!   on an anyone-can-claim settlement coin. The strike leg is reconciled to the option's committed
-//!   requested payment via its puzzle-announcement binding ([`SpendEffect::strike_announcement_bindings`],
-//!   MR-10). Option bundles use IMPLICIT-fee conservation (the option builders emit no `RESERVE_FEE`, and
-//!   the melted 1-mojo singleton is a structural carrier excluded from the value ledger).
+//! - **transfer** (SUPPORTED) re-homes the option singleton: [`OptionContract::parse`] reaches the
+//!   current owner's inner standard layer (the sole signed `AGG_SIG_ME`), which emits an odd-amount
+//!   `CREATE_COIN` re-homing the singleton to the new owner (a recipient the human reviews). Transfer
+//!   touches only the inner standard layer, so it is safely signable. Option bundles use IMPLICIT-fee
+//!   conservation (the option builders emit no `RESERVE_FEE`, and the 1-mojo singleton flows through to
+//!   the re-homed coin).
+//! - **exercise** (REFUSED, deferred #2245) unlocks the locked underlying (a [`P2OneOfManyLayer`] coin)
+//!   onto a BARE `SETTLEMENT_PAYMENT_HASH` coin. Consensus forces the strike payment to the creator but
+//!   does NOT force the unlocked underlying back to the holder — that reclaim leg is builder-enforced
+//!   only, so a compromised engine could strip it AFTER the wallet signs the strike-funding coin (wallet
+//!   pays the strike; an attacker sweeps the underlying). Exercise therefore CANNOT be safely
+//!   `LocalSigner`-signable until a dig-options puzzle change binds the reclaim to the holder. [`analyze`]
+//!   detects an exercise bundle by its [`P2OneOfManyLayer`] leg and refuses it fail-closed.
+//! - **mint** (REFUSED, deferred #2243) — its cross-seam summary decode is not yet wired.
 //!
 //! # Recipients vs change is key-relative
 //! Splitting a spend's outputs into recipients (value leaving) and change (value returning home) is
@@ -50,15 +50,15 @@
 //! [`LocalSigner`](super::signer::LocalSigner), which treats every output it can derive a key for as
 //! change; that is what the signer's summary gate compares against.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
-use chia_protocol::{Bytes32, Coin, CoinSpend};
+use chia_protocol::{Bytes32, CoinSpend};
 use chia_puzzle_types::Memos;
 use chia_wallet_sdk::driver::{
     Cat, Layer, OptionContract, P2OneOfManyLayer, Puzzle, SettlementLayer, StandardLayer,
 };
 use chia_wallet_sdk::puzzles::{SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH};
-use chia_wallet_sdk::types::{announcement_id, run_puzzle, Condition};
+use chia_wallet_sdk::types::{run_puzzle, Condition};
 use chia_wallet_sdk::utils::Address as Bech32Address;
 use clvm_traits::FromClvm;
 use clvm_utils::tree_hash;
@@ -90,11 +90,8 @@ pub struct DecodedOutput {
 /// The signer requires every change output to be wallet-owned and every `protocol_sink` output to be a
 /// recognized canonical structural hash, so no value can silently leave the wallet to a free address.
 ///
-/// `#[non_exhaustive]` (ref #2242): the bucket set grows as new spend classes are decoded (options
-/// added [`option_underlying_claims`](SpendEffect::option_underlying_claims) +
-/// [`settlement_claim_payouts`](SpendEffect::settlement_claim_payouts) +
-/// [`strike_announcement_bindings`](SpendEffect::strike_announcement_bindings)), so downstream matches
-/// must not assume a fixed field set.
+/// `#[non_exhaustive]` (ref #2242): the bucket set grows as new spend classes are decoded, so
+/// downstream matches must not assume a fixed field set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SpendEffect {
@@ -104,29 +101,15 @@ pub struct SpendEffect {
     pub change: Vec<DecodedOutput>,
     /// Outputs the wallet intentionally commits to a consensus-enforced canonical structural puzzle —
     /// the offer settlement-payments puzzle ([`SETTLEMENT_PAYMENT_HASH`]) or the singleton launcher
-    /// ([`SINGLETON_LAUNCHER_HASH`]). This is the sanctioned egress of offered/paid/unlocked assets:
+    /// ([`SINGLETON_LAUNCHER_HASH`]). This is the sanctioned egress of offered/paid assets:
     /// value leaves the wallet, but to a structure the protocol enforces, never to a chosen address.
     /// Every entry's `puzzle_hash` is a recognized canonical structural hash by construction (see
     /// [`is_protocol_sink_hash`]).
     pub protocol_sink: Vec<DecodedOutput>,
     /// The farmer fee (XCH mojos). For strict (XCH/CAT/offer) spends, summed from `RESERVE_FEE`
-    /// conditions; for an OPTION bundle, the IMPLICIT fee `inputs − outputs` (the option builders emit
-    /// no `RESERVE_FEE`, and the melted 1-mojo singleton is excluded from the ledger).
+    /// conditions; for an OPTION (transfer) bundle, the IMPLICIT fee `inputs − outputs` (the option
+    /// builders emit no `RESERVE_FEE`).
     pub fee: u64,
-    /// Amounts an option EXERCISE unlocked from the locked underlying ([`P2OneOfManyLayer`]) into the
-    /// settlement puzzle — each MUST be reclaimed IN-BUNDLE to a WALLET-OWNED puzzle hash, or the
-    /// unlocked underlying strands on an anyone-can-claim settlement coin (#1511 PR-C, threat MR-9). The
-    /// KEY-AWARE assertion lives in [`LocalSigner`](super::signer::LocalSigner) (it needs wallet keys).
-    pub option_underlying_claims: Vec<u64>,
-    /// The payouts decoded from CLAIMED settlement coins (their notarized payments) — the signer matches
-    /// an [`option_underlying_claims`](SpendEffect::option_underlying_claims) requirement against these
-    /// to prove the unlocked underlying returns to a wallet-owned puzzle hash (MR-9).
-    pub settlement_claim_payouts: Vec<DecodedOutput>,
-    /// The strike-payment puzzle-announcement ids an option EXERCISE's underlying spend ASSERTS (the
-    /// option's committed requested payment to the creator). Each MUST be satisfied by a claimed
-    /// settlement coin's created announcement, reconciling the strike leg's amount + destination to the
-    /// option's terms (MR-10) — else the strike could be re-routed or wrong-valued.
-    pub strike_announcement_bindings: Vec<Bytes32>,
 }
 
 /// True when `puzzle_hash` is a recognized canonical STRUCTURAL puzzle hash the wallet may commit
@@ -167,25 +150,11 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     let mut cat_in: BTreeMap<Bytes32, u64> = BTreeMap::new();
     let mut cat_out: BTreeMap<Bytes32, u64> = BTreeMap::new();
 
-    // Option-only accounting (#1511 PR-C): the unlocked-underlying claims to reconcile against
-    // wallet-owned settlement payouts (MR-9), the settlement payouts + created announcements to
-    // reconcile the strike leg (MR-10). Empty for every non-option bundle.
-    let mut option_underlying_claims: Vec<u64> = Vec::new();
-    let mut settlement_claim_payouts: Vec<DecodedOutput> = Vec::new();
-    let mut settlement_created_announcements: Vec<Bytes32> = Vec::new();
-    let mut strike_announcement_bindings: Vec<Bytes32> = Vec::new();
-    // Settlement egresses are routed here (not straight to `protocol_sink`) so an INTERMEDIATE egress —
-    // a settlement coin created AND reclaimed within the same bundle (every option exercise leg) — can
-    // be netted out of the reviewable sink bucket in option mode. Each entry is (created settlement coin
-    // id, the egress output). The claimed-settlement-coin ids are collected alongside to match them.
-    let mut settlement_egresses: Vec<(Bytes32, DecodedOutput)> = Vec::new();
-    let mut claimed_settlement_ids: HashSet<Bytes32> = HashSet::new();
-
-    // OPTION MODE is gated on the presence of an option-layer coin (an option singleton or a locked
-    // underlying). It selects IMPLICIT-fee conservation (the option builders emit no `RESERVE_FEE`, and
-    // the melted 1-mojo singleton is a structural carrier excluded from the ledger) and relaxes the
-    // per-coin settlement-binding (MR-6) — an option's settlement egress is bound by the option's own
-    // consensus structure (MR-9/MR-10), not by a per-funding-coin announcement assertion. The strict
+    // OPTION MODE is gated on the presence of an option-layer coin. For a signable option action that
+    // means a TRANSFER's singleton ([`OptionContract`]); an EXERCISE bundle (its [`P2OneOfManyLayer`]
+    // underlying leg) is detected here too but refused fail-closed in the loop below before conservation
+    // runs. It selects IMPLICIT-fee conservation: the option builders emit no `RESERVE_FEE` and the
+    // 1-mojo singleton flows through to the re-homed coin, so `in − out` IS the fee. The strict
     // XCH/CAT/offer path is byte-unchanged when this is false.
     let option_mode = is_option_bundle(&mut allocator, coin_spends)?;
 
@@ -236,7 +205,6 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
                 .map_err(|e| reject(format!("malformed CAT settlement puzzle: {e:?}")))?
                 .is_some()
             {
-                claimed_settlement_ids.insert(spend.coin.coin_id());
                 let conditions =
                     run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)?;
                 reject_any_agg_sig(&conditions)?;
@@ -279,12 +247,10 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
                 if let Some(create) = condition.as_create_coin() {
                     let cat_out_total = cat_out.entry(asset).or_default();
                     *cat_out_total = accumulate(*cat_out_total, create.amount, "CAT output total")?;
-                    route_spend_output(
+                    route_output(
                         &mut recipients,
                         &mut change,
                         &mut protocol_sink,
-                        &mut settlement_egresses,
-                        spend.coin.coin_id(),
                         DecodedOutput {
                             puzzle_hash: create.puzzle_hash,
                             amount: create.amount,
@@ -366,46 +332,25 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             continue;
         }
 
-        // The locked-underlying coin of an option EXERCISE — a `P2OneOfMany` 1-of-2 (exercise/clawback)
-        // puzzle, spent by merkle path with NO signature. Its exercise path unlocks the underlying into
-        // the settlement puzzle (`CREATE_COIN(SETTLEMENT, underlying)`) and ASSERTS the strike payment's
-        // puzzle announcement (binding the strike to the option's committed requested payment). The
-        // unlocked-underlying egress MUST be reclaimed to the wallet in-bundle (MR-9) — recorded here,
-        // asserted key-aware by the signer.
+        // An option EXERCISE's locked-underlying coin — a `P2OneOfMany` 1-of-2 (exercise/clawback)
+        // puzzle. Its presence UNAMBIGUOUSLY marks the bundle as an exercise (a transfer never spends
+        // it), and exercise is REFUSED fail-closed: the exercise path unlocks the underlying onto a bare
+        // `SETTLEMENT_PAYMENT_HASH` coin, and consensus forces only the STRIKE payment to the creator —
+        // NOT the unlocked underlying back to the holder. That reclaim leg is builder-enforced only, so a
+        // compromised engine could strip it AFTER the wallet signs the strike-funding coin: the wallet
+        // pays the strike while an attacker sweeps the underlying. Exercise cannot be safely
+        // `LocalSigner`-signable until a dig-options puzzle change binds the reclaim to the holder in
+        // consensus (deferred to #2245). Transfer, which only touches the inner standard layer, is
+        // unaffected and still signs.
         if P2OneOfManyLayer::parse_puzzle(&allocator, puzzle)
             .map_err(|e| reject(format!("malformed option underlying spend: {e:?}")))?
             .is_some()
         {
-            xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
-            let conditions = run_conditions(&mut allocator, puzzle_ptr, solution_ptr)?;
-            reject_any_agg_sig(&conditions)?;
-            for condition in &conditions {
-                if let Some(create) = condition.as_create_coin() {
-                    xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
-                    if is_protocol_sink_hash(create.puzzle_hash) {
-                        // The unlocked underlying handed to the settlement puzzle — a claim requirement.
-                        option_underlying_claims.push(create.amount);
-                    }
-                    route_spend_output(
-                        &mut recipients,
-                        &mut change,
-                        &mut protocol_sink,
-                        &mut settlement_egresses,
-                        spend.coin.coin_id(),
-                        DecodedOutput {
-                            puzzle_hash: create.puzzle_hash,
-                            amount: create.amount,
-                            asset_id: None,
-                        },
-                        &create.memos,
-                    );
-                } else if let Some(assertion) = condition.as_assert_puzzle_announcement() {
-                    // The strike-payment binding (MR-10): consensus forces a settlement coin creating
-                    // this exact announcement (the requested payment to the creator).
-                    strike_announcement_bindings.push(assertion.announcement_id);
-                }
-            }
-            continue;
+            return Err(reject(
+                "option exercise is not signable: the unlocked underlying's reclaim to the holder is \
+                 not consensus-forced, so a compromised engine could strip it after the wallet funds \
+                 the strike (deferred to #2245); refusing to sign",
+            ));
         }
 
         // A standard-layer XCH coin: its run conditions carry the XCH outputs + the fee.
@@ -431,12 +376,10 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
                 }
                 if let Some(create) = condition.as_create_coin() {
                     xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
-                    route_spend_output(
+                    route_output(
                         &mut recipients,
                         &mut change,
                         &mut protocol_sink,
-                        &mut settlement_egresses,
-                        spend.coin.coin_id(),
                         DecodedOutput {
                             puzzle_hash: create.puzzle_hash,
                             amount: create.amount,
@@ -457,36 +400,22 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             .is_some()
         {
             xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
-            claimed_settlement_ids.insert(spend.coin.coin_id());
             let conditions = run_conditions(&mut allocator, puzzle_ptr, solution_ptr)?;
             reject_any_agg_sig(&conditions)?;
             for condition in &conditions {
                 if let Some(create) = condition.as_create_coin() {
                     xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
-                    let output = DecodedOutput {
-                        puzzle_hash: create.puzzle_hash,
-                        amount: create.amount,
-                        asset_id: None,
-                    };
-                    // The claimed settlement coin's payouts are the material the signer reconciles an
-                    // option underlying-claim (MR-9) against — an underlying leg must land on a
-                    // wallet-owned puzzle hash here.
-                    settlement_claim_payouts.push(output.clone());
                     route_output(
                         &mut recipients,
                         &mut change,
                         &mut protocol_sink,
-                        output,
+                        DecodedOutput {
+                            puzzle_hash: create.puzzle_hash,
+                            amount: create.amount,
+                            asset_id: None,
+                        },
                         &create.memos,
                     );
-                } else if let Some(announcement) = condition.as_create_puzzle_announcement() {
-                    // The announcement this settlement claim CREATES — it satisfies an option
-                    // underlying's asserted strike binding (MR-10), reconciling the strike leg's
-                    // amount + destination to the option's committed requested payment.
-                    settlement_created_announcements.push(announcement_id(
-                        spend.coin.puzzle_hash,
-                        &announcement.message,
-                    ));
                 }
             }
             continue;
@@ -498,25 +427,11 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
         ));
     }
 
-    // Resolve settlement egresses into the reviewable sink bucket. An egress whose created settlement
-    // coin is CLAIMED within this same bundle is INTERMEDIATE plumbing (an option exercise reclaims both
-    // its unlocked-underlying and strike legs in-bundle) — netted out in option mode so the reviewable
-    // sinks reflect only value that actually leaves. A settlement egress NOT reclaimed in-bundle (an
-    // offer make/take) is a real sink and survives. Value totals already counted every egress, so this
-    // affects only the summary bucket, never conservation.
-    for (created_id, output) in settlement_egresses {
-        if option_mode && claimed_settlement_ids.contains(&created_id) {
-            continue;
-        }
-        protocol_sink.push(output);
-    }
-
     // XCH value conservation. Two modes:
     // - STRICT (XCH/CAT/offer, byte-unchanged): `in == out + reserve_fee`, a leak/mint is refused.
-    // - OPTION: the builders emit no `RESERVE_FEE` and the melted 1-mojo singleton is excluded from
-    //   the ledger, so the network-absorbed excess `in − out` IS the implicit fee. `out > in` (a mint)
-    //   is still refused (checked_sub). The implicit fee is compared to the reviewed `summary.fee` by
-    //   the signer (that comparison is the MR-11-style implicit-fee guard for the exercise leg).
+    // - OPTION (transfer): the builders emit no `RESERVE_FEE`, so the network-absorbed excess `in − out`
+    //   IS the implicit fee. `out > in` (a mint) is still refused (checked_sub). The implicit fee is
+    //   compared to the reviewed `summary.fee` by the signer (an MR-11-style implicit-fee guard).
     let effective_fee = if option_mode {
         xch_in.checked_sub(xch_out).ok_or_else(|| {
             reject(format!(
@@ -546,27 +461,11 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
         }
     }
 
-    // MR-10 (option exercise): every strike-payment announcement the underlying spend ASSERTS must be
-    // SATISFIED by a claimed settlement coin creating that exact announcement — reconciling the strike
-    // leg's amount + destination to the option's committed requested payment (consensus enforces this
-    // too; refusing at sign time is defense-in-depth against a re-routed/wrong-valued strike).
-    for binding in &strike_announcement_bindings {
-        if !settlement_created_announcements.contains(binding) {
-            return Err(reject(
-                "option exercise strike leg is not settled to the option's committed requested \
-                 payment (MR-10); refusing to sign",
-            ));
-        }
-    }
-
     Ok(SpendEffect {
         recipients,
         change,
         protocol_sink,
         fee: effective_fee,
-        option_underlying_claims,
-        settlement_claim_payouts,
-        strike_announcement_bindings,
     })
 }
 
@@ -695,29 +594,6 @@ fn route_output(
         protocol_sink.push(output);
     } else {
         classify(recipients, change, output, memos);
-    }
-}
-
-/// Route a create-coin output from a SPEND (a coin the wallet or an option layer authorizes), deferring
-/// a SETTLEMENT egress so an intermediate one — created and reclaimed within the same bundle — can be
-/// netted out of the reviewable sink bucket later (`creating_coin_id` is the id of the coin emitting the
-/// egress, so the created settlement coin's id can be reconstructed and matched to an in-bundle claim).
-/// A settlement egress that is NOT reclaimed in-bundle (an offer make/take) survives as a real sink.
-#[allow(clippy::too_many_arguments)]
-fn route_spend_output(
-    recipients: &mut Vec<DecodedOutput>,
-    change: &mut Vec<DecodedOutput>,
-    protocol_sink: &mut Vec<DecodedOutput>,
-    settlement_egresses: &mut Vec<(Bytes32, DecodedOutput)>,
-    creating_coin_id: Bytes32,
-    output: DecodedOutput,
-    memos: &Memos<clvmr::NodePtr>,
-) {
-    if output.puzzle_hash == Bytes32::new(SETTLEMENT_PAYMENT_HASH) {
-        let created = Coin::new(creating_coin_id, output.puzzle_hash, output.amount).coin_id();
-        settlement_egresses.push((created, output));
-    } else {
-        route_output(recipients, change, protocol_sink, output, memos);
     }
 }
 

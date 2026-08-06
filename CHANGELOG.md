@@ -7,8 +7,12 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.20.0] - 2026-08-06
 
 ### Features
-- **client:** Decode + sign covered-option transfer + exercise; assert the unlocked underlying is
-  reclaimed to the wallet (MR-9) before signing (#1511 PR-C). Option mint stays refused (#2243).
+- **client:** Decode + sign covered-option **transfer** via `OptionContract` singleton accounting
+  (#1511 PR-C). Option **exercise** is now REFUSED fail-closed: the exercising holder's underlying-reclaim
+  leg is not consensus-forced (it lands on a bare anyone-can-claim settlement coin), so a compromised
+  engine could strip it after the wallet funds the strike — exercise is not safely client-seam-signable
+  until a `dig-options` puzzle change binds the reclaim (deferred #2245). Option **mint** stays refused
+  (#2243). Removes the insufficient in-bundle-presence guard (MR-9) + its exercise-permit machinery.
 
 ## [0.19.0] - 2026-08-06
 

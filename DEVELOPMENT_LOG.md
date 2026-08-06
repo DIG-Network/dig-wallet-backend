@@ -27,23 +27,32 @@ underlying's asserted puzzle announcement), but does NOT force the underlying-cl
 holder — that leg is BUILDER-ENFORCED ONLY. If any path drops or re-routes it, the unlocked underlying
 strands on a BARE anyone-can-claim settlement coin (`SETTLEMENT_PAYMENT_HASH`, spendable by anyone with a
 `SettlementPaymentsSolution`, no key) for a mempool watcher to steal — while the holder has already paid
-the strike. So the client signer MUST assert, key-aware, that for every unlocked amount an in-bundle
-claimed-settlement payout of exactly that amount lands on a WALLET-OWNED puzzle hash before signing.
+the strike.
 
-Conservation consequences: the option builders emit NO `RESERVE_FEE` (excess funding is an implicit
-fee), and the melted 1-mojo singleton has no output. So option bundles need IMPLICIT-fee conservation
-(`fee = in − out`, the melted singleton excluded from the ledger), NOT the strict
-`in == out + reserve_fee` used for XCH/CAT/offer sends. And every settlement egress in an exercise is
-reclaimed IN-BUNDLE (both legs), so the egresses are intermediate plumbing — netted out of the reviewable
-sink bucket by matching each created settlement coin id to an in-bundle claim.
+**The refuted guard (why exercise is REFUSED, not guarded).** The original PR-C approach asserted,
+key-aware, that for every unlocked amount an in-bundle claimed-settlement payout of exactly that amount
+lands on a WALLET-OWNED puzzle hash before signing (the `assert_option_underlying_reclaimed` / MR-9
+guard). A custody audit REFUTED it: proving the reclaim leg is PRESENT in the bundle the wallet signs is
+not enough, because the reclaim is not CONSENSUS-forced. The wallet signs only the strike-funding coin;
+the underlying's reclaim leg lands on a bare `SETTLEMENT_PAYMENT_HASH` coin that anyone can spend with a
+`SettlementPaymentsSolution` (no key). A compromised engine can present a well-formed bundle to pass the
+guard, obtain the wallet's strike signature, then broadcast a DIFFERENT bundle that drops/re-routes the
+reclaim leg — the strike-funding spend is still valid on its own, so the wallet pays the strike while an
+attacker sweeps the underlying. An in-bundle-presence check can never close this: only a consensus
+binding (the underlying's exercise puzzle FORCING the reclaim to the holder's puzzle hash, the way it
+already forces the strike to the creator) makes exercise safe. That is a `dig-options` builder/puzzle
+change (deferred #2245). Until then, exercise is NOT client-seam-signable: `client::verify::analyze`
+detects the exercise's `P2OneOfManyLayer` underlying leg and REFUSES the whole bundle fail-closed. The
+engine still BUILDS a valid exercise (a raw external key-holder can settle it); only the custody signer
+refuses. LESSON: for a leg whose destination the wallet's signature does not itself bind, presence in the
+signed bundle proves nothing — require consensus enforcement or refuse.
 
-## Option EXERCISE review summary lists what LEAVES, not what is received
+Transfer is unaffected: it re-homes the singleton through the inner standard layer (the sole signed
+`AGG_SIG_ME` binds the destination) and touches no builder-enforced-only leg — so it stays signable.
 
-The signer's summary gate hides wallet-owned outputs (they are change). The unlocked underlying returns
-to the exercising holder (the wallet), so it is change — the exercise review summary must therefore list
-the STRIKE paid to the creator (what leaves) + the implicit fee, NOT the underlying. The pre-PR-C engine
-summary listed the underlying-to-owner, which the signer's gate rejected; PR-C changed
-`build_exercise_option`'s summary to the strike-to-creator so signer and engine reconcile.
+Conservation consequence (still relevant for TRANSFER): the option builders emit NO `RESERVE_FEE`
+(excess funding is an implicit fee). So option (transfer) bundles need IMPLICIT-fee conservation
+(`fee = in − out`), NOT the strict `in == out + reserve_fee` used for XCH/CAT/offer sends.
 
 ## Option MINT is not client-decodable from coin spends alone (#2243)
 
