@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.19.0] - 2026-08-06
 
 ### Features
-- **client:** Sign offer make/take/cancel via settlement-layer decode + the `protocol_sink` bucket (#1511 PR-B)
+- **client:** Decode + sign offer make/take/cancel via settlement-layer accounting (#1511 PR-B)
 
 ## [0.18.0] - 2026-08-06
 
