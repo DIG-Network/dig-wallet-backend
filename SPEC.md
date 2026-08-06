@@ -627,3 +627,5 @@ All of the following live behind the `client` seam and NEVER in the engine:
 Future lanes (state/sync, build/broadcast, custody, consumer migration) extend §3–§8 with concrete
 implementations and their conformance vectors; the seam boundary and the key-isolation invariant
 defined here are the fixed contract they MUST NOT violate.
+
+<!-- PR-B (#1511): offers make/take/cancel become signable through LocalSigner via settlement-layer decode. WIP. -->
