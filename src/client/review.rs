@@ -5,7 +5,7 @@
 //! XCH") so the user reviews rather than trusts blindly. Decoding is deterministic and
 //! side-effect free.
 
-use crate::types::{Amount, UnsignedSpend};
+use crate::types::{Amount, TransactionSummary, UnsignedSpend};
 
 /// Mojos per one XCH (12 decimal places).
 const MOJOS_PER_XCH: u64 = 1_000_000_000_000;
@@ -22,9 +22,11 @@ pub struct HumanReadableSummary {
     /// The number of signatures the user's key must produce.
     pub required_signature_count: usize,
     /// Whether the rendered lines were INDEPENDENTLY re-derived from the coin spends
-    /// ([`super::verify::derive_summary`]). When `false` the spend could not be independently decoded
-    /// — the lines fall back to the engine's (untrusted) claim and the confirm UI MUST surface this
-    /// as unverifiable; [`super::signer::LocalSigner::sign_unsigned`] will refuse to sign it.
+    /// ([`super::verify::derive_summary`], or the key-aware
+    /// [`super::signer::LocalSigner::decode_verified`]). When `false` the spend could not be
+    /// independently decoded — the lines fall back to the engine's (untrusted) claim and the confirm
+    /// UI MUST surface this as unverifiable; [`super::signer::LocalSigner::sign_unsigned`] will refuse
+    /// to sign it.
     pub verified: bool,
 }
 
@@ -45,17 +47,50 @@ fn render_amount(amount: Amount, is_xch: bool) -> String {
     format!("{whole}.{trimmed}")
 }
 
-/// Decode an unsigned spend into a human-readable summary for review.
+/// Decode an unsigned spend into a human-readable summary for DISPLAY-ONLY review — MAY be unverified.
 ///
 /// The rendered value flow is re-derived straight from the coin spends
 /// ([`super::verify::derive_summary`], #1058) so the confirm dialog shows what the transaction
 /// ACTUALLY does — the same authoritative summary the signer gates on — never the engine's
 /// (potentially lying) claim. If the spend cannot be independently decoded the engine summary is
-/// shown as a last resort, but [`super::signer::LocalSigner::sign_unsigned`] will then refuse it.
+/// shown as a last resort with [`HumanReadableSummary::verified`] `= false`.
+///
+/// # Never use this ahead of signing
+/// This lenient mode can silently degrade from "what the bundle DOES" to "what the (untrusted)
+/// builder CLAIMS it does". It is safe ONLY for a display surface that renders + honours the
+/// `verified` flag. Any path that precedes signing / a pre-sign consent prompt MUST use
+/// [`super::signer::LocalSigner::decode_verified`] instead, which has NO fallback AND applies the
+/// signer's key-aware ownership split, so it fails closed (#2209). The naming makes the unsafe choice
+/// the loud one: a caller that reaches for `decode` is opting into a possibly-unverified,
+/// key-free screen.
+///
+/// # Key-free — do not trust its recipient/change split
+/// `decode` renders the KEY-FREE [`super::verify::derive_summary`], whose recipient/change split is a
+/// memo heuristic with no ownership check. An un-hinted output to a NON-owned address is bucketed as
+/// "change" and dropped from the rendered lines — so this view can hide a real egress. Only the
+/// key-aware [`super::signer::LocalSigner::decode_verified`] (which the signer authorizes against)
+/// surfaces every non-owned output. This lenient decode is for a display surface only.
 pub fn decode(unsigned: &UnsignedSpend) -> HumanReadableSummary {
-    let derived = super::verify::derive_summary(&unsigned.coin_spends);
-    let verified = derived.is_ok();
-    let summary = derived.unwrap_or_else(|_| unsigned.summary.clone());
+    match super::verify::derive_summary(&unsigned.coin_spends) {
+        Ok(summary) => render(unsigned, &summary, true),
+        // Fall back to the engine's (untrusted) claim, flagged unverified. The signer refuses to
+        // sign such a spend regardless (`verify_before_signing` re-runs `analyze` fail-closed).
+        Err(_) => render(unsigned, &unsigned.summary, false),
+    }
+}
+
+/// Render a re-derived [`TransactionSummary`] into the human-readable confirm lines. `verified`
+/// records whether `summary` came from an independent re-derivation
+/// ([`super::signer::LocalSigner::decode_verified`] and the happy path of [`decode`] pass `true`;
+/// [`decode`] passes `false` for its engine-claim fallback).
+///
+/// `pub(crate)` so the key-aware consent decode on [`super::signer::LocalSigner`] renders through the
+/// SAME formatter as the lenient display decode — one rendering of confirm lines, no drift.
+pub(crate) fn render(
+    unsigned: &UnsignedSpend,
+    summary: &TransactionSummary,
+    verified: bool,
+) -> HumanReadableSummary {
     let lines = summary
         .outputs
         .iter()
@@ -86,7 +121,7 @@ pub fn decode(unsigned: &UnsignedSpend) -> HumanReadableSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Address, AssetId, SpendOutput, TransactionSummary};
+    use crate::types::{Address, AssetId, SpendOutput};
 
     fn unsigned(outputs: Vec<SpendOutput>, fee: Amount) -> UnsignedSpend {
         UnsignedSpend {
@@ -154,6 +189,11 @@ mod tests {
 
     /// A real, decodable spend is rendered from the re-derived (authoritative) summary and flagged
     /// verified.
+    ///
+    /// The no-fallback CONSENT decode is now key-aware and lives on
+    /// [`super::super::signer::LocalSigner::decode_verified`] (a free function structurally cannot
+    /// apply the ownership split); its coverage — including the divergence from this key-free view on
+    /// an un-hinted non-owned output — lives in the signer tests (#2209).
     #[cfg(feature = "engine")]
     #[tokio::test]
     async fn decode_of_a_real_spend_is_verified() {

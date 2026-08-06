@@ -431,11 +431,32 @@ Used by dig-app. The subscriber + identity provider + signer.
   operands are attacker-reachable — output amounts come from `CREATE_COIN` conditions, bounded by no
   coin amount — and conservation is decided by comparing these totals, so a wrapped total reports a
   spend that creates more than `u64::MAX` as conserved, and a saturated one is equally fail-open.
-- **`client::review::decode(&UnsignedSpend) -> HumanReadableSummary`** — deterministic, side-effect-free
-  decode of a spend into human-readable lines ("Send 1.5 XCH to xch1… · Fee 0.0001 XCH", coin-spend
-  and required-signature counts) for the native-confirm UI. The rendered value flow is re-derived via
-  `client::verify::derive_summary` (the authoritative summary), so the confirm dialog shows what the
-  transaction ACTUALLY does. The user reviews; they do not trust blindly.
+- **Spend decode — two modes, ONE interpreter AND (for consent) ONE ownership split (#2209).** Both
+  modes render the human-readable confirm lines ("Send 1.5 XCH to xch1… · Fee 0.0001 XCH", coin-spend
+  and required-signature counts) from the value flow re-derived by `client::verify` (→ `analyze`, the
+  SINGLE authoritative interpreter of what a spend means). They differ in fallback behaviour AND — the
+  point of #2209 — in WHICH recipient/change split they render:
+  - **`client::review::decode(&UnsignedSpend) -> HumanReadableSummary`** — DISPLAY-ONLY, key-FREE, MAY
+    be unverified. It renders `verify::derive_summary`, whose recipient/change split is a memo
+    heuristic with NO ownership check, so an un-hinted output to a NON-owned address is bucketed as
+    "change" and DROPPED from the lines. On re-derivation failure it falls back to the engine's
+    (untrusted) claimed summary with `HumanReadableSummary::verified = false`. A caller MUST render +
+    honour that flag. It MUST NOT be used ahead of signing.
+  - **`client::signer::LocalSigner::decode_verified(&UnsignedSpend) -> WalletResult<HumanReadableSummary>`**
+    — the pre-sign CONSENT decode. It is a METHOD on the key-holding signer (a free function cannot be
+    key-aware) with NO fallback: it re-derives through `verify::analyze` and, if that fails, returns
+    `Err(SpendValidationFailed)` — NEVER the engine's claim. It renders exactly the signer's key-AWARE
+    `LocalSigner::reviewable_summary` (every wallet-owned output is change; every NON-owned output —
+    including an un-hinted one the key-free split would hide — is a recipient line). The returned
+    summary is always `verified`.
+  - **Consent == signed bytes, by construction (MUST NOT drift):** the screen a user consents to
+    before signing and the bytes `LocalSigner::verify_before_signing` gates on derive from the SAME
+    `verify::analyze` interpreter AND the SAME key-aware ownership split (`reclassify_by_ownership` via
+    `reviewable_summary`) — `decode_verified` renders precisely what the signing gate authorizes, so
+    no egress the signer would sign can be missing from the approved screen. A key-FREE consent summary
+    would fail OPEN here (it hides un-hinted non-owned outputs the key-aware gate still signs), so the
+    consent decode MUST be the key-aware one on `LocalSigner`. Only the lenient key-free `decode` may
+    degrade, and only for a display surface that shows the `verified` flag.
 - **`client::signer`** — `IdentitySigner { identity(), sign(UnsignedSpend) -> SignedBundle }` and
   `LocalSigner` (holds a `chia::bls::SecretKey`, exposes only `public_key()` + `identity()` +
   `identity_public_key_bytes()` + `decap(peer_g1)`). `LocalSigner` also implements the engine's
