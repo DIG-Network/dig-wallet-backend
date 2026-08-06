@@ -242,19 +242,39 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   the caller's `fee` (a mint MUST NOT burn more than the caller consented to). The returned
   `OptionHandle` carries the terms (not recoverable from the on-chain singleton) + the ids to locate
   the option and its underlying.
-- **Exercise is NOT client-seam-signable (REFUSED, deferred #2245).** On exercise the unlocked
-  underlying lands on a BARE anyone-can-claim settlement coin. Consensus forces the strike payment to
-  the creator but does NOT force the underlying claim back to the holder — that reclaim leg is
-  BUILDER-ENFORCED ONLY. An in-bundle-presence guard is therefore INSUFFICIENT: a compromised engine
-  can strip the reclaim leg AFTER the wallet signs the strike-funding coin, so the wallet pays the
-  strike while an attacker sweeps the unlocked underlying. Because the reclaim is not consensus-forced,
-  `client::signer::LocalSigner` REFUSES to sign an exercise bundle fail-closed (§4): `client::verify`
-  detects the exercise's `P2OneOfManyLayer` underlying leg and rejects it. `build_exercise_option`
+- **`LocalSigner` signs option TRANSFER only; MINT + EXERCISE are REFUSED fail-closed.** Transfer
+  re-homes the option singleton through the current owner's inner standard layer (its sole
+  `AGG_SIG_ME`), touching nothing else, so it is safely client-seam-signable. Mint (deferred #2243) and
+  exercise (deferred #2245) are refused.
+- **The exercise refusal is enforced at the SIGNATURE SOURCE, and rests on a consensus invariant
+  (message ⟺ melt coupling).** Unlocking an option's underlying requires a mode-23 (`0x17`)
+  `SEND_MESSAGE`/`RECEIVE_MESSAGE` pairing, and the `OPTION_CONTRACT` puzzle couples that exercise
+  message INSEPARABLY to the singleton MELT: a message without a melt AND a melt without a message BOTH
+  consensus-reject (proven by `chia-sdk-driver` `option_contract.rs::test_incomplete_exercise`), while a
+  plain re-home transfer succeeds (`test_transfer_option`). Consensus therefore already makes "some
+  other singleton spend unlocks the underlying" impossible; the ONLY residual risk is the wallet being
+  tricked into SIGNING the melting/message-bearing delegated puzzle. `client::verify` closes that with
+  two guards, so a strip-the-leg attacker cannot obtain the wallet's signature on the unlock leg:
+  1. **Non-re-home refusal (fail-closed at the source).** An option-singleton spend whose inner
+     conditions do NOT re-home (no odd-amount `CREATE_COIN`) — i.e. a melt/exercise or a clawback — is
+     refused, REGARDLESS of whether the `P2OneOfManyLayer` underlying leg is present in the bundle. This
+     denies the signature on the melt+message leg even when the underlying leg is stripped.
+  2. **Transfer default-DENY allowlist.** A transfer's delegated puzzle may emit ONLY the single re-home
+     `CREATE_COIN`, its sole `AGG_SIG_ME`, and benign timelock/announcement-assertion/self-assertion
+     conditions. Any `SEND_MESSAGE`, `RECEIVE_MESSAGE`, `MeltSingleton`, `CREATE_COIN_ANNOUNCEMENT`,
+     `CREATE_PUZZLE_ANNOUNCEMENT`, a second value-bearing `CREATE_COIN`, or ANY unrecognized opcode is
+     refused. Fail-closed by construction (a new/unknown opcode refuses), so a transfer signature can
+     never carry the exercise message even inside a mixed spend.
+  The `P2OneOfManyLayer` underlying leg is ALSO refused directly (defense in depth). `build_exercise_option`
   still BUILDS a valid, broadcastable exercise (a raw external key-holder can settle it), and the
-  dependency-guard conformance test (`exercise_bundle_includes_the_underlying_claim_leg`) still pins
-  that the built bundle carries the underlying-claim leg — but the CLIENT WALLET will not sign it until
-  a `dig-options` puzzle change binds the reclaim to the holder in consensus (tracked in #2245).
-  Transfer, which touches only the inner standard layer, is unaffected and remains signable.
+  dependency-guard conformance test (`exercise_bundle_includes_the_underlying_claim_leg`) still pins that
+  the built bundle carries the underlying-claim leg — but the CLIENT WALLET will not sign it until a
+  `dig-options` puzzle change binds the reclaim to the holder in consensus (tracked in #2245).
+- **SDK-semantics pin (re-verify on bump).** These guards rely on the option-contract semantics of
+  `chia-sdk-driver 0.34.0` / `chia-puzzles 0.20.3` — specifically the mode-23 message ⟺ singleton-melt
+  coupling and the transfer/melt condition shapes. A future SDK/puzzle bump MUST re-verify that coupling
+  (re-run the reasoning against the new `option_contract.rs` `test_incomplete_exercise` /
+  `test_transfer_option`) before relying on transfer being the only signable action.
 - **Transfer + exercise are wired over `dig-options` v0.2.0** — `build_transfer_option` composes
   `dig_options::transfer`; `build_exercise_option` composes `dig_options::exercise`. Both are
   key-free and network-free: the engine cannot fetch an option's live singleton or recover a

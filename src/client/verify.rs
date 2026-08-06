@@ -32,13 +32,17 @@
 //!   touches only the inner standard layer, so it is safely signable. Option bundles use IMPLICIT-fee
 //!   conservation (the option builders emit no `RESERVE_FEE`, and the 1-mojo singleton flows through to
 //!   the re-homed coin).
-//! - **exercise** (REFUSED, deferred #2245) unlocks the locked underlying (a [`P2OneOfManyLayer`] coin)
-//!   onto a BARE `SETTLEMENT_PAYMENT_HASH` coin. Consensus forces the strike payment to the creator but
-//!   does NOT force the unlocked underlying back to the holder — that reclaim leg is builder-enforced
-//!   only, so a compromised engine could strip it AFTER the wallet signs the strike-funding coin (wallet
-//!   pays the strike; an attacker sweeps the underlying). Exercise therefore CANNOT be safely
-//!   `LocalSigner`-signable until a dig-options puzzle change binds the reclaim to the holder. [`analyze`]
-//!   detects an exercise bundle by its [`P2OneOfManyLayer`] leg and refuses it fail-closed.
+//! - **exercise** (REFUSED, deferred #2245) unlocks the locked underlying by melting the option
+//!   singleton and emitting the mode-23 (`0x17`) exercise `SEND_MESSAGE`. Consensus couples that message
+//!   inseparably to the singleton MELT (SDK `option_contract.rs::test_incomplete_exercise` proves
+//!   message-without-melt AND melt-without-message both reject), so "some other spend unlocks the
+//!   underlying" is impossible on chain; the ONLY residual risk is the wallet being tricked into SIGNING
+//!   the melting/message-bearing leg. [`analyze`] closes that at the signature source: an option-singleton
+//!   spend that does NOT re-home (a melt/exercise or clawback) is refused fail-closed REGARDLESS of
+//!   whether the [`P2OneOfManyLayer`] underlying leg is present (defeating the strip-the-leg attack), and
+//!   a transfer's delegated puzzle is held to a default-deny allowlist that admits no `SEND_MESSAGE`. The
+//!   [`P2OneOfManyLayer`] leg is ALSO refused directly (defense in depth). Exercise stays unsignable until
+//!   a dig-options puzzle change binds the underlying reclaim to the holder in consensus.
 //! - **mint** (REFUSED, deferred #2243) — its cross-seam summary decode is not yet wired.
 //!
 //! # Recipients vs change is key-relative
@@ -263,12 +267,13 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             continue;
         }
 
-        // An OPTION SINGLETON spend (#1511 PR-C transfer/exercise): the option contract is a singleton
-        // wrapping the current owner's inner standard layer (the sole signed coin). Decode via
-        // `OptionContract::parse` to reach that inner p2, enforce the sole-AGG_SIG_ME commitment exactly
-        // as a standard/CAT send, then either RE-HOME the singleton (transfer: an odd-amount CREATE_COIN
-        // to the new owner) or MELT it (exercise: no CREATE_COIN — a structural carrier absorbed as an
-        // implicit fee, excluded from the value ledger).
+        // An OPTION SINGLETON spend (#1511 PR-C): the option contract is a singleton wrapping the current
+        // owner's inner standard layer (the sole signed coin). Decode via `OptionContract::parse` to reach
+        // that inner p2 and enforce the sole-AGG_SIG_ME commitment exactly as a standard/CAT send. ONLY a
+        // re-homing TRANSFER (an odd-amount `CREATE_COIN` to the new owner) is signable; a spend that does
+        // NOT re-home — a melt/exercise (mode-23 `SEND_MESSAGE` + `MeltSingleton`) or a clawback — is
+        // refused fail-closed below, at the signature source, so the wallet never signs the leg that
+        // unlocks the option underlying (Case-A guard, #1511 PR-C).
         if let Some((_option, inner_puzzle, inner_solution)) =
             OptionContract::parse(&allocator, spend.coin, puzzle, solution_ptr)
                 .map_err(|e| reject(format!("malformed option singleton spend: {e:?}")))?
@@ -289,44 +294,67 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
                 .iter()
                 .filter_map(Condition::as_create_coin)
                 .any(|create| create.amount % 2 == 1);
-            if re_homes {
-                // TRANSFER: the singleton's 1 mojo flows through to the re-homed coin — count both.
-                xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
-                for condition in &conditions {
-                    reject_unexpected_agg_sig(condition)?;
-                    if let Some(create) = condition.as_create_coin() {
-                        // MR-12: the re-homed singleton must go to the new owner's p2 (a chosen address
-                        // the human reviews via the summary), NEVER to a structural launcher/settlement
-                        // hash the option layer did not authorize — that would be an unauthorized re-home
-                        // laundered as a protocol sink. The sole-AGG_SIG_ME commitment already binds the
-                        // destination to the holder's signature; this refuses the structural-hash case.
-                        if is_protocol_sink_hash(create.puzzle_hash) {
-                            return Err(reject(
-                                "option transfer re-homes the singleton to a structural puzzle hash \
-                                 (unauthorized re-home); refusing to sign",
-                            ));
-                        }
-                        xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
-                        route_output(
-                            &mut recipients,
-                            &mut change,
-                            &mut protocol_sink,
-                            DecodedOutput {
-                                puzzle_hash: create.puzzle_hash,
-                                amount: create.amount,
-                                asset_id: None,
-                            },
-                            &create.memos,
-                        );
+            if !re_homes {
+                // NOT a re-home: this option-singleton spend melts/exercises the singleton (a
+                // `melt_singleton` — the magic `CREATE_COIN(_, -113)` decoded as `Condition::MeltSingleton`,
+                // never as an odd-amount value `CREATE_COIN`) and/or carries the mode-23 exercise
+                // `SEND_MESSAGE`, or is a clawback. NONE of these is a signable action in PR-C: only a
+                // re-homing TRANSFER is. Refuse fail-closed HERE, at the signature source, REGARDLESS of
+                // whether the P2OneOfMany underlying leg is present in the bundle — so the strip-the-leg
+                // attack (omit the underlying leg to dodge the `P2OneOfManyLayer` refusal below) cannot
+                // obtain the wallet's signature on the melt+message spend that unlocks the underlying.
+                // (A plain transfer decodes an odd-amount `CREATE_COIN(amount = 1)` and takes the
+                // re-home branch above, so it is unaffected.)
+                return Err(reject(
+                    "option singleton spend does not re-home (melt/exercise or clawback); only a \
+                     re-homing TRANSFER is signable; refusing to sign",
+                ));
+            }
+
+            // TRANSFER: the singleton's 1 mojo flows through to the re-homed coin — count both.
+            xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
+            let mut create_coins = 0usize;
+            for condition in &conditions {
+                reject_unexpected_agg_sig(condition)?;
+                // Default-DENY allowlist: a transfer's delegated puzzle may emit ONLY the re-home
+                // `CREATE_COIN`, its sole `AGG_SIG_ME`, and benign assertions. Any other condition — a
+                // mode-23 exercise `SEND_MESSAGE`/`RECEIVE_MESSAGE`, a `MeltSingleton`, an announcement
+                // CREATE, or an unknown opcode — is refused, so a transfer signature can never carry the
+                // exercise message even in a mixed spend.
+                reject_non_transfer_condition(condition)?;
+                if let Some(create) = condition.as_create_coin() {
+                    // Exactly one value-bearing `CREATE_COIN` (the re-home) is permitted; a second is an
+                    // undisclosed extra egress riding the transfer.
+                    create_coins += 1;
+                    if create_coins > 1 {
+                        return Err(reject(
+                            "option transfer emits more than one CREATE_COIN (undisclosed extra \
+                             egress); refusing to sign",
+                        ));
                     }
-                }
-            } else {
-                // EXERCISE: the inner standard layer melts the singleton (`melt_singleton` — a magic
-                // CREATE_COIN with amount -113, decoded as `Condition::MeltSingleton`, never as a value
-                // CREATE_COIN). The 1-mojo singleton is a structural carrier absorbed as fee, so it is
-                // excluded from the value ledger; only the signature commitment matters here.
-                for condition in &conditions {
-                    reject_unexpected_agg_sig(condition)?;
+                    // MR-12: the re-homed singleton must go to the new owner's p2 (a chosen address
+                    // the human reviews via the summary), NEVER to a structural launcher/settlement
+                    // hash the option layer did not authorize — that would be an unauthorized re-home
+                    // laundered as a protocol sink. The sole-AGG_SIG_ME commitment already binds the
+                    // destination to the holder's signature; this refuses the structural-hash case.
+                    if is_protocol_sink_hash(create.puzzle_hash) {
+                        return Err(reject(
+                            "option transfer re-homes the singleton to a structural puzzle hash \
+                             (unauthorized re-home); refusing to sign",
+                        ));
+                    }
+                    xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
+                    route_output(
+                        &mut recipients,
+                        &mut change,
+                        &mut protocol_sink,
+                        DecodedOutput {
+                            puzzle_hash: create.puzzle_hash,
+                            amount: create.amount,
+                            asset_id: None,
+                        },
+                        &create.memos,
+                    );
                 }
             }
             continue;
@@ -362,9 +390,12 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
             let conditions = run_conditions(&mut allocator, puzzle_ptr, solution_ptr)?;
             enforce_sole_agg_sig_me(&conditions, committed_message)?;
-            // In an option EXERCISE the strike-funding coin commits value to settlement with no per-coin
-            // offer-binding assertion — the strike is bound by the option's underlying announcement
-            // (MR-10) + the atomic bundle, not by MR-6. Only the strict offer path requires MR-6.
+            // In an option TRANSFER a standard-layer XCH coin only ever appears as the OPTIONAL farmer-fee
+            // coin the engine links to the singleton via `assert_concurrent_spend` (transfer itself takes
+            // no fee). It legitimately commits no value to the settlement puzzle, so MR-6's
+            // give-it-away-for-nothing binding does not apply — skip it in option mode. Only the strict
+            // offer path requires MR-6. (Exercise never reaches here: its option-singleton melt/message
+            // leg is refused fail-closed above, at the signature source.)
             if !option_mode {
                 enforce_settlement_binding(&conditions)?;
             }
@@ -760,6 +791,57 @@ fn reject_unexpected_agg_sig(condition: &Condition) -> WalletResult<()> {
     if forbidden {
         return Err(reject(
             "unexpected non-AGG_SIG_ME signature condition in a send spend (refusing to sign)",
+        ));
+    }
+    Ok(())
+}
+
+/// Default-DENY allowlist for an option TRANSFER's delegated-puzzle conditions (Case-A guard, #1511
+/// PR-C). A transfer is signable precisely because it touches only the inner standard layer to
+/// RE-HOME the singleton; the only conditions a legitimate transfer emits are the re-home
+/// `CREATE_COIN`, its sole `AGG_SIG_ME`, and benign timelock/announcement/self assertions.
+///
+/// This is fail-CLOSED by construction — an UNRECOGNIZED opcode is REFUSED, not waved through — so a
+/// future/unknown condition cannot smuggle unsignable behaviour into a transfer. In particular it
+/// refuses the mode-23 exercise `SEND_MESSAGE`/`RECEIVE_MESSAGE` (which, paired with the singleton
+/// MELT, is what unlocks the option underlying — SDK `option_contract.rs::test_incomplete_exercise`
+/// proves the message ⟺ melt coupling is consensus-enforced), the `MeltSingleton`, and any
+/// `CREATE_COIN_ANNOUNCEMENT`/`CREATE_PUZZLE_ANNOUNCEMENT`. Thus a transfer signature can never carry
+/// the exercise message even inside a mixed spend. (`CreateCoin` + `AggSigMe` are permitted here and
+/// accounted/enforced by the caller — the single-re-home count + sole-AGG_SIG_ME checks.)
+fn reject_non_transfer_condition(condition: &Condition) -> WalletResult<()> {
+    let permitted = matches!(
+        condition,
+        // The re-home output + its authorizing signature — accounted by the caller.
+        Condition::CreateCoin(_)
+            | Condition::AggSigMe(_)
+            // Benign timelock assertions.
+            | Condition::AssertSecondsAbsolute(_)
+            | Condition::AssertSecondsRelative(_)
+            | Condition::AssertHeightAbsolute(_)
+            | Condition::AssertHeightRelative(_)
+            | Condition::AssertBeforeSecondsAbsolute(_)
+            | Condition::AssertBeforeSecondsRelative(_)
+            | Condition::AssertBeforeHeightAbsolute(_)
+            | Condition::AssertBeforeHeightRelative(_)
+            // Benign announcement/concurrency ASSERTIONS (never the CREATE side).
+            | Condition::AssertCoinAnnouncement(_)
+            | Condition::AssertPuzzleAnnouncement(_)
+            | Condition::AssertConcurrentSpend(_)
+            | Condition::AssertConcurrentPuzzle(_)
+            // Benign self-introspection assertions.
+            | Condition::AssertMyCoinId(_)
+            | Condition::AssertMyParentId(_)
+            | Condition::AssertMyPuzzleHash(_)
+            | Condition::AssertMyAmount(_)
+            | Condition::AssertMyBirthSeconds(_)
+            | Condition::AssertMyBirthHeight(_)
+            | Condition::AssertEphemeral(_)
+    );
+    if !permitted {
+        return Err(reject(
+            "option transfer delegated puzzle emits a condition outside the transfer allowlist \
+             (exercise message, melt, announcement, or an unknown opcode); refusing to sign",
         ));
     }
     Ok(())

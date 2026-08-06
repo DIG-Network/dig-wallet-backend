@@ -15,14 +15,17 @@ use std::sync::Arc;
 use chia_bls::PublicKey;
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_sdk_test::{sign_transaction, Simulator};
-use chia_wallet_sdk::driver::{Cat, SpendContext};
+use chia_wallet_sdk::driver::{Cat, SpendContext, StandardLayer};
+use chia_wallet_sdk::types::Conditions;
 use dig_options::{create, OptionTerms, OptionType, Owner};
 
+use dig_wallet_backend::client::verify::analyze;
 use dig_wallet_backend::engine::build::{SdkSpendBuilder, SpendInputs};
 use dig_wallet_backend::engine::build_options::OptionBuilder;
 use dig_wallet_backend::types::{
     Amount, AssetId, ExerciseOptionRequest, IdentityRef, Network, OptionHandle, OptionOnChainState,
-    OptionStrike, Puzzlehash, TransferOptionRequest, WalletId, WalletResult, WireCoin,
+    OptionStrike, Puzzlehash, TransferOptionRequest, WalletErrorCode, WalletId, WalletResult,
+    WireCoin,
 };
 
 const EXPIRY: u64 = 10_000;
@@ -275,4 +278,174 @@ async fn engine_transfer_then_new_owner_exercises_on_the_simulator() {
         total_at(&sim, carol.puzzle_hash) > carol_before,
         "the new owner receives the unlocked underlying"
     );
+}
+
+// ---- #1511 PR-C Case-A signature-source guards: melt/exercise refused, transfer allowlisted. ----
+//
+// The consensus PROOF these guards rely on is SDK `option_contract.rs::test_incomplete_exercise`
+// (the mode-23 `SEND_MESSAGE` ⟺ singleton `MeltSingleton` are inseparable on chain: message-without-
+// melt AND melt-without-message both consensus-REJECT) + `test_transfer_option` (a plain re-home
+// transfer succeeds). Consensus therefore already makes "any singleton spend unlocks the underlying"
+// impossible; the ONLY residual risk is the WALLET being tricked into SIGNING the melting/message-
+// bearing leg. These tests exercise that risk through the real `client::verify::analyze` seam the
+// signer gates on: an `Err` there is the signer refusing (producing ZERO signatures).
+
+/// Mint a self-owned (creator == owner) option in `ctx`, funded by `funding`, and drain the mint
+/// spends from `ctx` so a subsequent `ctx.take()` yields ONLY the option action under test. The
+/// returned `created.option` is spendable directly through the SDK driver (`analyze` never checks
+/// lineage validity, only the decoded value flow + condition allowlist).
+fn create_self_option(
+    ctx: &mut SpendContext,
+    pk: PublicKey,
+    funding: Coin,
+    puzzle_hash: Bytes32,
+) -> dig_options::CreatedOption {
+    let terms = OptionTerms::new(puzzle_hash, 1_000, OptionType::Xch { amount: 250 }, EXPIRY);
+    let mint = create(ctx, &Owner::Standard(pk), funding, &terms).unwrap();
+    let created = mint.created.clone().unwrap();
+    let _ = ctx.take(); // discard the mint spends; keep only the action-under-test
+    created
+}
+
+/// RED (Finding 1): an option EXERCISE that MELTS the singleton + emits the mode-23 `SEND_MESSAGE`,
+/// with the `P2OneOfMany` underlying leg OMITTED from the bundle (the strip-the-leg attack), must be
+/// refused at the signature source — the non-re-home refusal, NOT the leg-presence check. Before the
+/// Finding-1 fix the melt/else-branch fell through and `analyze` returned `Ok`, letting the wallet
+/// sign the leg that unlocks the underlying.
+#[test]
+fn exercise_stripped_underlying_leg_is_refused() {
+    let mut sim = Simulator::new();
+    let mut ctx = SpendContext::new();
+    let alice = sim.bls(1_001);
+    let created = create_self_option(&mut ctx, alice.pk, alice.coin, alice.puzzle_hash);
+
+    // Spend the option singleton ALONE (melt + mode-23 exercise message); no underlying leg present.
+    let inner = StandardLayer::new(alice.pk);
+    created
+        .option
+        .exercise(&mut ctx, &inner, Conditions::new())
+        .unwrap();
+    let spends = ctx.take();
+
+    let err = analyze(&spends).expect_err("a melting option-singleton spend must be refused");
+    assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+}
+
+/// Regression (defense in depth): the SAME exercise WITH the `P2OneOfMany` underlying leg present —
+/// the full engine-built exercise bundle — stays refused. Both the Finding-1 melt-branch refusal and
+/// the pre-existing `P2OneOfManyLayer` refusal cover it; either firing yields the fail-closed verdict.
+#[tokio::test]
+async fn exercise_with_underlying_leg_is_refused() {
+    let mut sim = Simulator::new();
+    let mut ctx = SpendContext::new();
+    let (underlying, strike) = (1_000u64, 250u64);
+    let alice = sim.bls(underlying + 1);
+    let terms = OptionTerms::new(
+        alice.puzzle_hash,
+        underlying,
+        OptionType::Xch { amount: strike },
+        EXPIRY,
+    );
+    let mint = create(&mut ctx, &Owner::Standard(alice.pk), alice.coin, &terms).unwrap();
+    let created = mint.created.clone().unwrap();
+    let (handle, on_chain) = projection_from_create(
+        &mint.coin_spends,
+        &created,
+        alice.puzzle_hash,
+        alice.puzzle_hash,
+        underlying,
+        strike,
+    );
+
+    let strike_coin = sim.new_coin(alice.puzzle_hash, strike);
+    let unsigned = engine(vec![strike_coin], alice.puzzle_hash, alice.pk)
+        .build_exercise_option(ExerciseOptionRequest {
+            identity: identity(),
+            handle,
+            on_chain,
+            fee: Amount(0),
+        })
+        .await
+        .expect("the engine still builds a valid exercise bundle");
+
+    let err = analyze(&unsigned.coin_spends).expect_err("an exercise bundle must be refused");
+    assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+}
+
+/// RED (guard b): a re-homing TRANSFER whose delegated puzzle ALSO carries the mode-23 exercise
+/// `SEND_MESSAGE` must be refused by the transfer allowlist. Before the allowlist the transfer branch
+/// only looked at `CREATE_COIN`s and ignored the message, so `analyze` returned `Ok` — a transfer
+/// signature that also authorizes the underlying-unlocking message.
+#[test]
+fn transfer_delegated_puzzle_carrying_exercise_message_is_refused() {
+    let mut sim = Simulator::new();
+    let mut ctx = SpendContext::new();
+    let alice = sim.bls(1_001);
+    let created = create_self_option(&mut ctx, alice.pk, alice.coin, alice.puzzle_hash);
+
+    let inner = StandardLayer::new(alice.pk);
+    let destination = Bytes32::new([0x9a; 32]);
+    let data = ctx.alloc(&created.option.info.underlying_coin_id).unwrap();
+    let smuggled = Conditions::new().send_message(
+        23,
+        created.option.info.underlying_delegated_puzzle_hash.into(),
+        vec![data],
+    );
+    let _rehomed = created
+        .option
+        .transfer(&mut ctx, &inner, destination, smuggled)
+        .unwrap();
+    let spends = ctx.take();
+
+    let err =
+        analyze(&spends).expect_err("a transfer carrying the exercise message must be refused");
+    assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+}
+
+/// GREEN control: a clean re-home transfer (no message, no melt) still analyzes cleanly, signs, and
+/// SETTLES on the simulator — proving the two guards do not over-refuse the one signable option
+/// action. Mirrors SDK `test_transfer_option`.
+#[tokio::test]
+async fn plain_transfer_still_signs() {
+    let mut sim = Simulator::new();
+    let mut ctx = SpendContext::new();
+    let (underlying, strike) = (1_000u64, 250u64);
+    let alice = sim.bls(underlying + 1);
+    let bob = sim.bls(0);
+    let terms = OptionTerms::new(
+        alice.puzzle_hash,
+        underlying,
+        OptionType::Xch { amount: strike },
+        EXPIRY,
+    );
+    let mint = create(&mut ctx, &Owner::Standard(alice.pk), alice.coin, &terms).unwrap();
+    let created = mint.created.clone().unwrap();
+    let mint_sig = sign_transaction(&mint.coin_spends, std::slice::from_ref(&alice.sk)).unwrap();
+    sim.new_transaction(SpendBundle::new(mint.coin_spends.clone(), mint_sig))
+        .unwrap();
+    let (handle, on_chain) = projection_from_create(
+        &mint.coin_spends,
+        &created,
+        alice.puzzle_hash,
+        alice.puzzle_hash,
+        underlying,
+        strike,
+    );
+
+    let unsigned = engine(vec![], alice.puzzle_hash, alice.pk)
+        .build_transfer_option(TransferOptionRequest {
+            identity: identity(),
+            handle,
+            on_chain,
+            to_puzzle_hash: Puzzlehash(hex::encode(bob.puzzle_hash)),
+            fee: Amount(0),
+        })
+        .await
+        .unwrap();
+
+    // The transfer allowlist must NOT over-refuse a clean re-home.
+    analyze(&unsigned.coin_spends).expect("a clean option transfer analyzes cleanly");
+    let sig = sign_transaction(&unsigned.coin_spends, &[alice.sk]).unwrap();
+    sim.new_transaction(SpendBundle::new(unsigned.coin_spends, sig))
+        .expect("a clean option transfer must settle on the simulator");
 }

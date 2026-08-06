@@ -271,10 +271,10 @@ impl OptionBuilder for SdkSpendBuilder {
         ensure_signed_offline(&coin_spends, &required_signatures)?;
 
         // The review summary lists what LEAVES the wallet: the STRIKE paid to the creator (the option's
-        // committed clawback/creator puzzle hash), plus the implicit fee. The unlocked underlying is
-        // claimed BACK to the holder (the wallet) in the same bundle, so it is change (value returning
-        // home), not an egress — the client signer independently proves that claim lands on a
-        // wallet-owned puzzle hash (#1511 PR-C, MR-9) and reconciles this summary against what leaves.
+        // committed clawback/creator puzzle hash), plus the implicit fee. NOTE: exercise is NOT signable
+        // in PR-C — the client signer refuses the option-singleton melt/message leg fail-closed (deferred
+        // #2245), so this summary path is exercised only by the engine's build+conformance tests, never
+        // by a real signed spend. Transfer is the only signable option action (see `client::verify`).
         let creator_ph = parse_puzzle_hash(&handle.creator_puzzle_hash)?;
         Ok(UnsignedSpend {
             coin_spends,

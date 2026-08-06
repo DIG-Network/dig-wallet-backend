@@ -8,11 +8,16 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ### Features
 - **client:** Decode + sign covered-option **transfer** via `OptionContract` singleton accounting
-  (#1511 PR-C). Option **exercise** is now REFUSED fail-closed: the exercising holder's underlying-reclaim
-  leg is not consensus-forced (it lands on a bare anyone-can-claim settlement coin), so a compromised
-  engine could strip it after the wallet funds the strike — exercise is not safely client-seam-signable
-  until a `dig-options` puzzle change binds the reclaim (deferred #2245). Option **mint** stays refused
-  (#2243). Removes the insufficient in-bundle-presence guard (MR-9) + its exercise-permit machinery.
+  (#1511 PR-C). Option **exercise** is REFUSED fail-closed at the SIGNATURE SOURCE by two guards in
+  `client::verify`: (1) an option-singleton spend that does NOT re-home (a melt/exercise or clawback) is
+  refused regardless of whether the `P2OneOfMany` underlying leg is present — closing the strip-the-leg
+  attack; (2) a transfer's delegated puzzle is held to a default-DENY allowlist (only the re-home
+  `CREATE_COIN`, its sole `AGG_SIG_ME`, and benign assertions), so a transfer signature can never carry
+  the mode-23 exercise `SEND_MESSAGE`. This rests on the consensus invariant that the exercise message
+  and the singleton melt are inseparable (`chia-sdk-driver` `test_incomplete_exercise`); exercise stays
+  unsignable until a `dig-options` puzzle change binds the underlying reclaim to the holder (deferred
+  #2245). Option **mint** stays refused (#2243). Pins reliance on `chia-sdk-driver 0.34.0` /
+  `chia-puzzles 0.20.3` option-contract semantics (a future SDK bump must re-verify the coupling).
 
 ## [0.19.0] - 2026-08-06
 

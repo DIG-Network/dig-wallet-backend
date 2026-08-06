@@ -41,11 +41,29 @@ reclaim leg — the strike-funding spend is still valid on its own, so the walle
 attacker sweeps the underlying. An in-bundle-presence check can never close this: only a consensus
 binding (the underlying's exercise puzzle FORCING the reclaim to the holder's puzzle hash, the way it
 already forces the strike to the creator) makes exercise safe. That is a `dig-options` builder/puzzle
-change (deferred #2245). Until then, exercise is NOT client-seam-signable: `client::verify::analyze`
-detects the exercise's `P2OneOfManyLayer` underlying leg and REFUSES the whole bundle fail-closed. The
-engine still BUILDS a valid exercise (a raw external key-holder can settle it); only the custody signer
-refuses. LESSON: for a leg whose destination the wallet's signature does not itself bind, presence in the
-signed bundle proves nothing — require consensus enforcement or refuse.
+change (deferred #2245). Until then, exercise is NOT client-seam-signable. The engine still BUILDS a
+valid exercise (a raw external key-holder can settle it); only the custody signer refuses. LESSON: for a
+leg whose destination the wallet's signature does not itself bind, presence in the signed bundle proves
+nothing — require consensus enforcement or refuse.
+
+**Where the exercise refusal actually lives (Case-A, the corrected guard set).** Refusing only the
+`P2OneOfManyLayer` underlying leg is NOT sufficient: an attacker can OMIT that leg from the bundle and
+still get the wallet to sign the option-singleton melt+message leg (the strip-the-leg attack). The
+durable insight is that unlocking the underlying requires a mode-23 (`0x17`) `SEND_MESSAGE`, and the
+`OPTION_CONTRACT` puzzle couples that message INSEPARABLY to the singleton MELT — proven by
+`chia-sdk-driver-0.34.0` `option_contract.rs::test_incomplete_exercise` (message-without-melt AND
+melt-without-message both consensus-reject); `test_transfer_option` proves a plain re-home transfer
+succeeds. So consensus already forbids "some other spend unlocks the underlying"; the residual risk is
+purely the wallet SIGNING the melt/message leg. `client::verify::analyze` therefore refuses at the
+SIGNATURE SOURCE with two guards: (1) any option-singleton spend that does NOT re-home (no odd-amount
+`CREATE_COIN` — a melt/exercise or clawback) is refused regardless of the underlying leg's presence;
+(2) a transfer's delegated puzzle is held to a default-DENY allowlist (only the re-home `CREATE_COIN`,
+its sole `AGG_SIG_ME`, and benign assertions — never a `SEND_MESSAGE`/`RECEIVE_MESSAGE`/`MeltSingleton`/
+announcement-CREATE/second value CREATE/unknown opcode). The `P2OneOfManyLayer` refusal is retained as
+defense in depth. LESSON: guard the SIGNATURE on the leg that authorizes the dangerous action (here the
+melt+message), not the mere presence/absence of a sibling leg — and make the allowlist default-DENY so a
+new opcode fails closed. This reasoning is pinned to `chia-sdk-driver 0.34.0` / `chia-puzzles 0.20.3`;
+a future SDK/puzzle bump must re-verify the message ⟺ melt coupling.
 
 Transfer is unaffected: it re-homes the singleton through the inner standard layer (the sole signed
 `AGG_SIG_ME` binds the destination) and touches no builder-enforced-only leg — so it stays signable.
