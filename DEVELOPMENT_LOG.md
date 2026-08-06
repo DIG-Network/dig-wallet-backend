@@ -11,9 +11,22 @@ degrades from "what the bundle DOES" (re-derived by `verify::analyze`) to "what 
 CLAIMS it does" at the exact moment assurance matters, and a caller that forgets to check `verified`
 gets a plausible-but-unverified screen. The rule: if two code paths must agree about the MEANING of
 something, exactly one may interpret it — the fallback quietly swaps interpreters. Hence two modes:
-lenient `decode` (display-only, may be unverified) and `decode_verified` (no fallback, fails closed).
-The signing gate (`verify_before_signing`) and the consent prompt both derive from the one interpreter
-`verify::analyze`, so the approved screen and the signed bytes share a source by construction.
+lenient `decode` (display-only, may be unverified) and `LocalSigner::decode_verified` (no fallback,
+fails closed). The signing gate (`verify_before_signing`) and the consent prompt both derive from the
+one interpreter `verify::analyze`, so the approved screen and the signed bytes share a source by
+construction.
+
+**Sharing the interpreter is NOT enough — the consent decode must ALSO share the key-aware ownership
+split (#2209 Finding-2).** A key-FREE summary (`verify::derive_summary`/`summarize`) splits
+recipients from change on a MEMO heuristic with no ownership check, and DROPS the change bucket from
+the rendered lines. So an un-hinted `CREATE_COIN(non_owned_ph, N)` on a wallet-owned coin is bucketed
+as "change" and hidden — yet the signer's key-AWARE split (`reclassify_by_ownership`) correctly treats
+any non-owned output as a recipient and WOULD sign it. Result: a key-free consent screen fails OPEN —
+the user approves an empty/fee-only screen while value leaves to an attacker. Fix: the consent decode
+(`LocalSigner::decode_verified`) renders the signer's own `reviewable_summary`, so the approved screen
+equals the signed bytes by construction. Lesson: when two paths must agree, they must share EVERY
+judgement that changes the outcome — here both the interpreter AND the wallet-relative ownership split,
+not just the parse. A free function with no key access structurally cannot be the safe consent decode.
 
 ## chia-wallet-sdk 0.34 — offer requested payments are DIRECT to the payee
 

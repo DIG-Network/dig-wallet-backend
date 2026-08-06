@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.21.0] - 2026-08-06
 
 ### Features
-- **client:** Add `decode_verified` — a no-fallback spend decode for the pre-sign consent path that fails closed instead of degrading to the engine's untrusted summary (#2209)
+- **client:** Add key-aware `LocalSigner::decode_verified` — the no-fallback pre-sign consent decode. It renders the signer's key-aware ownership split (`reviewable_summary`), so the approved screen equals the signed bytes and an un-hinted non-owned egress can no longer be hidden. Replaces the removed key-free free function `review::decode_verified` (a free function structurally cannot apply the ownership split); the lenient display-only `review::decode` is unchanged (#2209)
 
 ## [0.20.0] - 2026-08-06
 

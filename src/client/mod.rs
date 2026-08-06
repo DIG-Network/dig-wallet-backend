@@ -23,7 +23,7 @@ pub mod verify;
 pub use addressbook::AddressBook;
 pub use hd::{MasterKey, MasterKeySource};
 pub use identity::{HdIdentity, IdentityProvider};
-pub use review::{decode, decode_verified, HumanReadableSummary};
+pub use review::{decode, HumanReadableSummary};
 pub use signer::{IdentitySigner, LocalSigner};
 pub use transport::{ControlTransport, IpcWalletClient};
 pub use verify::{

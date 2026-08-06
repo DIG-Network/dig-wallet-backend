@@ -37,6 +37,7 @@ use crate::types::{
 };
 
 use super::hd::{MasterKey, DEFAULT_ADDRESS_GAP};
+use super::review::{self, HumanReadableSummary};
 use super::verify::{self, SpendEffect};
 
 /// The Chia mainnet genesis challenge — the AGG_SIG_ME additional data every mainnet spend
@@ -310,6 +311,35 @@ impl LocalSigner {
     ) -> WalletResult<TransactionSummary> {
         let effect = self.reclassify_by_ownership(verify::analyze(coin_spends)?);
         verify::summarize(&effect)
+    }
+
+    /// Decode an unsigned spend for the pre-sign CONSENT prompt — the human-readable screen the user
+    /// approves before this signer produces a signature (SPEC §4, #2209). NO fallback, fails closed.
+    ///
+    /// This is the ONLY safe consent decode, and it lives HERE — on the key-holding signer — for one
+    /// reason: the approved screen MUST equal the signed bytes, and that equality holds only if the
+    /// screen is rendered from the SAME key-aware view the signer authorizes against. Concretely it:
+    ///
+    /// 1. re-derives the value flow through the shared interpreter [`verify::analyze`] with NO
+    ///    fallback — a spend that cannot be independently accounted for returns
+    ///    `Err(SpendValidationFailed)` and NEVER renders the engine's (untrusted) claim; and
+    /// 2. applies the SAME key-aware ownership split the signing gate uses
+    ///    ([`reviewable_summary`](LocalSigner::reviewable_summary) →
+    ///    [`reclassify_by_ownership`](LocalSigner::reclassify_by_ownership)), so every output this
+    ///    wallet cannot derive a key for is surfaced as a recipient line — INCLUDING an un-hinted
+    ///    non-owned output that the key-free [`review::decode`]/[`verify::derive_summary`] would bucket
+    ///    as "change" and silently drop.
+    ///
+    /// Because it renders exactly [`reviewable_summary`](LocalSigner::reviewable_summary) — the very
+    /// summary [`verify_before_signing`](LocalSigner::verify_before_signing) gates the engine claim
+    /// against — the consent screen and the signed bytes share BOTH the interpreter AND the ownership
+    /// split by construction: there is no view the signer would authorize that this decode does not
+    /// show. The returned summary is always [`verified`](HumanReadableSummary::verified). Use the
+    /// key-free [`review::decode`] only for a display surface that honours the `verified` flag, never
+    /// ahead of signing.
+    pub fn decode_verified(&self, unsigned: &UnsignedSpend) -> WalletResult<HumanReadableSummary> {
+        let summary = self.reviewable_summary(&unsigned.coin_spends)?;
+        Ok(review::render(unsigned, &summary, true))
     }
 
     /// Require the engine-supplied `claimed` summary to match the independently re-derived `effect` on
@@ -2340,6 +2370,114 @@ mod tests {
             .unwrap(),
             ctx.take(),
         )
+    }
+
+    /// #2209 FINDING-2 (the headline): the key-FREE consent view fails OPEN on an un-hinted,
+    /// NON-owned output — it buckets it as "change" and DROPS it — while the signer's key-AWARE gate
+    /// would authorize a spend that pays it. The key-aware [`LocalSigner::decode_verified`] closes the
+    /// divergence: it SURFACES that egress as a recipient line, so the approved screen equals the
+    /// signed bytes.
+    ///
+    /// The spend is a REAL, `analyze`-VALID standard-layer spend of a 2-XCH wallet-owned coin (the
+    /// signer's own canonical key decides ownership) paying 1 XCH to an attacker address UN-HINTED
+    /// (so the memo heuristic mislabels it change) + 1 XCH back home. Anchored to a real spend + real
+    /// keys, never a mock.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn consent_decode_surfaces_an_unhinted_non_owned_egress_the_keyfree_view_hides() {
+        use chia_puzzle_types::standard::StandardArgs;
+
+        const ONE_XCH: u64 = 1_000_000_000_000;
+        // A NON-owned recipient (the attacker) and the wallet's OWN change puzzle hash.
+        let attacker = Bytes32::new([0x33u8; 32]);
+        let wallet_ph = Bytes32::from(
+            StandardArgs::curry_tree_hash(master("blind-egress").wallet_public_key(0)).to_bytes(),
+        );
+
+        // Pay 1 XCH to `attacker` UN-HINTED + 1 XCH change home, from a 2-XCH coin (conserving).
+        let (signer, coin_spends) = wallet_xch_spend(
+            "blind-egress",
+            2 * ONE_XCH,
+            &[(attacker, ONE_XCH, false), (wallet_ph, ONE_XCH, false)],
+            false,
+        );
+        assert!(
+            verify::analyze(&coin_spends).is_ok(),
+            "the spend is a valid, conserving standard-layer send"
+        );
+
+        // The OLD key-FREE summarizer HIDES the egress: both outputs are un-hinted, so both are
+        // bucketed as change and the rendered summary is EMPTY. This is the fail-open gap.
+        let key_free = verify::derive_summary(&coin_spends).unwrap();
+        assert!(
+            key_free.outputs.is_empty(),
+            "the key-free view drops the un-hinted non-owned egress (Finding-2 gap)"
+        );
+
+        // The KEY-AWARE consent decode SURFACES the 1-XCH → attacker egress as a recipient line.
+        let unsigned = UnsignedSpend {
+            coin_spends: coin_spends.clone(),
+            required_signatures: vec![],
+            summary: empty_summary(),
+        };
+        let consent = signer.decode_verified(&unsigned).unwrap();
+        assert!(consent.verified);
+        assert_eq!(
+            consent.lines,
+            vec![format!("Send 1 XCH to {}", xch_addr(attacker).0)],
+            "the consent decode must surface the previously-hidden non-owned egress"
+        );
+
+        // ... and it equals what the signing gate authorizes for the SAME spend: the key-aware
+        // reviewable summary lists exactly that egress (1 XCH to the attacker), so the approved screen
+        // and the signed bytes share the ownership split by construction.
+        let reviewable = signer.reviewable_summary(&coin_spends).unwrap();
+        assert_eq!(reviewable.outputs.len(), 1);
+        assert_eq!(reviewable.outputs[0].address, xch_addr(attacker));
+        assert_eq!(reviewable.outputs[0].amount, crate::types::Amount(ONE_XCH));
+    }
+
+    /// #2209: the key-aware [`LocalSigner::decode_verified`] REFUSES exactly where the lenient
+    /// key-free [`review::decode`] silently degrades to the engine's (untrusted) claim
+    /// (`verified: false`). Migrated from the removed free-function `review::decode_verified`.
+    ///
+    /// The bundle is a REAL coin spend whose re-derivation genuinely fails — the identity puzzle `1`
+    /// (solution `()`) the chia-wallet-sdk drivers cannot account for — run through the same
+    /// [`verify::analyze`] wire the signer gates on. Not a mock: `analyze` runs the actual puzzle and
+    /// rejects it fail-closed.
+    #[test]
+    fn consent_decode_refuses_where_the_lenient_decode_is_unverified() {
+        use crate::types::{Address, Amount, SpendOutput, TransactionSummary};
+        use chia_protocol::{Coin, CoinSpend};
+
+        let coin = Coin::new(Bytes32::new([1u8; 32]), Bytes32::new([2u8; 32]), 100);
+        let bad_spend = CoinSpend::new(coin, vec![0x01].into(), vec![0x80].into());
+        let unsigned = UnsignedSpend {
+            coin_spends: vec![bad_spend],
+            required_signatures: vec![],
+            summary: TransactionSummary {
+                outputs: vec![SpendOutput {
+                    address: Address("xch1attacker".into()),
+                    amount: Amount(1_000_000_000_000),
+                    asset_id: None,
+                }],
+                fee: Amount(0),
+            },
+        };
+
+        // The lenient key-free decoder degrades to the engine's untrusted claim, flagged unverified.
+        let lenient = review::decode(&unsigned);
+        assert!(
+            !lenient.verified,
+            "the lenient decoder falls back to the engine claim, flagged unverified"
+        );
+
+        // The key-aware consent decode REFUSES — it never renders the untrusted engine claim.
+        let signer = mainnet_signer("consent-refuse");
+        let err = signer
+            .decode_verified(&unsigned)
+            .expect_err("decode_verified must fail when re-derivation fails, never fall back");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
     }
 
     /// The canonical settlement-payments puzzle hash — the ONLY destination `analyze` routes to
