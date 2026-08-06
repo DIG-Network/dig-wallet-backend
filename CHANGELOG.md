@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.20.0] - 2026-08-06
+
+### Features
+- **client:** Decode + sign covered-option transfer + exercise; assert the unlocked underlying is
+  reclaimed to the wallet (MR-9) before signing (#1511 PR-C). Option mint stays refused (#2243).
+
 ## [0.19.0] - 2026-08-06
 
 ### Features

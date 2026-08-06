@@ -249,7 +249,11 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   claims the unlocked underlying (a settlement-puzzle coin of the underlying amount) to the holder;
   no path may drop or reorder it, and a caller MUST broadcast the whole bundle — a subset strands the
   underlying for any mempool watcher to steal after the holder has paid the strike. This invariant is
-  pinned by a dependency-guard conformance test (`exercise_bundle_includes_the_underlying_claim_leg`).
+  pinned by a dependency-guard conformance test (`exercise_bundle_includes_the_underlying_claim_leg`)
+  AND enforced at the client signer (§4, MR-9): the signer refuses to sign unless the unlocked
+  underlying is reclaimed in-bundle to a wallet-owned puzzle hash. The exercise review summary lists
+  what LEAVES the wallet — the STRIKE paid to the creator + the implicit fee — not the underlying
+  (which returns home to the holder, verified wallet-owned by the signer, #1511 PR-C).
 - **Transfer + exercise are wired over `dig-options` v0.2.0** — `build_transfer_option` composes
   `dig_options::transfer`; `build_exercise_option` composes `dig_options::exercise`. Both are
   key-free and network-free: the engine cannot fetch an option's live singleton or recover a
@@ -368,21 +372,28 @@ Used by dig-app. The subscriber + identity provider + signer.
   launder a blank-check signature for another coin through a benign carrier), or a wrong-hash
   `AGG_SIG_ME` are each refused (#1519). `derive_summary(&[CoinSpend]) -> TransactionSummary`
   wraps it for display; `summarize(&SpendEffect) -> TransactionSummary` is the shared renderer both it
-  and the signer's key-aware summary use. The standard-XCH-send, CAT-send, $DIG-**tip**, and the three
-  **offer** shapes (make / take / cancel) the engine builds are decodable (a tip is a single-key CAT
-  payment through the same `Cat::parse` path, #1511 PR-A; offers commit value to the canonical
-  settlement puzzle, #1511 PR-B — see below); any coin spend that cannot be FULLY accounted for (a
-  foreign puzzle, undecodable bytes, a value leak/mint, a "settlement" output to a non-canonical hash)
-  is refused fail-closed with `WalletErrorCode::SpendValidationFailed`.
-- **Settlement / `protocol_sink` (offers, #1511 PR-B).** `SpendEffect` carries a THIRD output bucket
-  `protocol_sink`: value the wallet intentionally commits to a consensus-enforced canonical STRUCTURAL
-  puzzle — today exactly the offer settlement-payments puzzle (`SETTLEMENT_PAYMENT_HASH`). A
-  `CREATE_COIN` routes to `protocol_sink` ONLY when its destination is that canonical hash
-  (`is_protocol_sink_hash`), never a free address, so an attacker address can never be laundered as a
-  "sink". Value conservation generalizes to `in == recipients + change + protocol_sink + fee` (still
-  TOTAL arithmetic — never wrapping). A wallet coin that spends into settlement MUST also carry an
-  offer-binding assertion (announcement/concurrency), or it is refused as give-it-away-for-nothing
-  (MR-6). Settlement-layer coins the wallet CLAIMS (take/cancel) are decoded through `SettlementLayer`
+  and the signer's key-aware summary use. The standard-XCH-send, CAT-send, $DIG-**tip**, the three
+  **offer** shapes (make / take / cancel), and the covered-option **transfer** + **exercise** the engine
+  builds are decodable (a tip is a single-key CAT payment through the same `Cat::parse` path, #1511 PR-A;
+  offers commit value to the canonical settlement puzzle, #1511 PR-B; options decode through
+  `OptionContract`/`P2OneOfManyLayer`/`SettlementLayer`, #1511 PR-C — see below); any coin spend that
+  cannot be FULLY accounted for (a foreign puzzle, undecodable bytes, a value leak/mint, a "settlement"
+  output to a non-canonical hash) is refused fail-closed with `WalletErrorCode::SpendValidationFailed`.
+  Option **mint** is NOT yet decodable (its cross-seam summary reconciliation is tracked in #2243) and
+  is refused.
+- **Settlement / `protocol_sink` (offers #1511 PR-B, options #1511 PR-C).** `SpendEffect` carries a THIRD
+  output bucket `protocol_sink`: value the wallet intentionally commits to a consensus-enforced canonical
+  STRUCTURAL puzzle — the offer settlement-payments puzzle (`SETTLEMENT_PAYMENT_HASH`) or the singleton
+  launcher (`SINGLETON_LAUNCHER_HASH`, #1511 PR-C). A `CREATE_COIN` routes to `protocol_sink` ONLY when
+  its destination is one of those canonical hashes (`is_protocol_sink_hash`), never a free address, so an
+  attacker address can never be laundered as a "sink" (the per-option locked-underlying hash is NOT a
+  fixed constant and is deliberately not recognized — the option-mint decode gap, #2243). Value
+  conservation generalizes to `in == recipients + change + protocol_sink + fee` (still TOTAL arithmetic —
+  never wrapping). A wallet coin that spends into settlement MUST also carry an offer-binding assertion
+  (announcement/concurrency), or it is refused as give-it-away-for-nothing (MR-6) — EXCEPT in an option
+  bundle, where the strike egress is bound instead by the option's underlying announcement (MR-10) + the
+  atomic bundle. Settlement-layer coins the wallet CLAIMS (take/cancel/exercise) are decoded through
+  `SettlementLayer`
   (which gates on `SETTLEMENT_PAYMENT_HASH`); they carry NO signature (claimed by announcement), so
   their `AGG_SIG_ME`/quote-form guards are skipped and their notarized payments are accounted as
   outputs — a cancel is an ordinary standard/CAT reclaim and decodes with no settlement leg.
@@ -451,10 +462,31 @@ Used by dig-app. The subscriber + identity provider + signer.
      settlement puzzle, so the offer builders leave the address blank and it is NOT compared).
      Zero-value settlement outputs are announcement carriers and are excluded from the reviewed egress.
      Settlement-layer coins the wallet claims carry no signature and are re-derived, never signed.
+  8. **Covered-option transfer + exercise (#1511 PR-C).** Options decode ONLY through chia-wallet-sdk
+     drivers (`OptionContract`, `P2OneOfManyLayer`, `SettlementLayer`), never bespoke CLVM. A **transfer**
+     reaches the option singleton's inner standard layer via `OptionContract::parse` (the sole signed
+     `AGG_SIG_ME`) and re-homes the singleton with an odd-amount `CREATE_COIN` to the new owner; a
+     re-home to a structural launcher/settlement hash is refused (**MR-12**, unauthorized re-home). An
+     **exercise** melts the singleton, unlocks the underlying (a `P2OneOfManyLayer` coin) into the
+     settlement puzzle, and pays the strike; it carries TWO settlement legs (strike → creator, unlocked
+     underlying → holder). Option bundles use IMPLICIT-fee conservation (`fee = in − out`; the builders
+     emit no `RESERVE_FEE`, and the melted 1-mojo singleton is a structural carrier excluded from the
+     ledger), and settlement egresses reclaimed IN-BUNDLE (both exercise legs) are netted out of the
+     reviewable sink bucket (intermediate plumbing, not net egress). Two option-specific gates bind:
+     - **MR-9 (the crux, key-aware in `LocalSigner`).** The unlocked-underlying leg is builder-enforced
+       ONLY — consensus forces the strike to the creator but NOT the underlying claim back to the holder.
+       So before signing, for every unlocked amount the signer requires an in-bundle claimed-settlement
+       payout of exactly that amount to a WALLET-OWNED puzzle hash (`owns_puzzle_hash`) — else refused
+       fail-closed. Absent it, the unlocked underlying would strand on an anyone-can-claim settlement coin
+       while the wallet has paid the strike.
+     - **MR-10.** Every strike-payment puzzle-announcement the underlying spend ASSERTS MUST be satisfied
+       by a claimed settlement coin creating that exact announcement, reconciling the strike leg's amount
+       + destination to the option's committed requested payment — else refused.
   - **Signing scope (fail-closed).** `sign_unsigned` signs the standard-XCH-send, CAT-send, $DIG-tip
-    (#1511 PR-A), and the three offer shapes make / take / cancel (#1511 PR-B) classes `client::verify`
-    can decode. A covered-option `UnsignedSpend` routed through it is refused (`SpendValidationFailed`)
-    until its verify decoder lands.
+    (#1511 PR-A), the three offer shapes make / take / cancel (#1511 PR-B), and the covered-option
+    **transfer** + **exercise** (#1511 PR-C) classes `client::verify` can decode. An option **mint**
+    `UnsignedSpend` routed through it is refused (`SpendValidationFailed`) — its cross-seam summary
+    reconciliation is tracked in #2243.
 - **`client::identity::IdentityProvider`** — `active_identity()`, `tracked_public_keys()`. Supplies the
   engine public material only. `HdIdentity` additionally exposes `identity_public_key_bytes()` (the
   48-byte G1 identity key published to slot `0x0010`) and `decap(peer_g1)` (the dig-message recipient

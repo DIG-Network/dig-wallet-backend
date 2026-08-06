@@ -270,14 +270,19 @@ impl OptionBuilder for SdkSpendBuilder {
         let required_signatures = self.required_signatures(&coin_spends)?;
         ensure_signed_offline(&coin_spends, &required_signatures)?;
 
+        // The review summary lists what LEAVES the wallet: the STRIKE paid to the creator (the option's
+        // committed clawback/creator puzzle hash), plus the implicit fee. The unlocked underlying is
+        // claimed BACK to the holder (the wallet) in the same bundle, so it is change (value returning
+        // home), not an egress — the client signer independently proves that claim lands on a
+        // wallet-owned puzzle hash (#1511 PR-C, MR-9) and reconciles this summary against what leaves.
+        let creator_ph = parse_puzzle_hash(&handle.creator_puzzle_hash)?;
         Ok(UnsignedSpend {
             coin_spends,
             required_signatures,
             summary: TransactionSummary {
                 outputs: vec![SpendOutput {
-                    // The unlocked underlying is claimed to the option's current owner (p2).
-                    address: encode_address(p2_puzzle_hash)?,
-                    amount: handle.underlying_amount,
+                    address: encode_address(creator_ph)?,
+                    amount: Amount(strike_amount),
                     asset_id: None,
                 }],
                 fee: Amount(implicit_fee),
@@ -763,7 +768,10 @@ mod tests {
         assert!(!unsigned.coin_spends.is_empty());
         assert!(!unsigned.required_signatures.is_empty());
         assert_eq!(unsigned.summary.fee, Amount(5));
-        assert_eq!(unsigned.summary.outputs[0].amount, Amount(1_000));
+        // The review summary lists what LEAVES the wallet: the STRIKE (500) paid to the creator, not
+        // the unlocked underlying (which is reclaimed BACK to the holder in-bundle — value returning
+        // home, verified wallet-owned by the client signer, #1511 PR-C).
+        assert_eq!(unsigned.summary.outputs[0].amount, Amount(500));
     }
 
     /// WIRED atomicity guard (SPEC §3a): the engine-built exercise bundle MUST carry the settlement
