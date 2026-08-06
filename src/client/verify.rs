@@ -8,12 +8,19 @@
 //! and fee. The signer then gates on THIS, closing the blind-signing gap.
 //!
 //! # Fail-closed
-//! The decodable spend classes are the standard-layer XCH send, the CAT send, and the $DIG **tip**
+//! The decodable spend classes are the standard-layer XCH send, the CAT send, the $DIG **tip**
 //! (a single-key CAT payment — recipient + change, no separate XCH fee — that flows through the SAME
-//! [`Cat::parse`] path). Any coin spend the driver cannot fully parse+account for — a foreign puzzle,
-//! a value leak, a minted CAT — yields [`WalletErrorCode::SpendValidationFailed`]; the signer refuses
-//! to sign it. (Offers/options reaching the signer are still refused here until their decoders land —
-//! that is intended.)
+//! [`Cat::parse`] path), and the three **offer** shapes (make / take / cancel), whose value the wallet
+//! commits to the consensus-enforced **settlement-payments** puzzle (#1511 PR-B). A settlement output
+//! is accounted into a THIRD bucket, [`SpendEffect::protocol_sink`] — value intentionally handed to a
+//! recognized canonical structural puzzle, not to a free address — so an attacker address can never be
+//! laundered as a "sink". Settlement-layer coins the wallet CLAIMS (take/cancel) are decoded through
+//! [`SettlementLayer`] and carry NO signature (claimed by announcement), so they skip the
+//! wallet-signed-coin guards; only the wallet's own standard/CAT coins are signed. Any coin spend the
+//! drivers cannot fully parse+account for — a foreign puzzle, a value leak, a minted CAT, a "settlement"
+//! output to a non-canonical hash — yields [`WalletErrorCode::SpendValidationFailed`]; the signer
+//! refuses to sign it. (Covered-**option** spends reaching the signer are still refused here until
+//! their decoder lands — that is intended.)
 //!
 //! # Recipients vs change is key-relative
 //! Splitting a spend's outputs into recipients (value leaving) and change (value returning home) is
@@ -28,7 +35,8 @@ use std::collections::BTreeMap;
 
 use chia_protocol::{Bytes32, CoinSpend};
 use chia_puzzle_types::Memos;
-use chia_wallet_sdk::driver::{Cat, Layer, Puzzle, StandardLayer};
+use chia_wallet_sdk::driver::{Cat, Layer, Puzzle, SettlementLayer, StandardLayer};
+use chia_wallet_sdk::puzzles::SETTLEMENT_PAYMENT_HASH;
 use chia_wallet_sdk::types::{run_puzzle, Condition};
 use chia_wallet_sdk::utils::Address as Bech32Address;
 use clvm_traits::FromClvm;
@@ -56,16 +64,35 @@ pub struct DecodedOutput {
 ///
 /// [`recipients`](SpendEffect::recipients) are the HINTED (memo-carrying) outputs a payment sends to
 /// a counterparty; [`change`](SpendEffect::change) are the un-hinted outputs a well-formed spend
-/// returns to itself. The signer requires every change output to be wallet-owned, so no value can
-/// silently leave the wallet.
+/// returns to itself; [`protocol_sink`](SpendEffect::protocol_sink) are outputs the wallet commits to
+/// a consensus-enforced canonical structural puzzle (the offer **settlement** puzzle, #1511 PR-B).
+/// The signer requires every change output to be wallet-owned and every `protocol_sink` output to be a
+/// recognized canonical structural hash, so no value can silently leave the wallet to a free address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpendEffect {
     /// The hinted outputs (payments to counterparties).
     pub recipients: Vec<DecodedOutput>,
     /// The un-hinted outputs (change back to the spender).
     pub change: Vec<DecodedOutput>,
+    /// Outputs the wallet intentionally commits to a consensus-enforced canonical structural puzzle —
+    /// today exactly the offer settlement-payments puzzle ([`SETTLEMENT_PAYMENT_HASH`]). This is the
+    /// sanctioned egress of the offered/paid assets in a make/take: value leaves the wallet, but to a
+    /// structure the protocol enforces, never to a chosen address. Every entry's `puzzle_hash` is a
+    /// recognized canonical structural hash by construction (see [`is_protocol_sink_hash`]).
+    pub protocol_sink: Vec<DecodedOutput>,
     /// The farmer fee (XCH mojos), summed from the spend's `RESERVE_FEE` conditions.
     pub fee: u64,
+}
+
+/// True when `puzzle_hash` is a recognized canonical STRUCTURAL puzzle hash the wallet may commit
+/// value to as a [`SpendEffect::protocol_sink`] — today exactly the immutable Chia offer
+/// settlement-payments puzzle ([`SETTLEMENT_PAYMENT_HASH`]).
+///
+/// This is the allow-list that stops value exfiltration masquerading as an offer: a `CREATE_COIN`
+/// routes to `protocol_sink` ONLY when its destination is one of these fixed protocol structures, so a
+/// coin created to an attacker's address can never be laundered as a benign "sink" (threat MR-3/MR-5).
+pub fn is_protocol_sink_hash(puzzle_hash: Bytes32) -> bool {
+    puzzle_hash == Bytes32::new(SETTLEMENT_PAYMENT_HASH)
 }
 
 /// Re-derive the value flow of `coin_spends` from the coin spends alone, fail-closed.
@@ -82,6 +109,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     let mut allocator = Allocator::new();
     let mut recipients = Vec::new();
     let mut change = Vec::new();
+    let mut protocol_sink = Vec::new();
     let mut fee: u64 = 0;
 
     // Per-asset value ledgers (None-keyed XCH is tracked separately below).
@@ -123,32 +151,66 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             let cat = parsed.cat;
             let inner_puzzle = parsed.p2_puzzle;
             let inner_solution = parsed.p2_solution;
-            // The CAT's inner p2 MUST be a standard layer whose delegated puzzle is quote-form —
-            // otherwise the signed message (tree-hash-only) would not commit to the actual outputs
-            // (see `committed_delegated_puzzle_message`).
+            let asset = cat.info.asset_id;
+
+            // Every CAT coin's own amount is value entering the spend, whoever authorizes it.
+            let cat_in_total = cat_in.entry(asset).or_default();
+            *cat_in_total = accumulate(*cat_in_total, spend.coin.amount, "CAT input total")?;
+
+            // A CAT coin the wallet CLAIMS as part of taking/cancelling an offer wraps the canonical
+            // settlement puzzle: it is spent by announcement, carries NO signature, and its notarized
+            // payments are the outputs. Account those but skip the wallet-signed-coin guards (there is
+            // nothing to sign, and the settlement puzzle is a fixed structure, not a delegated one).
+            if SettlementLayer::parse_puzzle(&allocator, inner_puzzle)
+                .map_err(|e| reject(format!("malformed CAT settlement puzzle: {e:?}")))?
+                .is_some()
+            {
+                let conditions =
+                    run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)?;
+                reject_any_agg_sig(&conditions)?;
+                for create in conditions.iter().filter_map(Condition::as_create_coin) {
+                    let cat_out_total = cat_out.entry(asset).or_default();
+                    *cat_out_total = accumulate(*cat_out_total, create.amount, "CAT output total")?;
+                    route_output(
+                        &mut recipients,
+                        &mut change,
+                        &mut protocol_sink,
+                        DecodedOutput {
+                            puzzle_hash: create.puzzle_hash,
+                            amount: create.amount,
+                            asset_id: Some(asset),
+                        },
+                        &create.memos,
+                    );
+                }
+                continue;
+            }
+
+            // Otherwise it is a wallet-signed CAT send: its inner p2 MUST be a standard layer whose
+            // delegated puzzle is quote-form — otherwise the signed message (tree-hash-only) would not
+            // commit to the actual outputs (see `committed_delegated_puzzle_message`).
             if StandardLayer::parse_puzzle(&allocator, inner_puzzle)
                 .map_err(|e| reject(format!("malformed CAT inner puzzle: {e:?}")))?
                 .is_none()
             {
                 return Err(reject(
-                    "CAT inner puzzle is not a standard layer; refusing to sign",
+                    "CAT inner puzzle is neither a standard layer nor a settlement layer; refusing \
+                     to sign",
                 ));
             }
             let committed_message = committed_delegated_puzzle_message(&allocator, inner_solution)?;
-
-            let asset = cat.info.asset_id;
-            let cat_in_total = cat_in.entry(asset).or_default();
-            *cat_in_total = accumulate(*cat_in_total, spend.coin.amount, "CAT input total")?;
             let conditions = run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)?;
             enforce_sole_agg_sig_me(&conditions, committed_message)?;
+            enforce_settlement_binding(&conditions)?;
             for condition in &conditions {
                 reject_unexpected_agg_sig(condition)?;
                 if let Some(create) = condition.as_create_coin() {
                     let cat_out_total = cat_out.entry(asset).or_default();
                     *cat_out_total = accumulate(*cat_out_total, create.amount, "CAT output total")?;
-                    classify(
+                    route_output(
                         &mut recipients,
                         &mut change,
+                        &mut protocol_sink,
                         DecodedOutput {
                             puzzle_hash: create.puzzle_hash,
                             amount: create.amount,
@@ -170,6 +232,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
             let conditions = run_conditions(&mut allocator, puzzle_ptr, solution_ptr)?;
             enforce_sole_agg_sig_me(&conditions, committed_message)?;
+            enforce_settlement_binding(&conditions)?;
             for condition in &conditions {
                 reject_unexpected_agg_sig(condition)?;
                 if let Some(reserve) = condition.as_reserve_fee() {
@@ -178,9 +241,10 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
                 }
                 if let Some(create) = condition.as_create_coin() {
                     xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
-                    classify(
+                    route_output(
                         &mut recipients,
                         &mut change,
+                        &mut protocol_sink,
                         DecodedOutput {
                             puzzle_hash: create.puzzle_hash,
                             amount: create.amount,
@@ -193,8 +257,36 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             continue;
         }
 
+        // A settlement-payments (XCH) coin the wallet CLAIMS while taking/cancelling an offer: the
+        // canonical, immutable settlement puzzle, spent by announcement with NO signature. Account its
+        // notarized-payment outputs into the XCH ledger; there is nothing to sign here.
+        if SettlementLayer::parse_puzzle(&allocator, puzzle)
+            .map_err(|e| reject(format!("malformed settlement spend: {e:?}")))?
+            .is_some()
+        {
+            xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
+            let conditions = run_conditions(&mut allocator, puzzle_ptr, solution_ptr)?;
+            reject_any_agg_sig(&conditions)?;
+            for create in conditions.iter().filter_map(Condition::as_create_coin) {
+                xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
+                route_output(
+                    &mut recipients,
+                    &mut change,
+                    &mut protocol_sink,
+                    DecodedOutput {
+                        puzzle_hash: create.puzzle_hash,
+                        amount: create.amount,
+                        asset_id: None,
+                    },
+                    &create.memos,
+                );
+            }
+            continue;
+        }
+
         return Err(reject(
-            "coin spend is neither a standard-layer XCH nor a CAT spend; refusing to sign",
+            "coin spend is neither a standard-layer XCH, a CAT, nor a settlement spend; refusing to \
+             sign",
         ));
     }
 
@@ -222,6 +314,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     Ok(SpendEffect {
         recipients,
         change,
+        protocol_sink,
         fee,
     })
 }
@@ -238,11 +331,17 @@ pub fn derive_summary(coin_spends: &[CoinSpend]) -> WalletResult<TransactionSumm
     summarize(&analyze(coin_spends)?)
 }
 
-/// Render a re-derived [`SpendEffect`]'s recipients + fee as a [`TransactionSummary`] (the outputs
-/// a human reviews). Shared by the key-free [`derive_summary`] and the signer's key-aware summary,
-/// so both encode addresses + asset ids identically.
+/// Render a re-derived [`SpendEffect`]'s value LEAVING the wallet — recipients (to a real address)
+/// plus `protocol_sink` (to a consensus-enforced settlement structure) — and the fee, as a
+/// [`TransactionSummary`] (the outputs a human reviews). Shared by the key-free [`derive_summary`] and
+/// the signer's key-aware summary, so both encode addresses + asset ids identically.
+///
+/// A `protocol_sink` output is rendered with an EMPTY address: its destination is the fixed settlement
+/// puzzle, not a chosen recipient, so there is no meaningful address to show — the offer builders emit
+/// the offered/paid assets the same way, and the signer's summary gate compares these by amount+asset,
+/// never by address (#1511 PR-B).
 pub fn summarize(effect: &SpendEffect) -> WalletResult<TransactionSummary> {
-    let outputs = effect
+    let mut outputs = effect
         .recipients
         .iter()
         .map(|output| {
@@ -253,6 +352,20 @@ pub fn summarize(effect: &SpendEffect) -> WalletResult<TransactionSummary> {
             })
         })
         .collect::<WalletResult<Vec<_>>>()?;
+    // A zero-value settlement output is an announcement CARRIER (a take creates one to bind the
+    // offered coins), not value leaving the wallet — omit it so the reviewed summary lists only real
+    // egress.
+    outputs.extend(
+        effect
+            .protocol_sink
+            .iter()
+            .filter(|output| output.amount > 0)
+            .map(|output| SpendOutput {
+                address: Address(String::new()),
+                amount: Amount(output.amount),
+                asset_id: output.asset_id.map(|asset| AssetId(hex::encode(asset))),
+            }),
+    );
     Ok(TransactionSummary {
         outputs,
         fee: Amount(effect.fee),
@@ -285,6 +398,89 @@ fn classify(
     } else {
         change.push(output);
     }
+}
+
+/// Route a decoded output into the three buckets (#1511 PR-B): a `CREATE_COIN` to a recognized
+/// canonical structural puzzle (settlement) is a [`SpendEffect::protocol_sink`] — the sanctioned
+/// egress of an offered/paid asset — regardless of its memos; everything else falls through to the
+/// key-free recipient/change [`classify`]. Routing on the DESTINATION HASH (never on a caller-chosen
+/// flag) is what stops a plain payment to an attacker being mislabelled as a benign sink (MR-3/MR-5).
+fn route_output(
+    recipients: &mut Vec<DecodedOutput>,
+    change: &mut Vec<DecodedOutput>,
+    protocol_sink: &mut Vec<DecodedOutput>,
+    output: DecodedOutput,
+    memos: &Memos<clvmr::NodePtr>,
+) {
+    if is_protocol_sink_hash(output.puzzle_hash) {
+        protocol_sink.push(output);
+    } else {
+        classify(recipients, change, output, memos);
+    }
+}
+
+/// True when `conditions` carry at least one announcement/concurrency assertion — the binding that
+/// ties a coin's settlement egress to receiving the counter-payment (#1511 MR-6).
+///
+/// A wallet coin that spends its value INTO the settlement puzzle with no such assertion is a
+/// give-it-away-for-nothing: nothing forces the offered value to be exchanged for anything. A genuine
+/// make asserts the requested payment's puzzle announcement; a genuine take binds to the maker's
+/// offered coins via a concurrency assertion. This is defense-in-depth BEYOND the sole-AGG_SIG_ME
+/// tree-hash commitment (which already binds the exact conditions to the signature).
+fn has_offer_binding_assertion(conditions: &[Condition]) -> bool {
+    conditions.iter().any(|condition| {
+        matches!(
+            condition,
+            Condition::AssertPuzzleAnnouncement(_)
+                | Condition::AssertCoinAnnouncement(_)
+                | Condition::AssertConcurrentSpend(_)
+                | Condition::AssertConcurrentPuzzle(_)
+        )
+    })
+}
+
+/// Enforce MR-6 on a WALLET-SIGNED coin: if it spends value into the settlement puzzle (emits a
+/// `CREATE_COIN` to [`SETTLEMENT_PAYMENT_HASH`]) it MUST also carry an offer-binding assertion, or the
+/// value would leave the wallet for nothing. Fail-closed.
+fn enforce_settlement_binding(conditions: &[Condition]) -> WalletResult<()> {
+    let creates_sink = conditions
+        .iter()
+        .filter_map(Condition::as_create_coin)
+        .any(|create| is_protocol_sink_hash(create.puzzle_hash));
+    if creates_sink && !has_offer_binding_assertion(conditions) {
+        return Err(reject(
+            "a coin commits value to settlement with no offer-binding assertion \
+             (give-it-away-for-nothing); refusing to sign",
+        ));
+    }
+    Ok(())
+}
+
+/// A claimed settlement-layer coin is spent by ANNOUNCEMENT and carries no signature; the immutable
+/// settlement puzzle emits only `CREATE_COIN` + announcement conditions. Any `AGG_SIG_*` in its run
+/// conditions is therefore anomalous — refuse fail-closed rather than account a coin whose spend would
+/// silently require a signature the taker never reviewed (defense-in-depth; the canonical puzzle
+/// cannot emit one, so this only ever fires on a corrupted decode).
+fn reject_any_agg_sig(conditions: &[Condition]) -> WalletResult<()> {
+    let has_agg_sig = conditions.iter().any(|condition| {
+        condition.as_agg_sig_me().is_some()
+            || matches!(
+                condition,
+                Condition::AggSigUnsafe(_)
+                    | Condition::AggSigParent(_)
+                    | Condition::AggSigPuzzle(_)
+                    | Condition::AggSigAmount(_)
+                    | Condition::AggSigPuzzleAmount(_)
+                    | Condition::AggSigParentAmount(_)
+                    | Condition::AggSigParentPuzzle(_)
+            )
+    });
+    if has_agg_sig {
+        return Err(reject(
+            "a claimed settlement coin carries an AGG_SIG condition; refusing to sign",
+        ));
+    }
+    Ok(())
 }
 
 /// The AGG_SIG_ME message a standard-layer coin's signature MUST commit to — `sha256tree` of its
@@ -874,5 +1070,127 @@ mod tests {
             analyze(&spends).unwrap_err().code,
             WalletErrorCode::SpendValidationFailed,
         );
+    }
+
+    // ---- #1511 PR-B: settlement-layer decode + the `protocol_sink` bucket. ----
+
+    /// The canonical settlement-payments puzzle hash — the ONLY destination routed to `protocol_sink`.
+    fn settlement_ph() -> Bytes32 {
+        Bytes32::new(chia_wallet_sdk::puzzles::SETTLEMENT_PAYMENT_HASH)
+    }
+
+    /// A wallet coin that spends value INTO the settlement puzzle (with an offer-binding assertion)
+    /// routes that egress to `protocol_sink` — not to recipients or change — leaving `recipients`
+    /// empty. This is the maker's offered leg of a make.
+    #[test]
+    fn a_settlement_egress_routes_to_protocol_sink() {
+        let effect = analyze(&standard_spend(
+            wallet_coin(50_000, 1),
+            Conditions::new()
+                .create_coin(settlement_ph(), 50_000, Memos::None)
+                .assert_concurrent_spend(Bytes32::new([0x44; 32])),
+        ))
+        .expect("a bound settlement egress is a valid offered leg");
+        assert!(
+            effect.recipients.is_empty(),
+            "offered value is not a recipient"
+        );
+        assert_eq!(effect.protocol_sink.len(), 1);
+        assert_eq!(effect.protocol_sink[0].amount, 50_000);
+        assert_eq!(effect.protocol_sink[0].puzzle_hash, settlement_ph());
+    }
+
+    /// A wallet coin committing value to settlement with NO offer-binding assertion
+    /// (give-it-away-for-nothing) is refused fail-closed (#1511 MR-6). The control above proves the
+    /// refusal is the missing assertion, not the settlement routing itself.
+    #[test]
+    fn a_settlement_egress_without_a_binding_assertion_is_refused() {
+        let err = analyze(&standard_spend(
+            wallet_coin(50_000, 1),
+            Conditions::new().create_coin(settlement_ph(), 50_000, Memos::None),
+        ))
+        .expect_err("an unbound settlement egress must be refused");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    /// A CLAIMED settlement (XCH) coin — the canonical settlement puzzle spent by announcement, no
+    /// signature — is decoded and its notarized payment accounted, with the settlement coin's amount as
+    /// input (so per-asset value still conserves).
+    #[test]
+    fn a_claimed_settlement_coin_is_decoded() {
+        use chia_puzzle_types::offer::{NotarizedPayment, Payment, SettlementPaymentsSolution};
+        use chia_wallet_sdk::driver::{Layer, SettlementLayer, Spend, SpendContext};
+
+        let payee = Bytes32::new([0x77; 32]);
+        let mut ctx = SpendContext::new();
+        let puzzle = SettlementLayer.construct_puzzle(&mut ctx).unwrap();
+        let payment = Payment::new(payee, 1_000, Memos::None);
+        let solution = SettlementLayer
+            .construct_solution(
+                &mut ctx,
+                SettlementPaymentsSolution::new(vec![NotarizedPayment::new(
+                    Bytes32::new([0x33; 32]),
+                    vec![payment],
+                )]),
+            )
+            .unwrap();
+        let coin = chia_protocol::Coin::new(Bytes32::new([0x22; 32]), settlement_ph(), 1_000);
+        ctx.spend(coin, Spend::new(puzzle, solution)).unwrap();
+
+        let effect = analyze(&ctx.take()).expect("a claimed settlement coin decodes");
+        // The 1_000 leaves to the payee (a change/recipient split the key-aware signer resolves);
+        // per-asset value conserves (input 1_000 == output 1_000), and nothing is a protocol sink.
+        assert!(effect.protocol_sink.is_empty());
+        let payout: u64 = effect
+            .recipients
+            .iter()
+            .chain(&effect.change)
+            .map(|o| o.amount)
+            .sum();
+        assert_eq!(payout, 1_000);
+    }
+
+    /// #1708 + #1511: value conservation stays TOTAL arithmetic when a `protocol_sink` leg is present.
+    /// A settlement egress of `u64::MAX` plus a `1_001` change wraps to `1_000` (== the input) under a
+    /// modulo accumulator — so the wrapping implementation would report a `protocol_sink`-inclusive
+    /// conservation as balanced on a spend moving more than `u64::MAX`. Must be refused; the control
+    /// (truthful amounts) is accepted.
+    #[test]
+    fn protocol_sink_inclusive_conservation_that_wraps_is_refused_1511() {
+        let ph = wallet_ph();
+        let err = analyze(&standard_spend(
+            wallet_coin(1_000, 1),
+            Conditions::new()
+                .create_coin(settlement_ph(), u64::MAX, Memos::None)
+                .create_coin(ph, 1_001, Memos::None)
+                .assert_concurrent_spend(Bytes32::new([0x44; 32])),
+        ))
+        .expect_err("a protocol-sink-inclusive spend past u64::MAX must be refused");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+        assert!(
+            err.message.contains("cannot be totalled"),
+            "got: {}",
+            err.message
+        );
+
+        // Control: truthful amounts (600 to settlement + 400 change) conserve and are accepted.
+        let effect = analyze(&standard_spend(
+            wallet_coin(1_000, 1),
+            Conditions::new()
+                .create_coin(settlement_ph(), 600, Memos::None)
+                .create_coin(ph, 400, Memos::None)
+                .assert_concurrent_spend(Bytes32::new([0x44; 32])),
+        ))
+        .expect("truthful protocol-sink-inclusive amounts conserve");
+        assert_eq!(effect.protocol_sink[0].amount, 600);
+        assert_eq!(effect.change[0].amount, 400);
+    }
+
+    /// The `protocol_sink` recognizer accepts exactly the canonical settlement hash.
+    #[test]
+    fn only_the_settlement_hash_is_a_protocol_sink() {
+        assert!(is_protocol_sink_hash(settlement_ph()));
+        assert!(!is_protocol_sink_hash(Bytes32::new([0x00; 32])));
+        assert!(!is_protocol_sink_hash(wallet_ph()));
     }
 }

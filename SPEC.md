@@ -368,10 +368,24 @@ Used by dig-app. The subscriber + identity provider + signer.
   launder a blank-check signature for another coin through a benign carrier), or a wrong-hash
   `AGG_SIG_ME` are each refused (#1519). `derive_summary(&[CoinSpend]) -> TransactionSummary`
   wraps it for display; `summarize(&SpendEffect) -> TransactionSummary` is the shared renderer both it
-  and the signer's key-aware summary use. The standard-XCH-send, CAT-send, and $DIG-**tip** classes
-  the engine builds are decodable (a tip is a single-key CAT payment through the same `Cat::parse`
-  path, #1511); any coin spend that cannot be FULLY accounted for (a foreign puzzle, undecodable
-  bytes, a value leak/mint) is refused fail-closed with `WalletErrorCode::SpendValidationFailed`.
+  and the signer's key-aware summary use. The standard-XCH-send, CAT-send, $DIG-**tip**, and the three
+  **offer** shapes (make / take / cancel) the engine builds are decodable (a tip is a single-key CAT
+  payment through the same `Cat::parse` path, #1511 PR-A; offers commit value to the canonical
+  settlement puzzle, #1511 PR-B — see below); any coin spend that cannot be FULLY accounted for (a
+  foreign puzzle, undecodable bytes, a value leak/mint, a "settlement" output to a non-canonical hash)
+  is refused fail-closed with `WalletErrorCode::SpendValidationFailed`.
+- **Settlement / `protocol_sink` (offers, #1511 PR-B).** `SpendEffect` carries a THIRD output bucket
+  `protocol_sink`: value the wallet intentionally commits to a consensus-enforced canonical STRUCTURAL
+  puzzle — today exactly the offer settlement-payments puzzle (`SETTLEMENT_PAYMENT_HASH`). A
+  `CREATE_COIN` routes to `protocol_sink` ONLY when its destination is that canonical hash
+  (`is_protocol_sink_hash`), never a free address, so an attacker address can never be laundered as a
+  "sink". Value conservation generalizes to `in == recipients + change + protocol_sink + fee` (still
+  TOTAL arithmetic — never wrapping). A wallet coin that spends into settlement MUST also carry an
+  offer-binding assertion (announcement/concurrency), or it is refused as give-it-away-for-nothing
+  (MR-6). Settlement-layer coins the wallet CLAIMS (take/cancel) are decoded through `SettlementLayer`
+  (which gates on `SETTLEMENT_PAYMENT_HASH`); they carry NO signature (claimed by announcement), so
+  their `AGG_SIG_ME`/quote-form guards are skipped and their notarized payments are accounted as
+  outputs — a cancel is an ordinary standard/CAT reclaim and decodes with no settlement leg.
   Splitting outputs into recipients vs change is inherently KEY-RELATIVE: `analyze` makes a key-free
   best-effort split on memo-hinting, but `dig-cat` (so every tip) memo-hints its change coin too, so
   the AUTHORITATIVE split is the key-aware one in `LocalSigner` (below) — the signer's gate never
@@ -430,10 +444,17 @@ Used by dig-app. The subscriber + identity provider + signer.
      carry EXACTLY ONE `AGG_SIG_ME`, committing to `sha256tree(delegated_puzzle)` — the message the
      re-derived outputs come from. Zero, duplicate, or wrong-hash `AGG_SIG_ME` is refused, so no
      extra signature can be laundered and the signed message provably matches the reviewed outputs.
-  - **Signing scope (fail-closed).** `sign_unsigned` signs the standard-XCH-send, CAT-send, and
-    $DIG-tip (#1511) classes `client::verify` can decode. An offer (settlement) or option
-    `UnsignedSpend` routed through it is refused (`SpendValidationFailed`) until its verify decoder
-    lands.
+  7. **Settlement `protocol_sink` gate (offers, #1511 PR-B).** Before signing, every re-derived
+     `protocol_sink` output MUST commit to a recognized canonical structural hash
+     (`is_protocol_sink_hash`); the reviewed summary is matched in two parts — recipients by address +
+     amount + asset, and settlement sinks by amount + asset only (their destination is the fixed
+     settlement puzzle, so the offer builders leave the address blank and it is NOT compared).
+     Zero-value settlement outputs are announcement carriers and are excluded from the reviewed egress.
+     Settlement-layer coins the wallet claims carry no signature and are re-derived, never signed.
+  - **Signing scope (fail-closed).** `sign_unsigned` signs the standard-XCH-send, CAT-send, $DIG-tip
+    (#1511 PR-A), and the three offer shapes make / take / cancel (#1511 PR-B) classes `client::verify`
+    can decode. A covered-option `UnsignedSpend` routed through it is refused (`SpendValidationFailed`)
+    until its verify decoder lands.
 - **`client::identity::IdentityProvider`** — `active_identity()`, `tracked_public_keys()`. Supplies the
   engine public material only. `HdIdentity` additionally exposes `identity_public_key_bytes()` (the
   48-byte G1 identity key published to slot `0x0010`) and `decap(peer_g1)` (the dig-message recipient
