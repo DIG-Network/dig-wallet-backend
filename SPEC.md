@@ -275,8 +275,9 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   coupling and the transfer/melt condition shapes. A future SDK/puzzle bump MUST re-verify that coupling
   (re-run the reasoning against the new `option_contract.rs` `test_incomplete_exercise` /
   `test_transfer_option`) before relying on transfer being the only signable action.
-- **Transfer + exercise are wired over `dig-options` v0.2.0** — `build_transfer_option` composes
-  `dig_options::transfer`; `build_exercise_option` composes `dig_options::exercise`. Both are
+- **Transfer is signed over `dig-options` v0.3.0**; **exercise is built but refused unsigned.** `build_transfer_option` composes
+  `dig_options::transfer` (the only signable action); `build_exercise_option` composes
+  `dig_options::exercise` (built for raw external settlement, never signed by the client wallet). Both are
   key-free and network-free: the engine cannot fetch an option's live singleton or recover a
   `dig_options::CreatedOption`, so the CLIENT supplies the option's current on-chain state.
 - **The on-chain-projection contract (`OptionOnChainState`).** `TransferOptionRequest` and
@@ -491,12 +492,23 @@ Used by dig-app. The subscriber + identity provider + signer.
      owner; a re-home to a structural launcher/settlement hash is refused (**MR-12**, unauthorized
      re-home). Option (transfer) bundles use IMPLICIT-fee conservation (`fee = in − out`; the builders
      emit no `RESERVE_FEE`, and the 1-mojo singleton flows through to the re-homed coin). An **exercise**
-     is REFUSED fail-closed (deferred #2245): `analyze` detects its `P2OneOfManyLayer` underlying leg and
-     rejects the bundle before any signature. The exercise unlocks the underlying onto a bare
-     anyone-can-claim settlement coin, and consensus forces only the STRIKE payment to the creator — NOT
-     the unlocked underlying back to the holder. An in-bundle-presence guard is insufficient (a compromised
-     engine can strip the reclaim leg after the wallet signs the strike-funding coin), so exercise cannot
-     be safely signable until a `dig-options` puzzle change binds the reclaim to the holder in consensus.
+     is REFUSED fail-closed (deferred #2245) by the SIGNATURE SOURCE, resting on a consensus invariant
+     (message ⟺ melt coupling): unlocking an option's underlying requires a mode-23 `SEND_MESSAGE`/
+     `RECEIVE_MESSAGE` pairing coupled INSEPARABLY to the singleton MELT by the `OPTION_CONTRACT` puzzle —
+     consensus rejects both a message without a melt AND a melt without a message, so "some other singleton
+     spend unlocks the underlying" is consensus-impossible; the residual risk is only that the wallet is
+     tricked into SIGNING the melting/message-bearing delegated puzzle. `client::verify` closes that with
+     two gates: (1) **Non-re-home refusal (fail-closed at the source)** — an option-singleton spend whose
+     inner conditions do NOT re-home (no odd-amount `CREATE_COIN`) — a melt/exercise/clawback — is REFUSED,
+     REGARDLESS of whether the `P2OneOfManyLayer` underlying leg is present in the bundle, denying the
+     signature on the melt+message leg even when the leg is stripped; (2) **Transfer default-DENY allowlist**
+     — a transfer's delegated puzzle may emit ONLY the single re-home `CREATE_COIN`, its sole `AGG_SIG_ME`,
+     and benign assertions, refusing any `SEND_MESSAGE`/`MELT`/announcement-creation/unknown opcodes.
+     The `P2OneOfManyLayer` underlying leg is ALSO refused directly (defense in depth). `build_exercise_option`
+     still BUILDS a valid, broadcastable exercise (a raw external key-holder can settle it), and the
+     dependency-guard conformance test still pins that the bundle carries the underlying-claim leg — but the
+     CLIENT WALLET will not sign it until a `dig-options` puzzle change binds the reclaim to the holder in
+     consensus (tracked in #2245).
   - **Signing scope (fail-closed).** `sign_unsigned` signs the standard-XCH-send, CAT-send, $DIG-tip
     (#1511 PR-A), the three offer shapes make / take / cancel (#1511 PR-B), and the covered-option
     **transfer** (#1511 PR-C) classes `client::verify` can decode. Two covered-option actions routed
