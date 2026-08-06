@@ -7,14 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.18.0] - 2026-08-06
 
 ### Features
-- **signer:** Sign $DIG tips through `LocalSigner::sign_unsigned` without becoming a signing oracle
-  (#1511). A tip is a single-key CAT payment that decodes through the existing `Cat::parse` verify
-  path; the custody core now splits a spend's outputs by KEY OWNERSHIP (`reviewable_summary`) so a
-  tip's memo-hinted change is not mistaken for a second recipient, while any non-owned output still
-  must be a declared recipient in the reviewed summary (no silent exfiltration). Adds a
-  simulator-backed golden harness that builds a real tip, signs it end-to-end, and validates the
-  bundle on-chain, plus fail-closed negatives (multi-recipient masquerade, change to a foreign
-  puzzle hash).
+- **client:** Sign tips spends via ownership-based recipient/change classification (#1511 PR-A)
 
 ## [0.17.0] - 2026-08-05
 
