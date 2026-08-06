@@ -10,17 +10,40 @@
 //! # Fail-closed
 //! The decodable spend classes are the standard-layer XCH send, the CAT send, the $DIG **tip**
 //! (a single-key CAT payment — recipient + change, no separate XCH fee — that flows through the SAME
-//! [`Cat::parse`] path), and the three **offer** shapes (make / take / cancel), whose value the wallet
-//! commits to the consensus-enforced **settlement-payments** puzzle (#1511 PR-B). A settlement output
-//! is accounted into a THIRD bucket, [`SpendEffect::protocol_sink`] — value intentionally handed to a
-//! recognized canonical structural puzzle, not to a free address — so an attacker address can never be
-//! laundered as a "sink". Settlement-layer coins the wallet CLAIMS (take/cancel) are decoded through
-//! [`SettlementLayer`] and carry NO signature (claimed by announcement), so they skip the
-//! wallet-signed-coin guards; only the wallet's own standard/CAT coins are signed. Any coin spend the
-//! drivers cannot fully parse+account for — a foreign puzzle, a value leak, a minted CAT, a "settlement"
-//! output to a non-canonical hash — yields [`WalletErrorCode::SpendValidationFailed`]; the signer
-//! refuses to sign it. (Covered-**option** spends reaching the signer are still refused here until
-//! their decoder lands — that is intended.)
+//! [`Cat::parse`] path), the three **offer** shapes (make / take / cancel), whose value the wallet
+//! commits to the consensus-enforced **settlement-payments** puzzle (#1511 PR-B), and the covered-option
+//! **transfer** (#1511 PR-C — see below). A settlement output is accounted into a THIRD
+//! bucket, [`SpendEffect::protocol_sink`] — value intentionally handed to a recognized canonical
+//! structural puzzle, not to a free address — so an attacker address can never be laundered as a "sink".
+//! Settlement-layer coins the wallet CLAIMS (take/cancel) are decoded through [`SettlementLayer`]
+//! and carry NO signature (claimed by announcement), so they skip the wallet-signed-coin guards; only the
+//! wallet's own standard/CAT coins (and an option singleton's inner standard layer) are signed. Any coin
+//! spend the drivers cannot fully parse+account for — a foreign puzzle, a value leak, a minted CAT, a
+//! "settlement" output to a non-canonical hash — yields [`WalletErrorCode::SpendValidationFailed`]; the
+//! signer refuses to sign it. Covered-option **mint** and **exercise** reaching the signer are refused —
+//! that is intended (see below).
+//!
+//! # Covered options — transfer signs; exercise + mint refused (#1511 PR-C)
+//! An option spend is decoded ONLY through chia-wallet-sdk drivers ([`OptionContract`],
+//! [`P2OneOfManyLayer`], [`SettlementLayer`]), never bespoke CLVM:
+//! - **transfer** (SUPPORTED) re-homes the option singleton: [`OptionContract::parse`] reaches the
+//!   current owner's inner standard layer (the sole signed `AGG_SIG_ME`), which emits an odd-amount
+//!   `CREATE_COIN` re-homing the singleton to the new owner (a recipient the human reviews). Transfer
+//!   touches only the inner standard layer, so it is safely signable. Option bundles use IMPLICIT-fee
+//!   conservation (the option builders emit no `RESERVE_FEE`, and the 1-mojo singleton flows through to
+//!   the re-homed coin).
+//! - **exercise** (REFUSED, deferred #2245) unlocks the locked underlying by melting the option
+//!   singleton and emitting the mode-23 (`0x17`) exercise `SEND_MESSAGE`. Consensus couples that message
+//!   inseparably to the singleton MELT (SDK `option_contract.rs::test_incomplete_exercise` proves
+//!   message-without-melt AND melt-without-message both reject), so "some other spend unlocks the
+//!   underlying" is impossible on chain; the ONLY residual risk is the wallet being tricked into SIGNING
+//!   the melting/message-bearing leg. [`analyze`] closes that at the signature source: an option-singleton
+//!   spend that does NOT re-home (a melt/exercise or clawback) is refused fail-closed REGARDLESS of
+//!   whether the [`P2OneOfManyLayer`] underlying leg is present (defeating the strip-the-leg attack), and
+//!   a transfer's delegated puzzle is held to a default-deny allowlist that admits no `SEND_MESSAGE`. The
+//!   [`P2OneOfManyLayer`] leg is ALSO refused directly (defense in depth). Exercise stays unsignable until
+//!   a dig-options puzzle change binds the underlying reclaim to the holder in consensus.
+//! - **mint** (REFUSED, deferred #2243) — its cross-seam summary decode is not yet wired.
 //!
 //! # Recipients vs change is key-relative
 //! Splitting a spend's outputs into recipients (value leaving) and change (value returning home) is
@@ -35,8 +58,10 @@ use std::collections::BTreeMap;
 
 use chia_protocol::{Bytes32, CoinSpend};
 use chia_puzzle_types::Memos;
-use chia_wallet_sdk::driver::{Cat, Layer, Puzzle, SettlementLayer, StandardLayer};
-use chia_wallet_sdk::puzzles::SETTLEMENT_PAYMENT_HASH;
+use chia_wallet_sdk::driver::{
+    Cat, Layer, OptionContract, P2OneOfManyLayer, Puzzle, SettlementLayer, StandardLayer,
+};
+use chia_wallet_sdk::puzzles::{SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH};
 use chia_wallet_sdk::types::{run_puzzle, Condition};
 use chia_wallet_sdk::utils::Address as Bech32Address;
 use clvm_traits::FromClvm;
@@ -68,31 +93,42 @@ pub struct DecodedOutput {
 /// a consensus-enforced canonical structural puzzle (the offer **settlement** puzzle, #1511 PR-B).
 /// The signer requires every change output to be wallet-owned and every `protocol_sink` output to be a
 /// recognized canonical structural hash, so no value can silently leave the wallet to a free address.
+///
+/// `#[non_exhaustive]` (ref #2242): the bucket set grows as new spend classes are decoded, so
+/// downstream matches must not assume a fixed field set.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SpendEffect {
     /// The hinted outputs (payments to counterparties).
     pub recipients: Vec<DecodedOutput>,
     /// The un-hinted outputs (change back to the spender).
     pub change: Vec<DecodedOutput>,
     /// Outputs the wallet intentionally commits to a consensus-enforced canonical structural puzzle —
-    /// today exactly the offer settlement-payments puzzle ([`SETTLEMENT_PAYMENT_HASH`]). This is the
-    /// sanctioned egress of the offered/paid assets in a make/take: value leaves the wallet, but to a
-    /// structure the protocol enforces, never to a chosen address. Every entry's `puzzle_hash` is a
-    /// recognized canonical structural hash by construction (see [`is_protocol_sink_hash`]).
+    /// the offer settlement-payments puzzle ([`SETTLEMENT_PAYMENT_HASH`]) or the singleton launcher
+    /// ([`SINGLETON_LAUNCHER_HASH`]). This is the sanctioned egress of offered/paid assets:
+    /// value leaves the wallet, but to a structure the protocol enforces, never to a chosen address.
+    /// Every entry's `puzzle_hash` is a recognized canonical structural hash by construction (see
+    /// [`is_protocol_sink_hash`]).
     pub protocol_sink: Vec<DecodedOutput>,
-    /// The farmer fee (XCH mojos), summed from the spend's `RESERVE_FEE` conditions.
+    /// The farmer fee (XCH mojos). For strict (XCH/CAT/offer) spends, summed from `RESERVE_FEE`
+    /// conditions; for an OPTION (transfer) bundle, the IMPLICIT fee `inputs − outputs` (the option
+    /// builders emit no `RESERVE_FEE`).
     pub fee: u64,
 }
 
 /// True when `puzzle_hash` is a recognized canonical STRUCTURAL puzzle hash the wallet may commit
-/// value to as a [`SpendEffect::protocol_sink`] — today exactly the immutable Chia offer
-/// settlement-payments puzzle ([`SETTLEMENT_PAYMENT_HASH`]).
+/// value to as a [`SpendEffect::protocol_sink`] — the immutable Chia offer settlement-payments puzzle
+/// ([`SETTLEMENT_PAYMENT_HASH`]) or the singleton launcher ([`SINGLETON_LAUNCHER_HASH`], the fixed
+/// structural puzzle every singleton — incl. an option — is minted through, #1511 PR-C).
 ///
-/// This is the allow-list that stops value exfiltration masquerading as an offer: a `CREATE_COIN`
+/// This is the allow-list that stops value exfiltration masquerading as an offer/option: a `CREATE_COIN`
 /// routes to `protocol_sink` ONLY when its destination is one of these fixed protocol structures, so a
 /// coin created to an attacker's address can never be laundered as a benign "sink" (threat MR-3/MR-5).
+/// The per-option locked-underlying puzzle hash is deliberately NOT recognized here — it is not a fixed
+/// constant and is not re-derivable from coin spends alone (that is the option-mint decode gap, #2243).
 pub fn is_protocol_sink_hash(puzzle_hash: Bytes32) -> bool {
     puzzle_hash == Bytes32::new(SETTLEMENT_PAYMENT_HASH)
+        || puzzle_hash == Bytes32::new(SINGLETON_LAUNCHER_HASH)
 }
 
 /// Re-derive the value flow of `coin_spends` from the coin spends alone, fail-closed.
@@ -117,6 +153,14 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     let mut xch_out: u64 = 0;
     let mut cat_in: BTreeMap<Bytes32, u64> = BTreeMap::new();
     let mut cat_out: BTreeMap<Bytes32, u64> = BTreeMap::new();
+
+    // OPTION MODE is gated on the presence of an option-layer coin. For a signable option action that
+    // means a TRANSFER's singleton ([`OptionContract`]); an EXERCISE bundle (its [`P2OneOfManyLayer`]
+    // underlying leg) is detected here too but refused fail-closed in the loop below before conservation
+    // runs. It selects IMPLICIT-fee conservation: the option builders emit no `RESERVE_FEE` and the
+    // 1-mojo singleton flows through to the re-homed coin, so `in − out` IS the fee. The strict
+    // XCH/CAT/offer path is byte-unchanged when this is false.
+    let option_mode = is_option_bundle(&mut allocator, coin_spends)?;
 
     for spend in coin_spends {
         let puzzle_ptr = node_from_bytes(&mut allocator, &spend.puzzle_reveal)
@@ -223,6 +267,120 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             continue;
         }
 
+        // An OPTION SINGLETON spend (#1511 PR-C): the option contract is a singleton wrapping the current
+        // owner's inner standard layer (the sole signed coin). Decode via `OptionContract::parse` to reach
+        // that inner p2 and enforce the sole-AGG_SIG_ME commitment exactly as a standard/CAT send. ONLY a
+        // re-homing TRANSFER (an odd-amount `CREATE_COIN` to the new owner) is signable; a spend that does
+        // NOT re-home — a melt/exercise (mode-23 `SEND_MESSAGE` + `MeltSingleton`) or a clawback — is
+        // refused fail-closed below, at the signature source, so the wallet never signs the leg that
+        // unlocks the option underlying (Case-A guard, #1511 PR-C).
+        if let Some((_option, inner_puzzle, inner_solution)) =
+            OptionContract::parse(&allocator, spend.coin, puzzle, solution_ptr)
+                .map_err(|e| reject(format!("malformed option singleton spend: {e:?}")))?
+        {
+            if StandardLayer::parse_puzzle(&allocator, inner_puzzle)
+                .map_err(|e| reject(format!("malformed option inner puzzle: {e:?}")))?
+                .is_none()
+            {
+                return Err(reject(
+                    "option singleton inner puzzle is not a standard layer; refusing to sign",
+                ));
+            }
+            let committed_message = committed_delegated_puzzle_message(&allocator, inner_solution)?;
+            let conditions = run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)?;
+            enforce_sole_agg_sig_me(&conditions, committed_message)?;
+
+            let re_homes = conditions
+                .iter()
+                .filter_map(Condition::as_create_coin)
+                .any(|create| create.amount % 2 == 1);
+            if !re_homes {
+                // NOT a re-home: this option-singleton spend melts/exercises the singleton (a
+                // `melt_singleton` — the magic `CREATE_COIN(_, -113)` decoded as `Condition::MeltSingleton`,
+                // never as an odd-amount value `CREATE_COIN`) and/or carries the mode-23 exercise
+                // `SEND_MESSAGE`, or is a clawback. NONE of these is a signable action in PR-C: only a
+                // re-homing TRANSFER is. Refuse fail-closed HERE, at the signature source, REGARDLESS of
+                // whether the P2OneOfMany underlying leg is present in the bundle — so the strip-the-leg
+                // attack (omit the underlying leg to dodge the `P2OneOfManyLayer` refusal below) cannot
+                // obtain the wallet's signature on the melt+message spend that unlocks the underlying.
+                // (A plain transfer decodes an odd-amount `CREATE_COIN(amount = 1)` and takes the
+                // re-home branch above, so it is unaffected.)
+                return Err(reject(
+                    "option singleton spend does not re-home (melt/exercise or clawback); only a \
+                     re-homing TRANSFER is signable; refusing to sign",
+                ));
+            }
+
+            // TRANSFER: the singleton's 1 mojo flows through to the re-homed coin — count both.
+            xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
+            let mut create_coins = 0usize;
+            for condition in &conditions {
+                reject_unexpected_agg_sig(condition)?;
+                // Default-DENY allowlist: a transfer's delegated puzzle may emit ONLY the re-home
+                // `CREATE_COIN`, its sole `AGG_SIG_ME`, and benign assertions. Any other condition — a
+                // mode-23 exercise `SEND_MESSAGE`/`RECEIVE_MESSAGE`, a `MeltSingleton`, an announcement
+                // CREATE, or an unknown opcode — is refused, so a transfer signature can never carry the
+                // exercise message even in a mixed spend.
+                reject_non_transfer_condition(condition)?;
+                if let Some(create) = condition.as_create_coin() {
+                    // Exactly one value-bearing `CREATE_COIN` (the re-home) is permitted; a second is an
+                    // undisclosed extra egress riding the transfer.
+                    create_coins += 1;
+                    if create_coins > 1 {
+                        return Err(reject(
+                            "option transfer emits more than one CREATE_COIN (undisclosed extra \
+                             egress); refusing to sign",
+                        ));
+                    }
+                    // MR-12: the re-homed singleton must go to the new owner's p2 (a chosen address
+                    // the human reviews via the summary), NEVER to a structural launcher/settlement
+                    // hash the option layer did not authorize — that would be an unauthorized re-home
+                    // laundered as a protocol sink. The sole-AGG_SIG_ME commitment already binds the
+                    // destination to the holder's signature; this refuses the structural-hash case.
+                    if is_protocol_sink_hash(create.puzzle_hash) {
+                        return Err(reject(
+                            "option transfer re-homes the singleton to a structural puzzle hash \
+                             (unauthorized re-home); refusing to sign",
+                        ));
+                    }
+                    xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
+                    route_output(
+                        &mut recipients,
+                        &mut change,
+                        &mut protocol_sink,
+                        DecodedOutput {
+                            puzzle_hash: create.puzzle_hash,
+                            amount: create.amount,
+                            asset_id: None,
+                        },
+                        &create.memos,
+                    );
+                }
+            }
+            continue;
+        }
+
+        // An option EXERCISE's locked-underlying coin — a `P2OneOfMany` 1-of-2 (exercise/clawback)
+        // puzzle. Its presence UNAMBIGUOUSLY marks the bundle as an exercise (a transfer never spends
+        // it), and exercise is REFUSED fail-closed: the exercise path unlocks the underlying onto a bare
+        // `SETTLEMENT_PAYMENT_HASH` coin, and consensus forces only the STRIKE payment to the creator —
+        // NOT the unlocked underlying back to the holder. That reclaim leg is builder-enforced only, so a
+        // compromised engine could strip it AFTER the wallet signs the strike-funding coin: the wallet
+        // pays the strike while an attacker sweeps the underlying. Exercise cannot be safely
+        // `LocalSigner`-signable until a dig-options puzzle change binds the reclaim to the holder in
+        // consensus (deferred to #2245). Transfer, which only touches the inner standard layer, is
+        // unaffected and still signs.
+        if P2OneOfManyLayer::parse_puzzle(&allocator, puzzle)
+            .map_err(|e| reject(format!("malformed option underlying spend: {e:?}")))?
+            .is_some()
+        {
+            return Err(reject(
+                "option exercise is not signable: the unlocked underlying's reclaim to the holder is \
+                 not consensus-forced, so a compromised engine could strip it after the wallet funds \
+                 the strike (deferred to #2245); refusing to sign",
+            ));
+        }
+
         // A standard-layer XCH coin: its run conditions carry the XCH outputs + the fee.
         if StandardLayer::parse_puzzle(&allocator, puzzle)
             .map_err(|e| reject(format!("malformed standard spend: {e:?}")))?
@@ -232,7 +390,15 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
             let conditions = run_conditions(&mut allocator, puzzle_ptr, solution_ptr)?;
             enforce_sole_agg_sig_me(&conditions, committed_message)?;
-            enforce_settlement_binding(&conditions)?;
+            // In an option TRANSFER a standard-layer XCH coin only ever appears as the OPTIONAL farmer-fee
+            // coin the engine links to the singleton via `assert_concurrent_spend` (transfer itself takes
+            // no fee). It legitimately commits no value to the settlement puzzle, so MR-6's
+            // give-it-away-for-nothing binding does not apply — skip it in option mode. Only the strict
+            // offer path requires MR-6. (Exercise never reaches here: its option-singleton melt/message
+            // leg is refused fail-closed above, at the signature source.)
+            if !option_mode {
+                enforce_settlement_binding(&conditions)?;
+            }
             for condition in &conditions {
                 reject_unexpected_agg_sig(condition)?;
                 if let Some(reserve) = condition.as_reserve_fee() {
@@ -267,36 +433,51 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
             let conditions = run_conditions(&mut allocator, puzzle_ptr, solution_ptr)?;
             reject_any_agg_sig(&conditions)?;
-            for create in conditions.iter().filter_map(Condition::as_create_coin) {
-                xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
-                route_output(
-                    &mut recipients,
-                    &mut change,
-                    &mut protocol_sink,
-                    DecodedOutput {
-                        puzzle_hash: create.puzzle_hash,
-                        amount: create.amount,
-                        asset_id: None,
-                    },
-                    &create.memos,
-                );
+            for condition in &conditions {
+                if let Some(create) = condition.as_create_coin() {
+                    xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
+                    route_output(
+                        &mut recipients,
+                        &mut change,
+                        &mut protocol_sink,
+                        DecodedOutput {
+                            puzzle_hash: create.puzzle_hash,
+                            amount: create.amount,
+                            asset_id: None,
+                        },
+                        &create.memos,
+                    );
+                }
             }
             continue;
         }
 
         return Err(reject(
-            "coin spend is neither a standard-layer XCH, a CAT, nor a settlement spend; refusing to \
-             sign",
+            "coin spend is not a standard-layer XCH, a CAT, an option, nor a settlement spend; \
+             refusing to sign",
         ));
     }
 
-    // Value must conserve per asset, or the spend leaks/mints value.
-    let xch_out_plus_fee = accumulate(xch_out, fee, "XCH output + fee total")?;
-    if xch_in != xch_out_plus_fee {
-        return Err(reject(format!(
-            "XCH value not conserved: in {xch_in} != out+fee {xch_out_plus_fee}"
-        )));
-    }
+    // XCH value conservation. Two modes:
+    // - STRICT (XCH/CAT/offer, byte-unchanged): `in == out + reserve_fee`, a leak/mint is refused.
+    // - OPTION (transfer): the builders emit no `RESERVE_FEE`, so the network-absorbed excess `in − out`
+    //   IS the implicit fee. `out > in` (a mint) is still refused (checked_sub). The implicit fee is
+    //   compared to the reviewed `summary.fee` by the signer (an MR-11-style implicit-fee guard).
+    let effective_fee = if option_mode {
+        xch_in.checked_sub(xch_out).ok_or_else(|| {
+            reject(format!(
+                "option spend mints value: outputs {xch_out} exceed inputs {xch_in}"
+            ))
+        })?
+    } else {
+        let xch_out_plus_fee = accumulate(xch_out, fee, "XCH output + fee total")?;
+        if xch_in != xch_out_plus_fee {
+            return Err(reject(format!(
+                "XCH value not conserved: in {xch_in} != out+fee {xch_out_plus_fee}"
+            )));
+        }
+        fee
+    };
     // Conservation is checked in BOTH directions over the union of assets seen as inputs or outputs:
     // an output whose asset was never an input is a mint from thin air; an input asset with no (or a
     // smaller) matching output is a melt/leak. Iterating only one side would miss the other.
@@ -315,8 +496,36 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
         recipients,
         change,
         protocol_sink,
-        fee,
+        fee: effective_fee,
     })
+}
+
+/// True when `coin_spends` contain an option-layer coin — an option singleton ([`OptionContract`]) or a
+/// locked-underlying 1-of-2 ([`P2OneOfManyLayer`]) — so [`analyze`] should use option-mode conservation.
+///
+/// This is a read-only pre-scan: a coin whose bytes don't parse (or don't parse as an option layer) is
+/// simply not an option coin here; the main [`analyze`] loop re-parses every coin and fails closed on
+/// anything it cannot fully account for, so a parse quirk in this scan can never let a spend through.
+fn is_option_bundle(allocator: &mut Allocator, coin_spends: &[CoinSpend]) -> WalletResult<bool> {
+    for spend in coin_spends {
+        let Ok(puzzle_ptr) = node_from_bytes(allocator, &spend.puzzle_reveal) else {
+            continue;
+        };
+        let Ok(solution_ptr) = node_from_bytes(allocator, &spend.solution) else {
+            continue;
+        };
+        let puzzle = Puzzle::parse(allocator, puzzle_ptr);
+        if matches!(
+            OptionContract::parse(allocator, spend.coin, puzzle, solution_ptr),
+            Ok(Some(_))
+        ) || matches!(
+            P2OneOfManyLayer::parse_puzzle(allocator, puzzle),
+            Ok(Some(_))
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Re-derive the human-facing [`TransactionSummary`] from `coin_spends` alone — the authoritative
@@ -582,6 +791,57 @@ fn reject_unexpected_agg_sig(condition: &Condition) -> WalletResult<()> {
     if forbidden {
         return Err(reject(
             "unexpected non-AGG_SIG_ME signature condition in a send spend (refusing to sign)",
+        ));
+    }
+    Ok(())
+}
+
+/// Default-DENY allowlist for an option TRANSFER's delegated-puzzle conditions (Case-A guard, #1511
+/// PR-C). A transfer is signable precisely because it touches only the inner standard layer to
+/// RE-HOME the singleton; the only conditions a legitimate transfer emits are the re-home
+/// `CREATE_COIN`, its sole `AGG_SIG_ME`, and benign timelock/announcement/self assertions.
+///
+/// This is fail-CLOSED by construction — an UNRECOGNIZED opcode is REFUSED, not waved through — so a
+/// future/unknown condition cannot smuggle unsignable behaviour into a transfer. In particular it
+/// refuses the mode-23 exercise `SEND_MESSAGE`/`RECEIVE_MESSAGE` (which, paired with the singleton
+/// MELT, is what unlocks the option underlying — SDK `option_contract.rs::test_incomplete_exercise`
+/// proves the message ⟺ melt coupling is consensus-enforced), the `MeltSingleton`, and any
+/// `CREATE_COIN_ANNOUNCEMENT`/`CREATE_PUZZLE_ANNOUNCEMENT`. Thus a transfer signature can never carry
+/// the exercise message even inside a mixed spend. (`CreateCoin` + `AggSigMe` are permitted here and
+/// accounted/enforced by the caller — the single-re-home count + sole-AGG_SIG_ME checks.)
+fn reject_non_transfer_condition(condition: &Condition) -> WalletResult<()> {
+    let permitted = matches!(
+        condition,
+        // The re-home output + its authorizing signature — accounted by the caller.
+        Condition::CreateCoin(_)
+            | Condition::AggSigMe(_)
+            // Benign timelock assertions.
+            | Condition::AssertSecondsAbsolute(_)
+            | Condition::AssertSecondsRelative(_)
+            | Condition::AssertHeightAbsolute(_)
+            | Condition::AssertHeightRelative(_)
+            | Condition::AssertBeforeSecondsAbsolute(_)
+            | Condition::AssertBeforeSecondsRelative(_)
+            | Condition::AssertBeforeHeightAbsolute(_)
+            | Condition::AssertBeforeHeightRelative(_)
+            // Benign announcement/concurrency ASSERTIONS (never the CREATE side).
+            | Condition::AssertCoinAnnouncement(_)
+            | Condition::AssertPuzzleAnnouncement(_)
+            | Condition::AssertConcurrentSpend(_)
+            | Condition::AssertConcurrentPuzzle(_)
+            // Benign self-introspection assertions.
+            | Condition::AssertMyCoinId(_)
+            | Condition::AssertMyParentId(_)
+            | Condition::AssertMyPuzzleHash(_)
+            | Condition::AssertMyAmount(_)
+            | Condition::AssertMyBirthSeconds(_)
+            | Condition::AssertMyBirthHeight(_)
+            | Condition::AssertEphemeral(_)
+    );
+    if !permitted {
+        return Err(reject(
+            "option transfer delegated puzzle emits a condition outside the transfer allowlist \
+             (exercise message, melt, announcement, or an unknown opcode); refusing to sign",
         ));
     }
     Ok(())
@@ -1186,10 +1446,14 @@ mod tests {
         assert_eq!(effect.change[0].amount, 400);
     }
 
-    /// The `protocol_sink` recognizer accepts exactly the canonical settlement hash.
+    /// The `protocol_sink` recognizer accepts exactly the canonical structural hashes — the settlement
+    /// puzzle and the singleton launcher (#1511 PR-C) — and nothing else (never a free/wallet address).
     #[test]
-    fn only_the_settlement_hash_is_a_protocol_sink() {
+    fn only_canonical_structural_hashes_are_protocol_sinks() {
         assert!(is_protocol_sink_hash(settlement_ph()));
+        assert!(is_protocol_sink_hash(Bytes32::new(
+            chia_wallet_sdk::puzzles::SINGLETON_LAUNCHER_HASH
+        )));
         assert!(!is_protocol_sink_hash(Bytes32::new([0x00; 32])));
         assert!(!is_protocol_sink_hash(wallet_ph()));
     }

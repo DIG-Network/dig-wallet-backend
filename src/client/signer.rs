@@ -409,11 +409,18 @@ impl LocalSigner {
 
     /// The custody core (SPEC §4). Signs the spend classes the engine builds and
     /// [`verify`](super::verify) can independently decode — a standard-layer XCH send, a CAT send, a
-    /// $DIG **tip** (a single-key CAT payment; #1511 PR-A), and the three **offer** shapes make / take
-    /// / cancel (#1511 PR-B), whose offered/paid assets are accounted as a settlement `protocol_sink`.
-    /// Settlement-layer coins the wallet claims carry no signature and skip the signed-coin guards. A
-    /// covered-**option** [`UnsignedSpend`] routed here is still refused fail-closed until its verify
-    /// decoder lands; that flow does not sign through `LocalSigner` today.
+    /// $DIG **tip** (a single-key CAT payment; #1511 PR-A), the three **offer** shapes make / take /
+    /// cancel (#1511 PR-B), and the covered-option **transfer** (#1511 PR-C), whose offered/paid assets
+    /// are accounted as a settlement `protocol_sink`. Settlement-layer coins the wallet claims carry no
+    /// signature and skip the signed-coin guards.
+    ///
+    /// Two option actions are REFUSED fail-closed and do NOT sign through `LocalSigner`: **mint** (its
+    /// cross-seam summary decode is deferred to #2243), and **exercise** — the exercising holder's
+    /// underlying-reclaim leg is NOT consensus-forced (`dig_options::exercise` lands the unlocked
+    /// underlying on a bare anyone-can-claim settlement coin with no reclaim binding), so a compromised
+    /// engine could strip it after the wallet funds the strike and sweep the underlying. Exercise cannot
+    /// be safely signable until a dig-options puzzle change binds the reclaim to the holder (deferred to
+    /// #2245). [`verify::analyze`] detects an exercise bundle (its locked-underlying leg) and refuses it.
     ///
     /// Fail-closed, in order: (1) independently verify the coin spends' value flow (#1058); (2)
     /// RE-DERIVE the authoritative required signatures FROM the verified coin spends — the
@@ -2599,5 +2606,290 @@ mod tests {
             signer.sign_unsigned(&honest).is_ok(),
             "the truthful control (settlement payment to a wallet-owned address) must sign",
         );
+    }
+
+    // ---- PR-C (#1511): covered-option TRANSFER signs through `LocalSigner`; EXERCISE + MINT refused ----
+    //
+    // An option transfer re-homes the singleton through the current owner's inner standard layer (the
+    // sole signed `AGG_SIG_ME`); `analyze` decodes it purely through chia-wallet-sdk drivers and the
+    // golden below builds a REAL transfer via the engine `OptionBuilder`, signs through
+    // `LocalSigner::sign_unsigned`, and settles on the simulator. EXERCISE and MINT are both REFUSED
+    // fail-closed: exercise's underlying-reclaim leg is not consensus-forced (deferred #2245), and
+    // mint's cross-seam decode is deferred (#2243).
+
+    #[cfg(feature = "engine")]
+    use crate::engine::build_options::OptionBuilder;
+
+    /// An `OptionBuilder` (the engine `SdkSpendBuilder`) over `party`'s simulator coins.
+    #[cfg(feature = "engine")]
+    fn option_builder(
+        party: &OfferParty,
+        xch: Vec<chia_protocol::Coin>,
+    ) -> crate::engine::build::SdkSpendBuilder {
+        use std::sync::Arc;
+        crate::engine::build::SdkSpendBuilder::new(
+            Arc::new(OfferInputs {
+                xch,
+                cats: vec![],
+                wallet_ph: party.wallet_ph,
+                pk: party.pk,
+            }),
+            Network::Simulator,
+            500,
+        )
+    }
+
+    /// Mint a real option (creator `creator_ph`, owner `owner_ph`) funded + signed by `party`, submit it
+    /// to `sim`, and return the retained handle + on-chain projection a client would later operate it
+    /// with — mirroring how a chain-reading client assembles them (see `tests/options_e2e.rs`).
+    #[cfg(feature = "engine")]
+    fn mint_option_on_sim(
+        sim: &mut chia_sdk_test::Simulator,
+        party: &OfferParty,
+        creator_ph: Bytes32,
+        owner_ph: Bytes32,
+        underlying: u64,
+        strike: u64,
+        expiry: u64,
+    ) -> (crate::types::OptionHandle, crate::types::OptionOnChainState) {
+        use crate::types::{
+            Amount, OptionHandle, OptionOnChainState, OptionStrike, Puzzlehash, WireCoin,
+        };
+        use chia_sdk_test::sign_transaction;
+        use chia_wallet_sdk::driver::SpendContext;
+        use dig_options::{create, OptionTerms, OptionType, Owner};
+
+        let funding = sim.new_coin(party.wallet_ph, underlying + 1);
+        let mut ctx = SpendContext::new();
+        let terms = OptionTerms {
+            creator_puzzle_hash: creator_ph,
+            owner_puzzle_hash: owner_ph,
+            underlying_amount: underlying,
+            strike_type: OptionType::Xch { amount: strike },
+            expiry_seconds: expiry,
+        };
+        let mint = create(&mut ctx, &Owner::Standard(party.pk), funding, &terms).unwrap();
+        let created = mint.created.clone().unwrap();
+        let sig = sign_transaction(&mint.coin_spends, std::slice::from_ref(&party.sk)).unwrap();
+        sim.new_transaction(chia_protocol::SpendBundle::new(
+            mint.coin_spends.clone(),
+            sig,
+        ))
+        .expect("mint settles on the simulator");
+
+        let wire = |c: &chia_protocol::Coin| WireCoin {
+            parent_coin_info: hex::encode(c.parent_coin_info),
+            puzzle_hash: hex::encode(c.puzzle_hash),
+            amount: c.amount,
+        };
+        let program_hex = |p: &chia_protocol::Program| hex::encode(Vec::<u8>::from(p.clone()));
+        let parent_id = created.option.coin.parent_coin_info;
+        let parent = mint
+            .coin_spends
+            .iter()
+            .find(|cs| cs.coin.coin_id() == parent_id)
+            .expect("the mint bundle contains the option child's parent spend");
+
+        let handle = OptionHandle {
+            launcher_id: hex::encode(created.option.info.launcher_id),
+            creator_puzzle_hash: Puzzlehash(hex::encode(creator_ph)),
+            owner_puzzle_hash: Puzzlehash(hex::encode(owner_ph)),
+            underlying_amount: Amount(underlying),
+            strike: OptionStrike::Xch {
+                amount: Amount(strike),
+            },
+            expiry_seconds: expiry,
+            underlying_coin_id: hex::encode(created.underlying_coin.coin_id()),
+            funding_coin_id: hex::encode(funding.coin_id()),
+        };
+        let on_chain = OptionOnChainState {
+            option_parent_coin: wire(&parent.coin),
+            option_parent_puzzle_reveal: program_hex(&parent.puzzle_reveal),
+            option_parent_solution: program_hex(&parent.solution),
+            underlying_coin: wire(&created.underlying_coin),
+        };
+        (handle, on_chain)
+    }
+
+    /// PR-C: option EXERCISE is REFUSED at the signer, fail-closed, producing ZERO signatures. Exercise
+    /// is not safely `LocalSigner`-signable: the exercising holder's underlying-reclaim leg is NOT
+    /// consensus-forced — `dig_options::exercise` lands the unlocked underlying on a bare
+    /// anyone-can-claim settlement coin with no reclaim binding — so a compromised engine could strip
+    /// that leg AFTER the wallet funds the strike-funding coin (the wallet pays the strike while an
+    /// attacker sweeps the underlying). It stays refused until a dig-options puzzle change binds the
+    /// reclaim to the holder (deferred to #2245). Mirrors `option_mint_is_still_refused`. The engine
+    /// still BUILDS a valid exercise (proving the refusal is the signer's deliberate policy, not a build
+    /// failure); `sign_unsigned` refuses it.
+    #[cfg(feature = "engine")]
+    #[tokio::test]
+    async fn option_exercise_is_refused() {
+        use crate::types::{Amount, ExerciseOptionRequest};
+
+        let mut sim = chia_sdk_test::Simulator::new();
+        let holder = offer_party("opt-exercise-refused");
+        let creator_ph = Bytes32::new([0xC1; 32]); // foreign creator (not the wallet)
+        let (underlying, strike) = (1_000u64, 250u64);
+        let (handle, on_chain) = mint_option_on_sim(
+            &mut sim,
+            &holder,
+            creator_ph,
+            holder.wallet_ph,
+            underlying,
+            strike,
+            10_000,
+        );
+
+        let strike_coin = sim.new_coin(holder.wallet_ph, strike);
+        let unsigned = option_builder(&holder, vec![strike_coin])
+            .build_exercise_option(ExerciseOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                fee: Amount(0),
+            })
+            .await
+            .expect("the engine still builds a valid exercise bundle");
+
+        let err = holder.signer.sign_unsigned(&unsigned).unwrap_err();
+        assert_eq!(
+            err.code,
+            WalletErrorCode::SpendValidationFailed,
+            "option exercise must be refused fail-closed at the signer (deferred #2245)",
+        );
+    }
+
+    /// PR-C GOLDEN: a covered-option TRANSFER re-homes the singleton through the owner's inner standard
+    /// layer, signs through `LocalSigner::sign_unsigned`, and settles on the simulator.
+    #[cfg(feature = "engine")]
+    #[tokio::test]
+    async fn golden_option_transfer_signs_and_settles() {
+        use crate::types::{Amount, Puzzlehash, TransferOptionRequest};
+
+        let mut sim = chia_sdk_test::Simulator::new();
+        let owner = offer_party("opt-transfer-owner");
+        let (handle, on_chain) = mint_option_on_sim(
+            &mut sim,
+            &owner,
+            owner.wallet_ph,
+            owner.wallet_ph,
+            1_000,
+            250,
+            10_000,
+        );
+        let destination = Bytes32::new([0x9a; 32]); // a new (foreign) owner
+
+        let unsigned = option_builder(&owner, vec![])
+            .build_transfer_option(TransferOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                to_puzzle_hash: Puzzlehash(hex::encode(destination)),
+                fee: Amount(0),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            same_summary(
+                &owner.signer.reviewable_summary(&unsigned.coin_spends).unwrap(),
+                &unsigned.summary,
+            ),
+            "the re-derived transfer summary must equal the builder's (re-homed singleton → new owner)",
+        );
+        let signed = owner
+            .signer
+            .sign_unsigned(&unsigned)
+            .expect("a genuine option transfer must sign through LocalSigner (#1511 PR-C)");
+        sim.new_transaction(signed.bundle)
+            .expect("the option transfer must be accepted by the simulator");
+    }
+
+    /// PR-C: option MINT stays REFUSED at the signer (its cross-seam summary decode is deferred to
+    /// #2243) — the engine still builds it, but `LocalSigner::sign_unsigned` refuses fail-closed.
+    #[cfg(feature = "engine")]
+    #[tokio::test]
+    async fn option_mint_is_still_refused() {
+        use crate::types::{Amount, MintOptionRequest, OptionStrike};
+
+        let party = offer_party("opt-mint-refused");
+        let unsigned = option_builder(&party, vec![sim_free_coin(&party, 1_011)])
+            .build_mint_option(MintOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                creator_puzzle_hash: None,
+                owner_puzzle_hash: None,
+                underlying_amount: Amount(1_000),
+                strike: OptionStrike::Xch {
+                    amount: Amount(500),
+                },
+                expiry_seconds: 1_800_000_000,
+                fee: Amount(10),
+            })
+            .await
+            .unwrap()
+            .unsigned;
+        assert_eq!(
+            party.signer.sign_unsigned(&unsigned).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+            "option mint must still be refused at the signer (#2243)",
+        );
+    }
+
+    /// PR-C NEGATIVE — MR-12: a transfer carrying an EXTRA coin riding the (fee) leg — an unauthorized
+    /// standard spend siphoning value to an attacker — is REFUSED (the extra egress is an unmatched
+    /// recipient). Control: `golden_option_transfer_signs_and_settles`.
+    #[cfg(feature = "engine")]
+    #[tokio::test]
+    async fn transfer_with_an_extra_riding_coin_is_refused_mr12() {
+        use crate::types::{Amount, Puzzlehash, TransferOptionRequest};
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
+        use chia_wallet_sdk::types::Conditions;
+
+        let mut sim = chia_sdk_test::Simulator::new();
+        let owner = offer_party("opt-mr12");
+        let (handle, on_chain) = mint_option_on_sim(
+            &mut sim,
+            &owner,
+            owner.wallet_ph,
+            owner.wallet_ph,
+            1_000,
+            250,
+            10_000,
+        );
+        let mut unsigned = option_builder(&owner, vec![])
+            .build_transfer_option(TransferOptionRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                handle,
+                on_chain,
+                to_puzzle_hash: Puzzlehash(hex::encode([0x9a; 32])),
+                fee: Amount(0),
+            })
+            .await
+            .unwrap();
+
+        // Append an unauthorized wallet standard spend paying an attacker — an extra coin the summary
+        // never disclosed. `analyze` decodes it as a recipient with no matching summary output → refuse.
+        let extra = sim.new_coin(owner.wallet_ph, 5_000);
+        let mut ctx = SpendContext::new();
+        StandardLayer::new(owner.pk)
+            .spend(
+                &mut ctx,
+                extra,
+                Conditions::new().create_coin(Bytes32::new([0x6e; 32]), 5_000, Memos::None),
+            )
+            .unwrap();
+        unsigned.coin_spends.extend(ctx.take());
+
+        assert_eq!(
+            owner.signer.sign_unsigned(&unsigned).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+            "a transfer carrying an extra attacker-paying coin must be refused",
+        );
+    }
+
+    /// A fresh simulator coin at `party`'s wallet puzzle hash, for a builder that needs XCH input.
+    #[cfg(feature = "engine")]
+    fn sim_free_coin(party: &OfferParty, amount: u64) -> chia_protocol::Coin {
+        chia_sdk_test::Simulator::new().new_coin(party.wallet_ph, amount)
     }
 }
