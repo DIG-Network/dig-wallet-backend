@@ -151,8 +151,8 @@ impl OfferBuilder {
         let mut ctx = SpendContext::new();
         let unsigned_take = take_build(&mut ctx, &offer, funds, fee).map_err(map_offer_error)?;
 
-        let unsigned =
-            self.finish_unsigned(unsigned_take.coin_spends.clone(), taker_summary(&cost, fee))?;
+        let summary = taker_summary(&unsigned_take.offer, fee)?;
+        let unsigned = self.finish_unsigned(unsigned_take.coin_spends.clone(), summary)?;
         let build_id = self.pending.insert_take(ctx, unsigned_take.offer);
         Ok(PendingOfferBuild { build_id, unsigned })
     }
@@ -462,27 +462,64 @@ fn offered_summary(offered: &OfferedAssets, fee: u64) -> TransactionSummary {
     }
 }
 
-/// The review summary for a take: the assets the taker PAYS (the arbitrage), plus the fee.
-fn taker_summary(cost: &OfferCost, fee: u64) -> TransactionSummary {
+/// The review summary for a take: the requested payments the taker PAYS, each to its REAL payee
+/// address, plus the fee.
+///
+/// Unlike the offered side of a make — where the maker's assets are committed to the settlement
+/// puzzle (an empty-address `protocol_sink`) — a take funds the maker's requested payments as ordinary
+/// coins created DIRECTLY to the payee puzzle hashes the offer specifies. The taker must review WHO is
+/// paid, so the recipients carry their real `xch1…` addresses; the client signer independently
+/// re-derives the same recipients from the coin spends and gates on this summary (#1511 PR-B). The
+/// assets the taker RECEIVES return to its own change address and are not listed (they do not leave
+/// the wallet).
+fn taker_summary(
+    offer: &chia_wallet_sdk::driver::Offer,
+    fee: u64,
+) -> WalletResult<TransactionSummary> {
+    let payments = offer.requested_payments();
     let mut outputs = Vec::new();
-    if cost.xch > 0 {
-        outputs.push(SpendOutput {
-            address: Address(String::new()),
-            amount: crate::types::Amount(cost.xch),
-            asset_id: None,
-        });
+    for notarized in &payments.xch {
+        for payment in &notarized.payments {
+            outputs.push(requested_payment_output(
+                payment.puzzle_hash,
+                payment.amount,
+                None,
+            )?);
+        }
     }
-    for (asset, amount) in &cost.cats {
-        outputs.push(SpendOutput {
-            address: Address(String::new()),
-            amount: crate::types::Amount(*amount),
-            asset_id: Some(AssetId(hex::encode(asset))),
-        });
+    for (asset_id, notarized_payments) in &payments.cats {
+        for notarized in notarized_payments {
+            for payment in &notarized.payments {
+                outputs.push(requested_payment_output(
+                    payment.puzzle_hash,
+                    payment.amount,
+                    Some(*asset_id),
+                )?);
+            }
+        }
     }
-    TransactionSummary {
+    Ok(TransactionSummary {
         outputs,
         fee: crate::types::Amount(fee),
-    }
+    })
+}
+
+/// One requested-payment recipient, its payee puzzle hash rendered as an `xch1…` address (the same
+/// display form the client verifier re-derives, so the signer's summary gate compares byte-for-byte).
+fn requested_payment_output(
+    payee: Bytes32,
+    amount: u64,
+    asset_id: Option<Bytes32>,
+) -> WalletResult<SpendOutput> {
+    Ok(SpendOutput {
+        address: Address(
+            Bech32Address::new(payee, "xch".into())
+                .encode()
+                .map_err(|e| spend_failed(format!("cannot encode payee address: {e:?}")))?,
+        ),
+        amount: crate::types::Amount(amount),
+        asset_id: asset_id.map(|asset| AssetId(hex::encode(asset))),
+    })
 }
 
 /// Translate a dig-offers [`OfferAsset`] into the wire [`SummaryAsset`].

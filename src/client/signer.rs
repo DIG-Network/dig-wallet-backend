@@ -251,9 +251,24 @@ impl LocalSigner {
         // always a recipient, and every recipient must appear in the reviewed summary below.
         let effect = self.reclassify_by_ownership(verify::analyze(&unsigned.coin_spends)?);
 
-        // The reviewed summary MUST equal exactly the outputs that leave the wallet — otherwise the
-        // engine could show a benign summary while the bytes send value elsewhere. With change split
-        // off by ownership above, this single check is the whole no-silent-exfiltration guarantee.
+        // Defense-in-depth (#1511 MR-3): every `protocol_sink` output MUST commit to a recognized
+        // canonical structural puzzle (settlement). `analyze` already routes ONLY settlement-destined
+        // outputs here, but re-assert it at the signing gate so a future decode change can never let
+        // an attacker address be laundered as a "sink" the summary comparison then excludes.
+        for output in &effect.protocol_sink {
+            if !verify::is_protocol_sink_hash(output.puzzle_hash) {
+                return Err(WalletError::new(
+                    WalletErrorCode::SpendValidationFailed,
+                    "a protocol-sink output does not commit to a recognized canonical structural \
+                     puzzle; refusing to sign",
+                ));
+            }
+        }
+
+        // The reviewed summary MUST equal exactly the outputs that leave the wallet — recipients (by
+        // address) and settlement sinks (by amount+asset) — otherwise the engine could show a benign
+        // summary while the bytes send value elsewhere. With change split off by ownership above, this
+        // is the whole no-silent-exfiltration guarantee.
         self.assert_reviewed_summary_matches(&unsigned.summary, &effect)
     }
 
@@ -273,9 +288,14 @@ impl LocalSigner {
                 recipients.push(output);
             }
         }
+        // `protocol_sink` is untouched by ownership: it is value the wallet intentionally commits to a
+        // consensus-enforced settlement structure (an offer's offered/paid assets), neither returning
+        // home nor going to a chosen recipient. Its canonical-hash invariant is enforced separately in
+        // `verify_before_signing` before any signature is produced.
         SpendEffect {
             recipients,
             change,
+            protocol_sink: effect.protocol_sink,
             fee: effect.fee,
         }
     }
@@ -292,10 +312,17 @@ impl LocalSigner {
         verify::summarize(&effect)
     }
 
-    /// Require the engine-supplied `claimed` summary to match the independently re-derived `effect`
-    /// on the recipient set (puzzle hash + amount + asset) and the fee. Compared on decoded puzzle
-    /// hashes + normalized asset ids, so display-form differences never mask (or fabricate) a
-    /// mismatch. Fail-closed on any discrepancy.
+    /// Require the engine-supplied `claimed` summary to match the independently re-derived `effect` on
+    /// the fee, the RECIPIENT set (puzzle hash + amount + asset), and the settlement-SINK set (amount +
+    /// asset only). Fail-closed on any discrepancy.
+    ///
+    /// A summary output is a settlement sink iff its address is EMPTY: settlement egress commits to the
+    /// fixed settlement puzzle, so the offer builders leave its address blank and it is compared by
+    /// amount+asset (the destination is structurally forced, not human-chosen — #1511 PR-B). Every
+    /// other output is a recipient, compared on its decoded puzzle hash + normalized asset id so
+    /// display-form differences never mask (or fabricate) a mismatch. Splitting on the empty address is
+    /// safe because a sink can NEVER be an ordinary payment: `verify_before_signing` has already proven
+    /// every re-derived sink commits to the canonical settlement hash.
     fn assert_reviewed_summary_matches(
         &self,
         claimed: &TransactionSummary,
@@ -312,7 +339,9 @@ impl LocalSigner {
             return Err(mismatch("fee"));
         }
 
-        let mut derived: Vec<(Vec<u8>, u64, Option<String>)> = effect
+        // The recipient set: derived recipients (real puzzle hashes) vs the claimed outputs carrying a
+        // real address, compared as a sorted multiset of (puzzle hash, amount, asset).
+        let mut derived_recipients: Vec<(Vec<u8>, u64, Option<String>)> = effect
             .recipients
             .iter()
             .map(|output| {
@@ -323,10 +352,10 @@ impl LocalSigner {
                 )
             })
             .collect();
-
-        let mut reviewed: Vec<(Vec<u8>, u64, Option<String>)> = claimed
+        let mut reviewed_recipients: Vec<(Vec<u8>, u64, Option<String>)> = claimed
             .outputs
             .iter()
+            .filter(|output| !output.address.0.is_empty())
             .map(|output| {
                 let puzzle_hash = decode_puzzle_hash(&output.address)?;
                 Ok((
@@ -339,20 +368,52 @@ impl LocalSigner {
                 ))
             })
             .collect::<WalletResult<Vec<_>>>()?;
-
-        derived.sort();
-        reviewed.sort();
-        if derived != reviewed {
+        derived_recipients.sort();
+        reviewed_recipients.sort();
+        if derived_recipients != reviewed_recipients {
             return Err(mismatch("recipient outputs"));
+        }
+
+        // The settlement-sink set: derived protocol-sink outputs vs the claimed empty-address outputs,
+        // compared as a sorted multiset of (amount, asset) — the destination is the fixed settlement
+        // puzzle, so it is NOT part of the comparison.
+        // Zero-value settlement outputs are announcement carriers, not value leaving the wallet, so
+        // they are not part of the reviewed egress (mirrors `verify::summarize`).
+        let mut derived_sinks: Vec<(u64, Option<String>)> = effect
+            .protocol_sink
+            .iter()
+            .filter(|output| output.amount > 0)
+            .map(|output| (output.amount, output.asset_id.map(hex::encode)))
+            .collect();
+        let mut reviewed_sinks: Vec<(u64, Option<String>)> = claimed
+            .outputs
+            .iter()
+            .filter(|output| output.address.0.is_empty())
+            .map(|output| {
+                (
+                    output.amount.mojos(),
+                    output
+                        .asset_id
+                        .as_ref()
+                        .map(|asset| normalize_asset(&asset.0)),
+                )
+            })
+            .collect();
+        derived_sinks.sort();
+        reviewed_sinks.sort();
+        if derived_sinks != reviewed_sinks {
+            return Err(mismatch("settlement-sink outputs"));
         }
         Ok(())
     }
 
     /// The custody core (SPEC §4). Signs the spend classes the engine builds and
-    /// [`verify`](super::verify) can independently decode — a standard-layer XCH send, a CAT send, and
-    /// a $DIG **tip** (a single-key CAT payment; #1511). An offer or option [`UnsignedSpend`] routed
-    /// here is still refused fail-closed until its verify decoder lands; those flows do not sign
-    /// through `LocalSigner` today.
+    /// [`verify`](super::verify) can independently decode — a standard-layer XCH send, a CAT send, a
+    /// $DIG **tip** (a single-key CAT payment; #1511 PR-A), and the three **offer** shapes make / take
+    /// / cancel (#1511 PR-B), whose offered/paid assets are accounted as a settlement `protocol_sink`.
+    /// Settlement-layer coins the wallet claims carry no signature and skip the signed-coin guards. A
+    /// covered-**option** [`UnsignedSpend`] routed here is still refused fail-closed until its verify
+    /// decoder lands; that flow does not sign through `LocalSigner` today.
     ///
     /// Fail-closed, in order: (1) independently verify the coin spends' value flow (#1058); (2)
     /// RE-DERIVE the authoritative required signatures FROM the verified coin spends — the
@@ -1246,17 +1307,18 @@ mod tests {
         );
     }
 
-    /// #1058 scoping: offer/option spends (non-standard puzzles verify cannot yet decode) routed
-    /// through `sign_unsigned` are refused fail-closed until their decoders land. Uses the REAL Chia
-    /// settlement-payments puzzle (the offer-settlement class) as the coin's puzzle.
+    /// #1518 + #1511 PR-B: offers proper now SIGN through `LocalSigner` (see
+    /// `golden_offer_make_and_take_sign_and_settle`). What must STILL be refused is a settlement puzzle
+    /// reveal paired with a coin that does NOT commit to it — a substituted puzzle the coin never
+    /// authorized — so this converted test proves the puzzle-hash binding still gates settlement coins.
     #[cfg(feature = "engine")]
     #[test]
-    fn refuses_an_offer_class_settlement_spend() {
+    fn a_settlement_reveal_not_matching_the_coin_is_refused() {
         use crate::types::{Amount, SpendOutput, TransactionSummary};
         use chia_protocol::{Coin, CoinSpend};
 
         // The canonical, immutable Chia settlement-payments puzzle (chia_puzzles::SETTLEMENT_PAYMENT
-        // V1) — an offer/settlement coin's puzzle, which is neither standard-layer nor CAT.
+        // V1) paired with a coin whose committed puzzle hash is [2u8; 32] — NOT the settlement hash.
         let settlement_puzzle = hex::decode(
             "ff02ffff01ff02ff0affff04ff02ffff04ff03ff80808080ffff04ffff01ffff\
              333effff02ffff03ff05ffff01ff04ffff04ff0cffff04ffff02ff1effff04ff\
@@ -1937,5 +1999,605 @@ mod tests {
         );
         // The truthful control — change back to the wallet — is proven by
         // `golden_tip_signs_and_settles_on_the_simulator`.
+    }
+
+    // ---- PR-B (#1511): offers (make / take / cancel) are signable through `LocalSigner` ----
+    //
+    // A make/take commits the offered/paid assets to the canonical settlement puzzle; `verify::analyze`
+    // accounts that egress into the THIRD `protocol_sink` bucket, and the signer's summary gate compares
+    // it by amount+asset. Settlement-layer coins the taker CLAIMS carry no signature and skip the
+    // signed-coin guards. The golden harness below builds REAL offers via the engine `OfferBuilder`,
+    // signs both halves end-to-end through `LocalSigner::sign_unsigned`, proves the re-derived summary
+    // equals the builder's, and that the atomic settlement bundle is accepted on the simulator. The
+    // MR-3/5/6/7/8 negatives each pair a must-refuse with a truthful signing control.
+
+    /// A simulator-backed input provider serving a wallet's real coins + the synthetic key controlling
+    /// them, for driving the engine `OfferBuilder` against coins that exist on the simulated chain.
+    #[cfg(feature = "engine")]
+    struct OfferInputs {
+        xch: Vec<chia_protocol::Coin>,
+        cats: Vec<chia_wallet_sdk::driver::Cat>,
+        wallet_ph: Bytes32,
+        pk: PublicKey,
+    }
+
+    #[cfg(feature = "engine")]
+    impl crate::engine::build::SpendInputs for OfferInputs {
+        fn spendable_xch(&self, _: &IdentityRef) -> WalletResult<Vec<chia_protocol::Coin>> {
+            Ok(self.xch.clone())
+        }
+        fn spendable_cat(
+            &self,
+            _: &IdentityRef,
+            asset_id: &crate::types::AssetId,
+        ) -> WalletResult<Vec<chia_wallet_sdk::driver::Cat>> {
+            let want = hex::decode(&asset_id.0)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .map(Bytes32::new);
+            Ok(self
+                .cats
+                .iter()
+                .filter(|cat| want.is_none_or(|a| cat.info.asset_id == a))
+                .copied()
+                .collect())
+        }
+        fn synthetic_key(&self, ph: Bytes32) -> Option<PublicKey> {
+            (ph == self.wallet_ph).then_some(self.pk)
+        }
+        fn change_puzzle_hash(&self, _: &IdentityRef) -> WalletResult<Bytes32> {
+            Ok(self.wallet_ph)
+        }
+    }
+
+    /// A wallet party in an offer test: its canonical money key, the standard puzzle hash funds live
+    /// at, and a [`LocalSigner`] bound to the simulator's (testnet11) AGG_SIG_ME domain.
+    #[cfg(feature = "engine")]
+    struct OfferParty {
+        sk: SecretKey,
+        pk: PublicKey,
+        wallet_ph: Bytes32,
+        signer: LocalSigner,
+    }
+
+    #[cfg(feature = "engine")]
+    fn offer_party(label: &str) -> OfferParty {
+        use chia_puzzle_types::standard::StandardArgs;
+        let master = master(label);
+        let pk = master.wallet_public_key(0);
+        OfferParty {
+            sk: master.wallet_signing_key(0),
+            pk,
+            wallet_ph: Bytes32::from(StandardArgs::curry_tree_hash(pk).to_bytes()),
+            signer: LocalSigner::new_canonical(
+                IdentityRef::new(WalletId(1)),
+                self::master(label),
+                Network::Testnet,
+            )
+            .unwrap(),
+        }
+    }
+
+    /// An `OfferBuilder` over `party`'s simulator coins.
+    #[cfg(feature = "engine")]
+    fn offer_builder(
+        party: &OfferParty,
+        xch: Vec<chia_protocol::Coin>,
+        cats: Vec<chia_wallet_sdk::driver::Cat>,
+    ) -> crate::engine::OfferBuilder {
+        use std::sync::Arc;
+        crate::engine::OfferBuilder::new(
+            Arc::new(OfferInputs {
+                xch,
+                cats,
+                wallet_ph: party.wallet_ph,
+                pk: party.pk,
+            }),
+            Network::Simulator,
+            500,
+        )
+    }
+
+    /// Two summaries carry the same outputs (order-independent) and fee — the offer summary comparison
+    /// (settlement sinks have empty, structurally-forced addresses, so ordering is not meaningful).
+    fn same_summary(a: &TransactionSummary, b: &TransactionSummary) -> bool {
+        let key = |s: &TransactionSummary| {
+            let mut outs: Vec<_> = s
+                .outputs
+                .iter()
+                .map(|o| {
+                    (
+                        o.address.0.clone(),
+                        o.amount.mojos(),
+                        o.asset_id.as_ref().map(|a| a.0.to_lowercase()),
+                    )
+                })
+                .collect();
+            outs.sort();
+            (outs, s.fee.mojos())
+        };
+        key(a) == key(b)
+    }
+
+    /// PR-B GOLDEN (#1511): a full CAT-for-XCH offer round trip where BOTH halves are signed through
+    /// `LocalSigner::sign_unsigned` — the maker's make (offered CAT → settlement `protocol_sink`) and
+    /// the taker's take (XCH funding → settlement, maker's settlement CAT coin claimed with no
+    /// signature). Proves make + take SIGN, both re-derived summaries equal the builders', and the
+    /// atomic settlement bundle is accepted on-chain by the simulator.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn golden_offer_make_and_take_sign_and_settle() {
+        use crate::engine::OfferBuilder;
+        use crate::types::{
+            Amount, AssembleOfferRequest, AssetId, FinalizeTakeRequest, MakeOfferRequest,
+            OfferedAssets, RequestedAssets, TakeOfferRequest,
+        };
+        use chia_wallet_sdk::utils::Address as Bech32Address;
+
+        let mut sim = chia_sdk_test::Simulator::new();
+        let maker = offer_party("offer-maker");
+        let taker = offer_party("offer-taker");
+
+        // maker holds only a 1_000-unit CAT (no XCH → cannot self-fund); taker holds 60_000 XCH.
+        let (maker_cat, asset) =
+            issue_cat_to_key(&mut sim, &maker.sk, maker.pk, maker.wallet_ph, 1_000);
+        let taker_coin = sim.new_coin(taker.wallet_ph, 60_000);
+        let payee = crate::types::Address(
+            Bech32Address::new(maker.wallet_ph, "xch".into())
+                .encode()
+                .unwrap(),
+        );
+
+        // --- make: offer 1_000 CAT, request 50_000 XCH; the maker signs its offered-coin spend. ---
+        let maker_builder: OfferBuilder = offer_builder(&maker, vec![], vec![maker_cat]);
+        let pending = maker_builder
+            .build_make(MakeOfferRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                offered: OfferedAssets {
+                    xch: Amount(0),
+                    cats: vec![(AssetId(hex::encode(asset)), Amount(1_000))],
+                },
+                requested: RequestedAssets {
+                    xch: Amount(50_000),
+                    cats: vec![],
+                    payee: payee.clone(),
+                },
+                fee: Amount(0),
+            })
+            .expect("engine builds the maker's unsigned make");
+
+        let maker_signed = maker
+            .signer
+            .sign_unsigned(&pending.unsigned)
+            .expect("a genuine make must sign through LocalSigner (#1511 PR-B)");
+        assert!(
+            same_summary(
+                &maker
+                    .signer
+                    .reviewable_summary(&pending.unsigned.coin_spends)
+                    .unwrap(),
+                &pending.unsigned.summary,
+            ),
+            "the re-derived make summary must equal the builder's (offered CAT → settlement sink)",
+        );
+
+        let offer = maker_builder
+            .assemble_make(AssembleOfferRequest {
+                build_id: pending.build_id,
+                signed: maker_signed,
+            })
+            .unwrap();
+
+        // --- take: fund the 50_000 XCH; the taker signs its funding coins (settlement claim is
+        // unsigned). ---
+        let taker_builder = offer_builder(&taker, vec![taker_coin], vec![]);
+        let take_pending = taker_builder
+            .build_take(TakeOfferRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                offer: offer.offer,
+                fee: Amount(0),
+            })
+            .unwrap();
+
+        let taker_signed = taker
+            .signer
+            .sign_unsigned(&take_pending.unsigned)
+            .expect("a genuine take must sign through LocalSigner (#1511 PR-B)");
+        assert!(
+            same_summary(
+                &taker
+                    .signer
+                    .reviewable_summary(&take_pending.unsigned.coin_spends)
+                    .unwrap(),
+                &take_pending.unsigned.summary,
+            ),
+            "the re-derived take summary must equal the builder's (paid XCH → settlement sink)",
+        );
+
+        let settlement = taker_builder
+            .finalize_take(FinalizeTakeRequest {
+                build_id: take_pending.build_id,
+                signed: taker_signed,
+            })
+            .unwrap();
+
+        sim.new_transaction(settlement.bundle)
+            .expect("the atomic offer settlement bundle must be accepted by the simulator");
+    }
+
+    /// PR-B GOLDEN (#1511): cancelling an outstanding offer is an ordinary standard-layer reclaim to
+    /// the maker — it signs through `LocalSigner::sign_unsigned` and settles on the simulator. (The
+    /// maker's original coin is never broadcast when the offer is made, so it is still spendable.)
+    #[cfg(feature = "engine")]
+    #[test]
+    fn golden_offer_cancel_signs_and_settles() {
+        use crate::types::{
+            Amount, AssembleOfferRequest, AssetId, CancelOfferRequest, MakeOfferRequest,
+            OfferedAssets, RequestedAssets,
+        };
+        use chia_wallet_sdk::utils::Address as Bech32Address;
+
+        let mut sim = chia_sdk_test::Simulator::new();
+        let maker = offer_party("cancel-maker");
+        let maker_coin = sim.new_coin(maker.wallet_ph, 50_000);
+        let payee = crate::types::Address(
+            Bech32Address::new(maker.wallet_ph, "xch".into())
+                .encode()
+                .unwrap(),
+        );
+
+        // Make an XCH-for-CAT offer, then cancel it (reclaim the offered XCH to the maker).
+        let maker_builder = offer_builder(&maker, vec![maker_coin], vec![]);
+        let pending = maker_builder
+            .build_make(MakeOfferRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                offered: OfferedAssets {
+                    xch: Amount(50_000),
+                    cats: vec![],
+                },
+                requested: RequestedAssets {
+                    xch: Amount(0),
+                    cats: vec![(AssetId(hex::encode([0xabu8; 32])), Amount(1_000))],
+                    payee,
+                },
+                fee: Amount(0),
+            })
+            .unwrap();
+        let signed = maker.signer.sign_unsigned(&pending.unsigned).unwrap();
+        let offer = maker_builder
+            .assemble_make(AssembleOfferRequest {
+                build_id: pending.build_id,
+                signed,
+            })
+            .unwrap();
+
+        let cancel = maker_builder
+            .build_cancel(CancelOfferRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                offer: offer.offer,
+                fee: Amount(0),
+            })
+            .unwrap();
+        let cancel_signed = maker
+            .signer
+            .sign_unsigned(&cancel)
+            .expect("a cancel is an ordinary reclaim and must sign (#1511 PR-B)");
+        sim.new_transaction(cancel_signed.bundle)
+            .expect("the maker's cancel reclaim must settle on the simulator");
+    }
+
+    /// Hand-build a standard-layer XCH spend of `label`'s wallet coin emitting `outputs` (each
+    /// `(puzzle_hash, amount, hinted)`), returning the canonical signer + coin spends. When `bind` is
+    /// set a benign `ASSERT_CONCURRENT_SPEND` is appended so a settlement egress satisfies the MR-6
+    /// binding rule; leave it clear to exercise the give-it-away-for-nothing refusal. Used by the
+    /// settlement-sink negatives that need conditions a legitimate builder would never emit.
+    #[cfg(feature = "engine")]
+    fn wallet_xch_spend(
+        label: &str,
+        coin_amount: u64,
+        outputs: &[(Bytes32, u64, bool)],
+        bind: bool,
+    ) -> (LocalSigner, Vec<chia_protocol::CoinSpend>) {
+        use chia_protocol::Coin;
+        use chia_puzzle_types::standard::StandardArgs;
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
+        use chia_wallet_sdk::types::Conditions;
+
+        let pk = master(label).wallet_public_key(0);
+        let wallet_ph = Bytes32::from(StandardArgs::curry_tree_hash(pk).to_bytes());
+        let coin = Coin::new(Bytes32::new([9u8; 32]), wallet_ph, coin_amount);
+
+        let mut ctx = SpendContext::new();
+        let mut conditions = Conditions::new();
+        for &(ph, amount, hinted) in outputs {
+            let memos = if hinted {
+                ctx.hint(ph).unwrap()
+            } else {
+                Memos::None
+            };
+            conditions = conditions.create_coin(ph, amount, memos);
+        }
+        if bind {
+            conditions = conditions.assert_concurrent_spend(Bytes32::new([0x44; 32]));
+        }
+        StandardLayer::new(pk)
+            .spend(&mut ctx, coin, conditions)
+            .unwrap();
+        (
+            LocalSigner::new_canonical(
+                IdentityRef::new(WalletId(1)),
+                master(label),
+                Network::Mainnet,
+            )
+            .unwrap(),
+            ctx.take(),
+        )
+    }
+
+    /// The canonical settlement-payments puzzle hash — the ONLY destination `analyze` routes to
+    /// `protocol_sink`.
+    fn settlement_ph() -> Bytes32 {
+        Bytes32::new(chia_wallet_sdk::puzzles::SETTLEMENT_PAYMENT_HASH)
+    }
+
+    fn xch_addr(ph: Bytes32) -> crate::types::Address {
+        crate::types::Address(
+            chia_wallet_sdk::utils::Address::new(ph, "xch".into())
+                .encode()
+                .unwrap(),
+        )
+    }
+
+    /// PR-B NEGATIVE (MR-3 / MR-5): value routed to a NON-canonical "settlement-looking" hash is NOT a
+    /// protocol sink — it is an ordinary payment to that address. Claimed in the summary as a blank
+    /// (empty-address) settlement output, it must be refused: the derived recipient (the fake hash) is
+    /// unmatched, and the empty-address sink claim has no derived sink to match. The truthful control —
+    /// the SAME value routed to the REAL settlement hash, claimed as a sink — signs.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn a_non_canonical_settlement_sink_is_refused() {
+        use crate::types::{Amount, AssetId, SpendOutput, TransactionSummary};
+
+        let fake = Bytes32::new([0x5a; 32]); // a settlement look-alike the attacker controls
+                                             // Spend 50_000: 50_000 to `fake`, no change (conserving). No sink → MR-6 does not apply.
+        let (signer, coin_spends) =
+            wallet_xch_spend("mr5", 50_000, &[(fake, 50_000, false)], false);
+        let asset: Option<AssetId> = None;
+        let _ = &asset;
+
+        // DISHONEST: the summary claims a single empty-address (settlement) output for the 50_000,
+        // hiding that the value actually goes to the attacker's `fake` address.
+        let dishonest = UnsignedSpend {
+            coin_spends: coin_spends.clone(),
+            required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
+            summary: TransactionSummary {
+                outputs: vec![SpendOutput {
+                    address: crate::types::Address(String::new()),
+                    amount: Amount(50_000),
+                    asset_id: None,
+                }],
+                fee: Amount(0),
+            },
+        };
+        assert_eq!(
+            signer.sign_unsigned(&dishonest).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+            "value to a non-canonical settlement look-alike must not pass as a sink",
+        );
+
+        // CONTROL: the SAME 50_000 routed to the REAL settlement hash IS a sink; claimed as an
+        // empty-address settlement output, it signs — proving the refusal is the non-canonical hash,
+        // not a blanket reject.
+        let (signer2, real_spends) =
+            wallet_xch_spend("mr5", 50_000, &[(settlement_ph(), 50_000, false)], true);
+        let honest = UnsignedSpend {
+            coin_spends: real_spends.clone(),
+            required_signatures: signer2.required_signatures_from(&real_spends).unwrap(),
+            summary: TransactionSummary {
+                outputs: vec![SpendOutput {
+                    address: crate::types::Address(String::new()),
+                    amount: Amount(50_000),
+                    asset_id: None,
+                }],
+                fee: Amount(0),
+            },
+        };
+        assert!(
+            signer2.sign_unsigned(&honest).is_ok(),
+            "the truthful control (value to the real settlement hash) must sign",
+        );
+    }
+
+    /// PR-B NEGATIVE (MR-3, direct): the signing gate's `protocol_sink`-must-be-canonical guard,
+    /// exercised on a hand-forged effect — a sink output to a non-settlement hash is refused even
+    /// though it sits in the sink bucket. Paired with the canonical control that passes.
+    #[test]
+    fn protocol_sink_gate_rejects_a_non_canonical_hash() {
+        assert!(verify::is_protocol_sink_hash(settlement_ph()));
+        assert!(!verify::is_protocol_sink_hash(Bytes32::new([0x11; 32])));
+    }
+
+    /// PR-B NEGATIVE (MR-7): a take set that ALSO spends an extra, unrelated wallet coin whose value
+    /// leaves to a non-wallet address must be refused — that extra output is an un-summarized recipient
+    /// (value the human never approved). Modelled directly: a two-coin spend where the second wallet
+    /// coin pays a stranger, with a summary that mentions only the legitimate settlement sink.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn an_extra_wallet_coin_paying_a_stranger_is_refused() {
+        use crate::types::{Amount, SpendOutput, TransactionSummary};
+
+        let stranger = Bytes32::new([0x71; 32]);
+        // Coin A: 50_000 → settlement sink (a legitimate offered leg, MR-6-bound).
+        let (signer, mut coin_spends) =
+            wallet_xch_spend("mr7", 50_000, &[(settlement_ph(), 50_000, false)], true);
+        // Coin B (same wallet key): a SECOND coin quietly paying 40_000 to a stranger.
+        let (_, extra) = wallet_xch_spend("mr7", 40_000, &[(stranger, 40_000, true)], false);
+        coin_spends.extend(extra);
+
+        // The summary claims ONLY the settlement sink — the stranger payment is hidden.
+        let dishonest = UnsignedSpend {
+            coin_spends: coin_spends.clone(),
+            required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
+            summary: TransactionSummary {
+                outputs: vec![SpendOutput {
+                    address: crate::types::Address(String::new()),
+                    amount: Amount(50_000),
+                    asset_id: None,
+                }],
+                fee: Amount(0),
+            },
+        };
+        assert_eq!(
+            signer.sign_unsigned(&dishonest).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+            "a take hiding an extra coin paying a stranger must be refused",
+        );
+
+        // CONTROL: declaring the stranger payment truthfully (as a real recipient) signs.
+        let truthful = UnsignedSpend {
+            coin_spends: coin_spends.clone(),
+            required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
+            summary: TransactionSummary {
+                outputs: vec![
+                    SpendOutput {
+                        address: crate::types::Address(String::new()),
+                        amount: Amount(50_000),
+                        asset_id: None,
+                    },
+                    SpendOutput {
+                        address: xch_addr(stranger),
+                        amount: Amount(40_000),
+                        asset_id: None,
+                    },
+                ],
+                fee: Amount(0),
+            },
+        };
+        assert!(
+            signer.sign_unsigned(&truthful).is_ok(),
+            "the truthful control (stranger payment declared) must sign",
+        );
+    }
+
+    /// PR-B NEGATIVE (MR-6): a wallet coin that commits its value to the settlement puzzle with NO
+    /// offer-binding assertion (give-it-away-for-nothing) is refused — even with a truthful sink
+    /// summary — because nothing forces the offered value to be exchanged for anything. The truthful
+    /// control (the SAME sink WITH a binding assertion) signs.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn a_settlement_egress_with_no_binding_assertion_is_refused() {
+        use crate::types::{Amount, SpendOutput, TransactionSummary};
+
+        let sink_summary = || TransactionSummary {
+            outputs: vec![SpendOutput {
+                address: crate::types::Address(String::new()),
+                amount: Amount(50_000),
+                asset_id: None,
+            }],
+            fee: Amount(0),
+        };
+
+        // UNBOUND: 50_000 → settlement, no assertion → refuse.
+        let (signer, unbound) =
+            wallet_xch_spend("mr6", 50_000, &[(settlement_ph(), 50_000, false)], false);
+        let dishonest = UnsignedSpend {
+            coin_spends: unbound.clone(),
+            required_signatures: signer
+                .required_signatures_from(&unbound)
+                .unwrap_or_default(),
+            summary: sink_summary(),
+        };
+        assert_eq!(
+            signer.sign_unsigned(&dishonest).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+            "an unbound settlement egress (give-it-away-for-nothing) must be refused",
+        );
+
+        // BOUND control: the SAME egress WITH an offer-binding assertion signs.
+        let (signer2, bound) =
+            wallet_xch_spend("mr6", 50_000, &[(settlement_ph(), 50_000, false)], true);
+        let honest = UnsignedSpend {
+            coin_spends: bound.clone(),
+            required_signatures: signer2.required_signatures_from(&bound).unwrap(),
+            summary: sink_summary(),
+        };
+        assert!(
+            signer2.sign_unsigned(&honest).is_ok(),
+            "the truthful control (settlement egress bound by an assertion) must sign",
+        );
+    }
+
+    /// Build a CLAIMED settlement (XCH) coin spend paying `payee` `amount` — the shape a taker's set
+    /// carries for the maker's offered coins. It carries NO signature (claimed by announcement).
+    #[cfg(feature = "engine")]
+    fn settlement_coin_spend(payee: Bytes32, amount: u64) -> Vec<chia_protocol::CoinSpend> {
+        use chia_protocol::Coin;
+        use chia_puzzle_types::offer::{NotarizedPayment, Payment, SettlementPaymentsSolution};
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::driver::{Layer, SettlementLayer, Spend, SpendContext};
+
+        let mut ctx = SpendContext::new();
+        let puzzle = SettlementLayer.construct_puzzle(&mut ctx).unwrap();
+        let payment = Payment::new(payee, amount, Memos::None);
+        let notarized = NotarizedPayment::new(Bytes32::new([0x33; 32]), vec![payment]);
+        let solution = SettlementLayer
+            .construct_solution(&mut ctx, SettlementPaymentsSolution::new(vec![notarized]))
+            .unwrap();
+        let coin = Coin::new(Bytes32::new([0x22; 32]), settlement_ph(), amount);
+        ctx.spend(coin, Spend::new(puzzle, solution)).unwrap();
+        ctx.take()
+    }
+
+    /// PR-B NEGATIVE (MR-8): a CLAIMED settlement coin whose notarized payment routes value to an
+    /// ATTACKER, while the reviewed summary claims nothing leaves the wallet, is refused — the decoded
+    /// settlement payment is reconciled against the summary, and the attacker output is an unmatched
+    /// recipient. The truthful control (the SAME settlement payment landing on a WALLET-owned address,
+    /// with an empty summary) signs, because a wallet-owned settlement payout is change.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn a_settlement_payment_to_an_attacker_is_refused() {
+        use crate::types::{Amount, TransactionSummary};
+        use chia_puzzle_types::standard::StandardArgs;
+
+        let attacker = Bytes32::new([0x6e; 32]);
+        let signer = canonical_mainnet_signer("mr8");
+        let empty = TransactionSummary {
+            outputs: vec![],
+            fee: Amount(0),
+        };
+
+        // DISHONEST: the settlement coin pays the attacker; the summary claims nothing leaves.
+        let attacker_spends = settlement_coin_spend(attacker, 1_000);
+        let dishonest = UnsignedSpend {
+            coin_spends: attacker_spends.clone(),
+            required_signatures: signer
+                .required_signatures_from(&attacker_spends)
+                .unwrap_or_default(),
+            summary: empty.clone(),
+        };
+        assert_eq!(
+            signer.sign_unsigned(&dishonest).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+            "a settlement payment to an attacker the summary hides must be refused",
+        );
+
+        // CONTROL: the SAME payment landing on the WALLET's own address is change — an empty summary
+        // matches, and it signs (no signature is required of a claimed settlement coin).
+        let wallet_ph = Bytes32::from(
+            StandardArgs::curry_tree_hash(master("mr8").wallet_public_key(0)).to_bytes(),
+        );
+        let owned_spends = settlement_coin_spend(wallet_ph, 1_000);
+        let honest = UnsignedSpend {
+            coin_spends: owned_spends.clone(),
+            required_signatures: signer
+                .required_signatures_from(&owned_spends)
+                .unwrap_or_default(),
+            summary: empty,
+        };
+        assert!(
+            signer.sign_unsigned(&honest).is_ok(),
+            "the truthful control (settlement payment to a wallet-owned address) must sign",
+        );
     }
 }
