@@ -26,7 +26,7 @@ pub use identity::{HdIdentity, IdentityProvider};
 pub use review::{decode, HumanReadableSummary};
 pub use signer::{IdentitySigner, LocalSigner};
 pub use transport::{ControlTransport, IpcWalletClient};
-pub use verify::{analyze, derive_summary, DecodedOutput, SpendEffect};
+pub use verify::{analyze, derive_summary, summarize, DecodedOutput, SpendEffect};
 
 // The subscription shape contract itself — `CatchUp` + `filter_events` — is the canonical
 // `dig-events-protocol` trait/fn (re-exported via `crate::types`); re-export here too so

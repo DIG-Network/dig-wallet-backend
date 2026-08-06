@@ -8,11 +8,21 @@
 //! and fee. The signer then gates on THIS, closing the blind-signing gap.
 //!
 //! # Fail-closed
-//! Only the two spend classes the engine builds today are decodable: a standard-layer XCH send and
-//! a CAT send (each optionally with standard-layer XCH fee/support coins). Any coin spend the driver
-//! cannot fully parse+account for — a foreign puzzle, a value leak, a minted CAT — yields
-//! [`WalletErrorCode::SpendValidationFailed`]; the signer refuses to sign it. (Offers/options/tips
-//! reaching the signer are refused here until their decoders land — that is intended.)
+//! The decodable spend classes are the standard-layer XCH send, the CAT send, and the $DIG **tip**
+//! (a single-key CAT payment — recipient + change, no separate XCH fee — that flows through the SAME
+//! [`Cat::parse`] path). Any coin spend the driver cannot fully parse+account for — a foreign puzzle,
+//! a value leak, a minted CAT — yields [`WalletErrorCode::SpendValidationFailed`]; the signer refuses
+//! to sign it. (Offers/options reaching the signer are still refused here until their decoders land —
+//! that is intended.)
+//!
+//! # Recipients vs change is key-relative
+//! Splitting a spend's outputs into recipients (value leaving) and change (value returning home) is
+//! inherently a WALLET-RELATIVE judgement: on-chain both are plain `CREATE_COIN`s. This module makes
+//! a key-free best-effort split on memo-hinting (the engine's XCH/CAT builders leave change
+//! un-hinted), but `dig-cat` — and so every $DIG tip — memo-hints its change coin too, so that split
+//! alone would over-count a tip's recipients. The AUTHORITATIVE, key-aware split lives in
+//! [`LocalSigner`](super::signer::LocalSigner), which treats every output it can derive a key for as
+//! change; that is what the signer's summary gate compares against.
 
 use std::collections::BTreeMap;
 
@@ -218,8 +228,20 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
 
 /// Re-derive the human-facing [`TransactionSummary`] from `coin_spends` alone — the authoritative
 /// summary the confirm surface renders and the signer gates on (never the engine's claim).
+///
+/// This is the KEY-FREE view: it splits recipients from change purely on memo-hinting (see
+/// [`classify`]). A spend whose change coin is itself memo-hinted (a `dig-cat`/$DIG-tip send) will
+/// therefore list that change among the recipients; the KEY-AWARE
+/// [`LocalSigner::reviewable_summary`](super::signer::LocalSigner::reviewable_summary) corrects that
+/// by treating every wallet-owned output as change.
 pub fn derive_summary(coin_spends: &[CoinSpend]) -> WalletResult<TransactionSummary> {
-    let effect = analyze(coin_spends)?;
+    summarize(&analyze(coin_spends)?)
+}
+
+/// Render a re-derived [`SpendEffect`]'s recipients + fee as a [`TransactionSummary`] (the outputs
+/// a human reviews). Shared by the key-free [`derive_summary`] and the signer's key-aware summary,
+/// so both encode addresses + asset ids identically.
+pub fn summarize(effect: &SpendEffect) -> WalletResult<TransactionSummary> {
     let outputs = effect
         .recipients
         .iter()

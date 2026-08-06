@@ -367,9 +367,15 @@ Used by dig-app. The subscriber + identity provider + signer.
   puzzle)` — zero (nothing binds a signature to the coin), more than one (a second `AGG_SIG_ME` could
   launder a blank-check signature for another coin through a benign carrier), or a wrong-hash
   `AGG_SIG_ME` are each refused (#1519). `derive_summary(&[CoinSpend]) -> TransactionSummary`
-  wraps it for display. Only the standard-XCH-send and CAT-send classes the engine builds are
-  decodable; any coin spend that cannot be FULLY accounted for (a foreign puzzle, undecodable bytes,
-  a value leak/mint) is refused fail-closed with `WalletErrorCode::SpendValidationFailed`.
+  wraps it for display; `summarize(&SpendEffect) -> TransactionSummary` is the shared renderer both it
+  and the signer's key-aware summary use. The standard-XCH-send, CAT-send, and $DIG-**tip** classes
+  the engine builds are decodable (a tip is a single-key CAT payment through the same `Cat::parse`
+  path, #1511); any coin spend that cannot be FULLY accounted for (a foreign puzzle, undecodable
+  bytes, a value leak/mint) is refused fail-closed with `WalletErrorCode::SpendValidationFailed`.
+  Splitting outputs into recipients vs change is inherently KEY-RELATIVE: `analyze` makes a key-free
+  best-effort split on memo-hinting, but `dig-cat` (so every tip) memo-hints its change coin too, so
+  the AUTHORITATIVE split is the key-aware one in `LocalSigner` (below) — the signer's gate never
+  relies on the memo heuristic.
   Every value accumulation on the conservation path — XCH inputs, XCH outputs, per-asset CAT inputs,
   per-asset CAT outputs, reserved fees, and `outputs + fee` — MUST be TOTAL arithmetic over the full
   `u64` range: a sum that is not representable MUST be refused with
@@ -397,9 +403,13 @@ Used by dig-app. The subscriber + identity provider + signer.
      refused.
   2. **AGG_SIG_ME binding.** Every signed message MUST end with the network genesis challenge; an
      unbound (`AGG_SIG_UNSAFE`) message is refused.
-  3. **Verify-before-sign (#1058).** `sign_unsigned` FIRST re-derives the spend via `client::verify`,
-     requires every change output to return to a wallet-owned puzzle hash (no exfiltration), and
-     requires the engine-supplied summary to match the re-derived recipients + fee. The required
+  3. **Verify-before-sign (#1058, #1511).** `sign_unsigned` FIRST re-derives the spend via
+     `client::verify`, then SPLITS the outputs by KEY OWNERSHIP — every output whose puzzle hash the
+     wallet can derive a key for is change (value returning home), every other output is a recipient.
+     This key-aware split (exposed as `LocalSigner::reviewable_summary`) supersedes the key-free memo
+     heuristic and is correct for a tip's memo-hinted change. The engine-supplied summary MUST equal
+     exactly the recipients that leave the wallet + the fee; a non-owned output missing from the
+     summary is refused (no silent exfiltration). The required
      signatures actually signed are RE-DERIVED from the verified coin spends via
      `SdkRequiredSignature::from_coin_spends` — the engine-supplied `required_signatures` field is
      UNTRUSTED (only cross-checked, never the signing source), so a malicious engine cannot use it as
@@ -420,9 +430,10 @@ Used by dig-app. The subscriber + identity provider + signer.
      carry EXACTLY ONE `AGG_SIG_ME`, committing to `sha256tree(delegated_puzzle)` — the message the
      re-derived outputs come from. Zero, duplicate, or wrong-hash `AGG_SIG_ME` is refused, so no
      extra signature can be laundered and the signed message provably matches the reviewed outputs.
-  - **Signing scope (fail-closed).** `sign_unsigned` signs ONLY the standard-XCH-send and CAT-send
-    classes `client::verify` can decode. An offer (settlement), option, or tip `UnsignedSpend` routed
-    through it is refused (`SpendValidationFailed`) until its verify decoder lands.
+  - **Signing scope (fail-closed).** `sign_unsigned` signs the standard-XCH-send, CAT-send, and
+    $DIG-tip (#1511) classes `client::verify` can decode. An offer (settlement) or option
+    `UnsignedSpend` routed through it is refused (`SpendValidationFailed`) until its verify decoder
+    lands.
 - **`client::identity::IdentityProvider`** — `active_identity()`, `tracked_public_keys()`. Supplies the
   engine public material only. `HdIdentity` additionally exposes `identity_public_key_bytes()` (the
   48-byte G1 identity key published to slot `0x0010`) and `decap(peer_g1)` (the dig-message recipient

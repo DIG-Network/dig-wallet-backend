@@ -240,21 +240,53 @@ impl LocalSigner {
     /// Fail-closed — a spend that cannot be fully accounted for is refused, so the signer never
     /// blindly signs bytes it did not verify.
     fn verify_before_signing(&self, unsigned: &UnsignedSpend) -> WalletResult<()> {
-        let effect = verify::analyze(&unsigned.coin_spends)?;
+        // Re-derive the value flow, then split it by KEY OWNERSHIP: every output this wallet can
+        // derive a key for is change (value returning home); everything else is a recipient. This is
+        // the authoritative, key-aware split — it supersedes the key-free memo heuristic
+        // `verify::analyze` produces, which over-counts recipients for a $DIG tip (dig-cat memo-hints
+        // the tip's change coin too). It never lets value leave unnoticed: a non-owned output is
+        // always a recipient, and every recipient must appear in the reviewed summary below.
+        let effect = self.reclassify_by_ownership(verify::analyze(&unsigned.coin_spends)?);
 
-        // No value may silently leave the wallet: every un-hinted (change) output must be ours.
-        for output in &effect.change {
-            if !self.owns_puzzle_hash(output.puzzle_hash) {
-                return Err(WalletError::new(
-                    WalletErrorCode::SpendValidationFailed,
-                    "a non-recipient output does not return to this wallet (possible exfiltration)",
-                ));
+        // The reviewed summary MUST equal exactly the outputs that leave the wallet — otherwise the
+        // engine could show a benign summary while the bytes send value elsewhere. With change split
+        // off by ownership above, this single check is the whole no-silent-exfiltration guarantee.
+        self.assert_reviewed_summary_matches(&unsigned.summary, &effect)
+    }
+
+    /// Split a re-derived [`SpendEffect`] by KEY OWNERSHIP: an output whose puzzle hash this wallet
+    /// controls is CHANGE (value returning home); every other output is a RECIPIENT the human must
+    /// have reviewed. Unlike the key-free memo split in [`verify::analyze`], this is correct for
+    /// spends whose change coin is memo-hinted (every `dig-cat`/$DIG-tip send), and it is strictly
+    /// safer — a non-owned output can never be silently reclassified as change and slip past the
+    /// summary gate.
+    fn reclassify_by_ownership(&self, effect: SpendEffect) -> SpendEffect {
+        let mut recipients = Vec::new();
+        let mut change = Vec::new();
+        for output in effect.recipients.into_iter().chain(effect.change) {
+            if self.owns_puzzle_hash(output.puzzle_hash) {
+                change.push(output);
+            } else {
+                recipients.push(output);
             }
         }
+        SpendEffect {
+            recipients,
+            change,
+            fee: effect.fee,
+        }
+    }
 
-        // The reviewed summary MUST equal what the coin spends actually do — otherwise the engine
-        // could show a benign summary while the bytes send elsewhere.
-        self.assert_reviewed_summary_matches(&unsigned.summary, &effect)
+    /// The KEY-AWARE reviewable summary: the value flow re-derived from `coin_spends`, with every
+    /// wallet-owned output treated as change so only the outputs that actually LEAVE the wallet are
+    /// listed. This is the summary the signer gates the engine's claim against; unlike the key-free
+    /// [`verify::derive_summary`] it is correct for a $DIG tip (whose change coin is memo-hinted).
+    pub fn reviewable_summary(
+        &self,
+        coin_spends: &[chia_protocol::CoinSpend],
+    ) -> WalletResult<TransactionSummary> {
+        let effect = self.reclassify_by_ownership(verify::analyze(coin_spends)?);
+        verify::summarize(&effect)
     }
 
     /// Require the engine-supplied `claimed` summary to match the independently re-derived `effect`
@@ -313,10 +345,11 @@ impl LocalSigner {
         Ok(())
     }
 
-    /// The custody core (SPEC §4). Currently signs only the two spend classes the engine builds and
-    /// [`verify`](super::verify) can independently decode — a standard-layer XCH send and a CAT send.
-    /// An offer, option, or tip [`UnsignedSpend`] routed here is refused fail-closed until its
-    /// verify decoder lands (#1058 follow-up); those flows do not sign through `LocalSigner` today.
+    /// The custody core (SPEC §4). Signs the spend classes the engine builds and
+    /// [`verify`](super::verify) can independently decode — a standard-layer XCH send, a CAT send, and
+    /// a $DIG **tip** (a single-key CAT payment; #1511). An offer or option [`UnsignedSpend`] routed
+    /// here is still refused fail-closed until its verify decoder lands; those flows do not sign
+    /// through `LocalSigner` today.
     ///
     /// Fail-closed, in order: (1) independently verify the coin spends' value flow (#1058); (2)
     /// RE-DERIVE the authoritative required signatures FROM the verified coin spends — the
@@ -1563,5 +1596,343 @@ mod tests {
             hex::encode(TESTNET11_AGG_SIG_ME_EXTRA_DATA),
             "37a90eb5185a9c4439a91ddc98bbadce7b4feba060d50116a067de66bf236615",
         );
+    }
+
+    // ---- PR-A (#1511): $DIG tips are signable through `LocalSigner::sign_unsigned` ----
+    //
+    // A tip is a pure single-key CAT payment (recipient CREATE_COIN hinted + change CREATE_COIN
+    // un-hinted, no separate XCH fee), so it decodes through the SAME `verify::analyze` CAT path a
+    // normal CAT send does — no verify change was required, only the removal of the tip refusal
+    // wording. The golden harness below is the reusable custody proof for tips (and the base
+    // PR-B/PR-C extend): it builds a REAL tip via the engine `build_tips` path, signs it end-to-end,
+    // proves the re-derived summary equals the builder's, and that the produced bundle is a VALID
+    // on-chain spend on `chia-sdk-test::Simulator`. It never broadcasts to mainnet.
+
+    /// Issue `amount` of a fresh CAT to the standard puzzle of `pk` (`wallet_ph`) on the simulator,
+    /// signed with `sk` (the synthetic key controlling the funding coin). Returns the spendable
+    /// [`Cat`] (with its lineage proof) and its asset id — so a built tip spends a coin that actually
+    /// exists on the simulated chain and its settlement can be validated.
+    #[cfg(feature = "engine")]
+    fn issue_cat_to_key(
+        sim: &mut chia_sdk_test::Simulator,
+        sk: &SecretKey,
+        pk: PublicKey,
+        wallet_ph: Bytes32,
+        amount: u64,
+    ) -> (chia_wallet_sdk::driver::Cat, Bytes32) {
+        use chia_wallet_sdk::driver::{Cat, SpendContext, StandardLayer};
+        use chia_wallet_sdk::types::Conditions;
+
+        let mut ctx = SpendContext::new();
+        let funding = sim.new_coin(wallet_ph, amount);
+        let hint = ctx.hint(wallet_ph).unwrap();
+        let (issue, cats) = Cat::single_issuance(
+            &mut ctx,
+            funding.coin_id(),
+            None,
+            amount,
+            Conditions::new().create_coin(wallet_ph, amount, hint),
+        )
+        .unwrap();
+        StandardLayer::new(pk)
+            .spend(&mut ctx, funding, issue)
+            .unwrap();
+        let asset_id = cats[0].info.asset_id;
+        sim.spend_coins(ctx.take(), std::slice::from_ref(sk))
+            .unwrap();
+        (cats[0], asset_id)
+    }
+
+    /// A one-CAT-group tip input provider: the wallet holds `cat`, controls it (and returns change)
+    /// under `wallet_ph`'s synthetic key `pk`, and — when `change_ph` differs — diverts change to a
+    /// foreign puzzle hash (the exfiltration negative below).
+    #[cfg(feature = "engine")]
+    struct TipInputsProvider {
+        cat: chia_wallet_sdk::driver::Cat,
+        wallet_ph: Bytes32,
+        pk: PublicKey,
+        change_ph: Bytes32,
+    }
+
+    #[cfg(feature = "engine")]
+    impl crate::engine::build::SpendInputs for TipInputsProvider {
+        fn spendable_xch(&self, _: &IdentityRef) -> WalletResult<Vec<chia_protocol::Coin>> {
+            Ok(vec![])
+        }
+        fn spendable_cat(
+            &self,
+            _: &IdentityRef,
+            _: &crate::types::AssetId,
+        ) -> WalletResult<Vec<chia_wallet_sdk::driver::Cat>> {
+            Ok(vec![self.cat])
+        }
+        fn synthetic_key(&self, ph: Bytes32) -> Option<PublicKey> {
+            (ph == self.wallet_ph).then_some(self.pk)
+        }
+        fn change_puzzle_hash(&self, _: &IdentityRef) -> WalletResult<Bytes32> {
+            Ok(self.change_ph)
+        }
+    }
+
+    /// Build a REAL, wallet-owned, simulator-backed unsigned $DIG tip for `label`: a CAT of `total`
+    /// base units at the wallet's canonical synthetic key, tipping `tip_amount` to `recipient_ph`,
+    /// returning change to `change_ph`. Returns the live simulator, the canonical [`LocalSigner`]
+    /// holding the key, and the unsigned tip — bound to testnet11 (the simulator's AGG_SIG_ME
+    /// domain), so a signed bundle can be validated with `sim.new_transaction`.
+    #[cfg(feature = "engine")]
+    async fn owned_tip(
+        label: &str,
+        total: u64,
+        tip_amount: u64,
+        recipient_ph: Bytes32,
+        change_ph: Bytes32,
+    ) -> (chia_sdk_test::Simulator, LocalSigner, UnsignedSpend) {
+        use crate::engine::build::SdkSpendBuilder;
+        use crate::engine::build_tips::TipBuilder;
+        use crate::types::{AssetId, Puzzlehash, TipRequest};
+        use chia_puzzle_types::standard::StandardArgs;
+        use std::sync::Arc;
+
+        let master = master(label);
+        let sk = master.wallet_signing_key(0);
+        let pk = master.wallet_public_key(0);
+        let wallet_ph = Bytes32::from(StandardArgs::curry_tree_hash(pk).to_bytes());
+
+        let mut sim = chia_sdk_test::Simulator::new();
+        let (cat, asset) = issue_cat_to_key(&mut sim, &sk, pk, wallet_ph, total);
+
+        let builder = SdkSpendBuilder::new(
+            Arc::new(TipInputsProvider {
+                cat,
+                wallet_ph,
+                pk,
+                change_ph,
+            }),
+            Network::Simulator,
+            500,
+        );
+        let unsigned = builder
+            .build_tip(TipRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                asset_id: AssetId(hex::encode(asset)),
+                recipient: Puzzlehash(hex::encode(recipient_ph)),
+                amount: crate::types::Amount(tip_amount),
+            })
+            .await
+            .expect("engine builds an unsigned tip");
+
+        let signer = LocalSigner::new_canonical(
+            IdentityRef::new(WalletId(1)),
+            self::master(label),
+            Network::Testnet,
+        )
+        .unwrap();
+        (sim, signer, unsigned)
+    }
+
+    /// PR-A GOLDEN (#1511): a genuine $DIG tip built by the engine signs end-to-end through
+    /// `LocalSigner::sign_unsigned` (no refusal), the independently re-derived summary byte-equals the
+    /// builder's, and the produced bundle is accepted on-chain by the simulator. This is the proof
+    /// that a tip is a signable CAT payment through the existing custody model — no verify relaxation.
+    #[cfg(feature = "engine")]
+    #[tokio::test]
+    async fn golden_tip_signs_and_settles_on_the_simulator() {
+        use chia_puzzle_types::standard::StandardArgs;
+        let recipient_ph = Bytes32::new([0x77u8; 32]);
+        // change returns to the wallet's own canonical puzzle hash.
+        let wallet_change = Bytes32::from(
+            StandardArgs::curry_tree_hash(master("tips-golden").wallet_public_key(0)).to_bytes(),
+        );
+        let (mut sim, signer, unsigned) =
+            owned_tip("tips-golden", 10_000, 1_000, recipient_ph, wallet_change).await;
+
+        // (a) it SIGNS — a tip is not refused by the custody core.
+        let signed = signer
+            .sign_unsigned(&unsigned)
+            .expect("a genuine $DIG tip must sign through LocalSigner (#1511)");
+
+        // (b) the key-aware re-derived summary byte-equals what the builder claimed (change split off
+        // by ownership; the tip's memo-hinted change is NOT mistaken for a second recipient).
+        let derived = signer.reviewable_summary(&unsigned.coin_spends).unwrap();
+        assert_eq!(
+            derived, unsigned.summary,
+            "the re-derived tip summary must equal the builder's summary"
+        );
+
+        // (c) the signed bundle is a VALID on-chain spend — never auto-broadcast to mainnet.
+        sim.new_transaction(signed.bundle)
+            .expect("the signed tip must be accepted by the simulator");
+    }
+
+    /// Hand-build a CAT spend of `label`'s wallet key that pays `outputs` (each `(ph, amount,
+    /// hinted)`), returning change to the wallet. `hinted` outputs are memo-tagged so `analyze`
+    /// classifies them as recipients; un-hinted ones are change. The CAT is issued off a fabricated
+    /// genesis coin — enough to drive `analyze` + `sign_unsigned`, which act BEFORE any on-chain
+    /// check. Returns the canonical signer holding the key + the coin spends.
+    #[cfg(feature = "engine")]
+    fn wallet_cat_spend(
+        label: &str,
+        total: u64,
+        outputs: &[(Bytes32, u64, bool)],
+    ) -> (LocalSigner, Vec<chia_protocol::CoinSpend>) {
+        use chia_protocol::Coin;
+        use chia_puzzle_types::standard::StandardArgs;
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::driver::SpendWithConditions;
+        use chia_wallet_sdk::driver::{Cat, CatSpend, SpendContext, StandardLayer};
+        use chia_wallet_sdk::types::Conditions;
+
+        let pk = master(label).wallet_public_key(0);
+        let wallet_ph = Bytes32::from(StandardArgs::curry_tree_hash(pk).to_bytes());
+
+        // Issue the CAT in ITS OWN context (only `cats[0]` is retained), so the spend context below
+        // holds exactly the one CAT spend the negatives exercise — mirroring the verify.rs harness.
+        let cat = {
+            let mut issue_ctx = SpendContext::new();
+            let genesis = Coin::new(Bytes32::new([5u8; 32]), wallet_ph, total);
+            let issue_hint = issue_ctx.hint(wallet_ph).unwrap();
+            let (_, cats) = Cat::single_issuance(
+                &mut issue_ctx,
+                genesis.coin_id(),
+                None,
+                total,
+                Conditions::new().create_coin(wallet_ph, total, issue_hint),
+            )
+            .unwrap();
+            cats[0]
+        };
+
+        // Build the inner p2 conditions in the spend context's OWN allocator, so each hint NodePtr is
+        // valid for the puzzle this allocator serializes.
+        let mut ctx = SpendContext::new();
+        let mut conditions = Conditions::new();
+        for &(ph, amount, hinted) in outputs {
+            let memos = if hinted {
+                ctx.hint(ph).unwrap()
+            } else {
+                Memos::None
+            };
+            conditions = conditions.create_coin(ph, amount, memos);
+        }
+
+        let inner = StandardLayer::new(pk)
+            .spend_with_conditions(&mut ctx, conditions)
+            .unwrap();
+        Cat::spend_all(&mut ctx, &[CatSpend::new(cat, inner)]).unwrap();
+        (
+            LocalSigner::new_canonical(
+                IdentityRef::new(WalletId(1)),
+                master(label),
+                Network::Mainnet,
+            )
+            .unwrap(),
+            ctx.take(),
+        )
+    }
+
+    /// PR-A NEGATIVE (MR-13): a "tip" whose coin spends actually pay TWO recipients while the reviewed
+    /// summary claims the single honest tip output MUST be refused fail-closed with ZERO signatures —
+    /// the extra recipient is value leaving the wallet the human never approved. Paired with a truthful
+    /// control (the same two-recipient shape, summary listing BOTH) that DOES sign, so a
+    /// reject-everything guard cannot masquerade as the fix.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn multi_recipient_tip_masquerade_is_refused() {
+        use crate::types::{Address, Amount, AssetId, SpendOutput, TransactionSummary};
+        use chia_puzzle_types::standard::StandardArgs;
+        use chia_wallet_sdk::utils::Address as Bech32Address;
+
+        let honest = Bytes32::new([0x77u8; 32]);
+        let sneaky = Bytes32::new([0x66u8; 32]);
+        let wallet_ph = Bytes32::from(
+            StandardArgs::curry_tree_hash(master("tip-multi").wallet_public_key(0)).to_bytes(),
+        );
+
+        // Coin spends that pay 1_000 to `honest` AND 1_000 to `sneaky` (both hinted), 8_000 change —
+        // conserving, so `analyze` accepts them; two hinted recipients are derived.
+        let (signer, coin_spends) = wallet_cat_spend(
+            "tip-multi",
+            10_000,
+            &[
+                (honest, 1_000, true),
+                (sneaky, 1_000, true),
+                (wallet_ph, 8_000, false),
+            ],
+        );
+        let asset = AssetId(hex::encode(
+            // the fabricated CAT's asset id is recovered from the derived effect.
+            verify::analyze(&coin_spends).unwrap().recipients[0]
+                .asset_id
+                .unwrap(),
+        ));
+        let xch_addr =
+            |ph: Bytes32| Address(Bech32Address::new(ph, "xch".into()).encode().unwrap());
+
+        // The DISHONEST summary claims only the single honest tip — a mismatch vs the two real
+        // recipients. Must be refused with zero signatures.
+        let dishonest = UnsignedSpend {
+            coin_spends: coin_spends.clone(),
+            required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
+            summary: TransactionSummary {
+                outputs: vec![SpendOutput {
+                    address: xch_addr(honest),
+                    amount: Amount(1_000),
+                    asset_id: Some(asset.clone()),
+                }],
+                fee: Amount(0),
+            },
+        };
+        assert_eq!(
+            signer.sign_unsigned(&dishonest).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+            "a tip hiding a second recipient must be refused fail-closed",
+        );
+
+        // CONTROL: the SAME coin spends with a TRUTHFUL two-recipient summary sign — proving the
+        // refusal is the summary mismatch, not a blanket reject of multi-output CAT spends.
+        let truthful = UnsignedSpend {
+            coin_spends: coin_spends.clone(),
+            required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
+            summary: TransactionSummary {
+                outputs: vec![
+                    SpendOutput {
+                        address: xch_addr(honest),
+                        amount: Amount(1_000),
+                        asset_id: Some(asset.clone()),
+                    },
+                    SpendOutput {
+                        address: xch_addr(sneaky),
+                        amount: Amount(1_000),
+                        asset_id: Some(asset),
+                    },
+                ],
+                fee: Amount(0),
+            },
+        };
+        assert!(
+            signer.sign_unsigned(&truthful).is_ok(),
+            "the truthful control (summary matches both recipients) must sign",
+        );
+    }
+
+    /// PR-A NEGATIVE (MR-13): a tip whose CHANGE leg returns to a NON-wallet puzzle hash (value
+    /// exfiltration through an un-hinted output) MUST be refused fail-closed with ZERO signatures,
+    /// even though the wallet controls the input coin. Paired with the golden tip (change to the
+    /// wallet) as the truthful control that signs.
+    #[cfg(feature = "engine")]
+    #[tokio::test]
+    async fn tip_change_to_a_foreign_puzzle_hash_is_refused() {
+        let recipient_ph = Bytes32::new([0x77u8; 32]);
+        let foreign_change = Bytes32::new([0x99u8; 32]); // NOT a wallet puzzle hash
+        let (_, signer, unsigned) =
+            owned_tip("tip-exfil", 10_000, 1_000, recipient_ph, foreign_change).await;
+
+        assert_eq!(
+            signer.sign_unsigned(&unsigned).unwrap_err().code,
+            WalletErrorCode::SpendValidationFailed,
+            "a tip whose change leaves the wallet must be refused",
+        );
+        // The truthful control — change back to the wallet — is proven by
+        // `golden_tip_signs_and_settles_on_the_simulator`.
     }
 }
