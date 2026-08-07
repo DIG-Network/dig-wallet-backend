@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.24.0] - Unreleased
+
+### Changed
+- **types/client:** `DecodedOutput`, `TransactionSummary`, `SpendOutput`, and `HumanReadableSummary`
+  are now `#[non_exhaustive]` — future additive decode fields (e.g. `received`, #2241) are non-breaking
+  for external consumers. External code must construct these via `..` in matches / a provided
+  constructor (`TransactionSummary::new`) rather than a bare struct literal. `SpendEffect` was already
+  `#[non_exhaustive]` (#1511 PR-C) (#2242)
+
 ## [0.23.1] - 2026-08-07
 
 ### Testing

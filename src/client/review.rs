@@ -11,7 +11,11 @@ use crate::types::{Amount, TransactionSummary, UnsignedSpend};
 const MOJOS_PER_XCH: u64 = 1_000_000_000_000;
 
 /// A human-readable rendering of an unsigned spend for the confirm dialog.
+///
+/// `#[non_exhaustive]` (#2242): a decode-output type for the confirm UI — new lines/flags are
+/// added additively as the review surface grows, so external matches/literals must use `..`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HumanReadableSummary {
     /// One line per recipient output — value LEAVING the wallet.
     pub lines: Vec<String>,

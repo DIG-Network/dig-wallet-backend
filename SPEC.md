@@ -110,6 +110,9 @@ this layer.**
 - `CoinRecord`, `CatRecord`, `NftRecord`, `DidRecord`, `Balance { confirmed, spendable }`.
 - `TransactionSummary { outputs: Vec<SpendOutput>, fee: Amount }`,
   `SpendOutput { address, amount, asset_id: Option<AssetId> }`, `TransactionRecord`.
+  `TransactionSummary` and `SpendOutput` are `#[non_exhaustive]` (#2242): a decode-output type grows
+  additive fields over time (`received`, #2241), so external code matches/constructs with `..` — use
+  `TransactionSummary::new(outputs, fee)` for a one-way summary, or a full literal in-crate.
 
 ### 2.3 Spend objects (the signing-seam payloads)
 
@@ -449,6 +452,9 @@ Used by dig-app. The subscriber + identity provider + signer.
   operands are attacker-reachable — output amounts come from `CREATE_COIN` conditions, bounded by no
   coin amount — and conservation is decided by comparing these totals, so a wrapped total reports a
   spend that creates more than `u64::MAX` as conserved, and a saturated one is equally fail-open.
+- **`HumanReadableSummary` and `verify::DecodedOutput` are `#[non_exhaustive]` (#2242)** — both are
+  decode-output types whose field set grows as the review surface gains lines/flags; external code
+  must match/construct with `..`.
 - **Spend decode — two modes, ONE interpreter AND (for consent) ONE ownership split (#2209).** Both
   modes render the human-readable confirm lines ("Send 1.5 XCH to xch1… · Fee 0.0001 XCH", coin-spend
   and required-signature counts) from the value flow re-derived by `client::verify` (→ `analyze`, the

@@ -94,7 +94,11 @@ impl Default for Balance {
 
 /// A concise, human-oriented summary of a spend's net effect — carried on an
 /// [`crate::types::UnsignedSpend`] and rendered by the client review surface.
+///
+/// `#[non_exhaustive]` (#2242): a decode-output type — new fields (like `received`, #2241) are
+/// added additively as the review surface grows, so external matches/literals must use `..`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct TransactionSummary {
     /// The net outputs to non-change recipients — value LEAVING the wallet (a plain send's
     /// recipients, or an offer make's offered assets committed to the settlement puzzle).
@@ -111,8 +115,26 @@ pub struct TransactionSummary {
     pub fee: Amount,
 }
 
+impl TransactionSummary {
+    /// Build a one-way-send summary (no `received` leg) — the common case, and the only
+    /// constructor an external crate needs since `#[non_exhaustive]` (#2242) forbids a bare
+    /// struct literal outside this crate. A two-sided summary (an offer MAKE's `received` leg)
+    /// is still built in-crate, where the literal form remains available.
+    pub fn new(outputs: Vec<SpendOutput>, fee: Amount) -> Self {
+        Self {
+            outputs,
+            received: Vec::new(),
+            fee,
+        }
+    }
+}
+
 /// One recipient line within a [`TransactionSummary`].
+///
+/// `#[non_exhaustive]` (#2242): a decode-output line type — grows additively alongside
+/// `TransactionSummary`, so external matches/literals must use `..`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SpendOutput {
     /// The destination address.
     pub address: Address,
