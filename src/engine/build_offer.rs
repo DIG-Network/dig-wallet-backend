@@ -458,6 +458,10 @@ fn make_summary(
     requested: &RequestedAssets,
     fee: u64,
 ) -> TransactionSummary {
+    // Offered legs are emitted with an EMPTY address, marking them protocol sinks rather than
+    // recipient payments (see `SpendOutput::is_protocol_sink`); the client seam re-derives + matches
+    // these independently by amount + asset (the adversarial-redundancy design — the two seams encode
+    // this convention separately and must not be merged).
     let mut outputs = Vec::new();
     if offered.xch.mojos() > 0 {
         outputs.push(SpendOutput {

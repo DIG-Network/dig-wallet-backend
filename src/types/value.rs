@@ -144,6 +144,22 @@ pub struct SpendOutput {
     pub asset_id: Option<AssetId>,
 }
 
+impl SpendOutput {
+    /// Whether this output is a settlement/protocol SINK rather than a recipient payment.
+    ///
+    /// Convention (the single source of truth for it): an EMPTY address marks an output that flows
+    /// into the offer/settlement protocol machinery (a settlement-layer coin, a change-to-self sink)
+    /// rather than to a named recipient. Sinks are compared by amount + asset only — never by
+    /// address — because they have no meaningful destination string. WHY it matters: the signer's
+    /// egress gate ([`assert_reviewed_summary_matches`]) relies on this distinction to multiset-match
+    /// the reviewed summary against what will actually be signed; a bare `address.0.is_empty()` check
+    /// scattered across the emit/read-back seams could silently disagree, so both seams route through
+    /// this one named predicate.
+    pub fn is_protocol_sink(&self) -> bool {
+        self.address.0.is_empty()
+    }
+}
+
 /// A settled transaction as it appears in history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionRecord {
@@ -176,5 +192,22 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
         let back: TransactionSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(summary, back);
+    }
+
+    /// #2282: an EMPTY address marks a protocol sink; a non-empty one is a recipient.
+    #[test]
+    fn is_protocol_sink_tracks_the_empty_address_convention() {
+        let sink = SpendOutput {
+            address: Address(String::new()),
+            amount: Amount(5),
+            asset_id: None,
+        };
+        let recipient = SpendOutput {
+            address: Address("xch1abc".into()),
+            amount: Amount(5),
+            asset_id: None,
+        };
+        assert!(sink.is_protocol_sink());
+        assert!(!recipient.is_protocol_sink());
     }
 }

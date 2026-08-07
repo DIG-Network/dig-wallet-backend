@@ -591,6 +591,9 @@ pub fn summarize_egress(
         protocol_sink
             .iter()
             .filter(|output| output.amount > 0)
+            // An EMPTY address marks this as a protocol sink, not a recipient
+            // (see `SpendOutput::is_protocol_sink`); the read-back gate matches these by
+            // amount + asset only.
             .map(|output| SpendOutput {
                 address: Address(String::new()),
                 amount: Amount(output.amount),
@@ -785,25 +788,35 @@ fn tied_to_announcement(
     false
 }
 
+/// The seven non-`AGG_SIG_ME` signature-condition variants — `AGG_SIG_UNSAFE` (raw attacker-chosen
+/// message) plus the six Parent/Puzzle/Amount-scoped families. This is the single source of truth for
+/// "an agg_sig condition that a legitimate standard/CAT/settlement spend never emits"; both
+/// fail-closed guards ([`reject_any_agg_sig`] and [`reject_unexpected_agg_sig`]) route through it so
+/// the forbidden set can never drift between the two. It deliberately EXCLUDES `AGG_SIG_ME`: whether
+/// an `AGG_SIG_ME` is permitted depends on the caller's class (a settlement coin forbids it too; a
+/// standard send permits exactly one), so each guard decides that separately.
+fn is_non_me_agg_sig(condition: &Condition) -> bool {
+    matches!(
+        condition,
+        Condition::AggSigUnsafe(_)
+            | Condition::AggSigParent(_)
+            | Condition::AggSigPuzzle(_)
+            | Condition::AggSigAmount(_)
+            | Condition::AggSigPuzzleAmount(_)
+            | Condition::AggSigParentAmount(_)
+            | Condition::AggSigParentPuzzle(_)
+    )
+}
+
 /// A claimed settlement-layer coin is spent by ANNOUNCEMENT and carries no signature; the immutable
 /// settlement puzzle emits only `CREATE_COIN` + announcement conditions. Any `AGG_SIG_*` in its run
 /// conditions is therefore anomalous — refuse fail-closed rather than account a coin whose spend would
 /// silently require a signature the taker never reviewed (defense-in-depth; the canonical puzzle
 /// cannot emit one, so this only ever fires on a corrupted decode).
 fn reject_any_agg_sig(conditions: &[Condition]) -> WalletResult<()> {
-    let has_agg_sig = conditions.iter().any(|condition| {
-        condition.as_agg_sig_me().is_some()
-            || matches!(
-                condition,
-                Condition::AggSigUnsafe(_)
-                    | Condition::AggSigParent(_)
-                    | Condition::AggSigPuzzle(_)
-                    | Condition::AggSigAmount(_)
-                    | Condition::AggSigPuzzleAmount(_)
-                    | Condition::AggSigParentAmount(_)
-                    | Condition::AggSigParentPuzzle(_)
-            )
-    });
+    let has_agg_sig = conditions
+        .iter()
+        .any(|condition| condition.as_agg_sig_me().is_some() || is_non_me_agg_sig(condition));
     if has_agg_sig {
         return Err(reject(
             "a claimed settlement coin carries an AGG_SIG condition; refusing to sign",
@@ -898,17 +911,7 @@ fn enforce_sole_agg_sig_me(
 /// fail-closed. `AGG_SIG_ME` is permitted (the signer re-derives + signs exactly those). This mirrors
 /// the kind filter in the signer, one layer earlier.
 fn reject_unexpected_agg_sig(condition: &Condition) -> WalletResult<()> {
-    let forbidden = matches!(
-        condition,
-        Condition::AggSigUnsafe(_)
-            | Condition::AggSigParent(_)
-            | Condition::AggSigPuzzle(_)
-            | Condition::AggSigAmount(_)
-            | Condition::AggSigPuzzleAmount(_)
-            | Condition::AggSigParentAmount(_)
-            | Condition::AggSigParentPuzzle(_)
-    );
-    if forbidden {
+    if is_non_me_agg_sig(condition) {
         return Err(reject(
             "unexpected non-AGG_SIG_ME signature condition in a send spend (refusing to sign)",
         ));
@@ -1270,6 +1273,43 @@ mod tests {
             test_public_key(),
             Bytes::from(message.to_vec()),
         ))
+    }
+
+    /// #2282: the shared forbidden-set predicate recognizes exactly the seven non-ME agg_sig variants,
+    /// treats `AGG_SIG_ME` as NOT part of the set, and ignores non-agg-sig conditions.
+    #[test]
+    fn is_non_me_agg_sig_covers_the_seven_variants_only_2282() {
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::types::conditions::{
+            AggSigAmount, AggSigParent, AggSigParentAmount, AggSigParentPuzzle, AggSigPuzzle,
+            AggSigPuzzleAmount, AggSigUnsafe, CreateCoin,
+        };
+
+        let pk = test_public_key();
+        let msg = || Bytes::from(vec![0x01u8; 32]);
+        let seven: Vec<Condition> = vec![
+            Condition::AggSigUnsafe(AggSigUnsafe::new(pk, msg())),
+            Condition::AggSigParent(AggSigParent::new(pk, msg())),
+            Condition::AggSigPuzzle(AggSigPuzzle::new(pk, msg())),
+            Condition::AggSigAmount(AggSigAmount::new(pk, msg())),
+            Condition::AggSigPuzzleAmount(AggSigPuzzleAmount::new(pk, msg())),
+            Condition::AggSigParentAmount(AggSigParentAmount::new(pk, msg())),
+            Condition::AggSigParentPuzzle(AggSigParentPuzzle::new(pk, msg())),
+        ];
+        for condition in &seven {
+            assert!(
+                is_non_me_agg_sig(condition),
+                "{condition:?} should be non-ME"
+            );
+        }
+        // AGG_SIG_ME is deliberately excluded from the shared set.
+        assert!(!is_non_me_agg_sig(&agg_sig_me([0x11u8; 32])));
+        // A non-agg-sig condition is not in the set.
+        assert!(!is_non_me_agg_sig(&Condition::CreateCoin(CreateCoin::new(
+            Bytes32::new([0u8; 32]),
+            1,
+            Memos::None,
+        ))));
     }
 
     /// #1519: exactly one AGG_SIG_ME committing to the expected delegated-puzzle hash is accepted.
