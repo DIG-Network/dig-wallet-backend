@@ -38,7 +38,28 @@ use crate::types::{
 
 use super::hd::{MasterKey, DEFAULT_ADDRESS_GAP};
 use super::review::{self, HumanReadableSummary};
-use super::verify::{self, SpendEffect};
+use super::verify::{self, DecodedOutput};
+
+/// A spend's outputs after the signer's KEY-OWNERSHIP split (#2239) — the authoritative,
+/// signer-local view that supersedes any key-free heuristic.
+///
+/// [`verify::analyze`](super::verify::analyze) returns the created coins UNDIVIDED
+/// ([`SpendEffect::outputs`](super::verify::SpendEffect::outputs)); this is where the key-holding
+/// signer classifies them: every output whose puzzle hash the wallet can derive a key for is change
+/// (value returning home) and is DROPPED from the reviewed egress, while every other output is a
+/// [`recipient`](OwnedSplit::recipients) the human MUST have reviewed. `protocol_sink` passes through
+/// untouched by ownership (its canonical-hash invariant is enforced separately).
+///
+/// Change carries no reviewed egress and is never compared against the engine summary, so it is not
+/// retained here — only the outputs that actually LEAVE the wallet (recipients + sinks) and the fee.
+struct OwnedSplit {
+    /// Outputs to addresses the wallet does NOT control — value leaving that must be reviewed.
+    recipients: Vec<DecodedOutput>,
+    /// Outputs committed to a consensus-enforced canonical structural puzzle (settlement / launcher).
+    protocol_sink: Vec<DecodedOutput>,
+    /// The farmer fee (XCH mojos).
+    fee: u64,
+}
 
 /// The Chia mainnet genesis challenge — the AGG_SIG_ME additional data every mainnet spend
 /// signature is bound to. Sourced from `dig-constants` (the ecosystem's single source of truth for
@@ -250,13 +271,13 @@ impl LocalSigner {
         // `verify::analyze` produces, which over-counts recipients for a $DIG tip (dig-cat memo-hints
         // the tip's change coin too). It never lets value leave unnoticed: a non-owned output is
         // always a recipient, and every recipient must appear in the reviewed summary below.
-        let effect = self.reclassify_by_ownership(verify::analyze(&unsigned.coin_spends)?);
+        let split = self.reclassify_by_ownership(verify::analyze(&unsigned.coin_spends)?);
 
         // Defense-in-depth (#1511 MR-3): every `protocol_sink` output MUST commit to a recognized
         // canonical structural puzzle (settlement). `analyze` already routes ONLY settlement-destined
         // outputs here, but re-assert it at the signing gate so a future decode change can never let
         // an attacker address be laundered as a "sink" the summary comparison then excludes.
-        for output in &effect.protocol_sink {
+        for output in &split.protocol_sink {
             if !verify::is_protocol_sink_hash(output.puzzle_hash) {
                 return Err(WalletError::new(
                     WalletErrorCode::SpendValidationFailed,
@@ -270,32 +291,30 @@ impl LocalSigner {
         // address) and settlement sinks (by amount+asset) — otherwise the engine could show a benign
         // summary while the bytes send value elsewhere. With change split off by ownership above, this
         // is the whole no-silent-exfiltration guarantee.
-        self.assert_reviewed_summary_matches(&unsigned.summary, &effect)
+        self.assert_reviewed_summary_matches(&unsigned.summary, &split)
     }
 
-    /// Split a re-derived [`SpendEffect`] by KEY OWNERSHIP: an output whose puzzle hash this wallet
-    /// controls is CHANGE (value returning home); every other output is a RECIPIENT the human must
-    /// have reviewed. Unlike the key-free memo split in [`verify::analyze`], this is correct for
-    /// spends whose change coin is memo-hinted (every `dig-cat`/$DIG-tip send), and it is strictly
-    /// safer — a non-owned output can never be silently reclassified as change and slip past the
-    /// summary gate.
-    fn reclassify_by_ownership(&self, effect: SpendEffect) -> SpendEffect {
-        let mut recipients = Vec::new();
-        let mut change = Vec::new();
-        for output in effect.recipients.into_iter().chain(effect.change) {
-            if self.owns_puzzle_hash(output.puzzle_hash) {
-                change.push(output);
-            } else {
-                recipients.push(output);
-            }
-        }
+    /// Split a re-derived [`SpendEffect`](super::verify::SpendEffect)'s UNDIVIDED outputs by KEY
+    /// OWNERSHIP into an [`OwnedSplit`]: an output whose puzzle hash this wallet controls is CHANGE
+    /// (value returning home); every other output is a RECIPIENT the human must have reviewed. This is
+    /// the ONE authoritative recipient/change split (#2239): `verify::analyze` performs none, so a
+    /// non-owned output can never be silently reclassified as change and slip past the summary gate —
+    /// and it is correct for spends whose change coin is memo-hinted (every `dig-cat`/$DIG-tip send),
+    /// which no key-free memo heuristic could classify reliably.
+    fn reclassify_by_ownership(&self, effect: verify::SpendEffect) -> OwnedSplit {
+        // Owned outputs are change (value returning home) and are dropped from the reviewed egress;
+        // every other output leaves the wallet and MUST appear in the reviewed summary.
+        let recipients = effect
+            .outputs
+            .into_iter()
+            .filter(|output| !self.owns_puzzle_hash(output.puzzle_hash))
+            .collect();
         // `protocol_sink` is untouched by ownership: it is value the wallet intentionally commits to a
         // consensus-enforced settlement structure (an offer's offered/paid assets), neither returning
         // home nor going to a chosen recipient. Its canonical-hash invariant is enforced separately in
         // `verify_before_signing` before any signature is produced.
-        SpendEffect {
+        OwnedSplit {
             recipients,
-            change,
             protocol_sink: effect.protocol_sink,
             fee: effect.fee,
         }
@@ -309,8 +328,8 @@ impl LocalSigner {
         &self,
         coin_spends: &[chia_protocol::CoinSpend],
     ) -> WalletResult<TransactionSummary> {
-        let effect = self.reclassify_by_ownership(verify::analyze(coin_spends)?);
-        verify::summarize(&effect)
+        let split = self.reclassify_by_ownership(verify::analyze(coin_spends)?);
+        verify::summarize_egress(&split.recipients, &split.protocol_sink, split.fee)
     }
 
     /// Decode an unsigned spend for the pre-sign CONSENT prompt — the human-readable screen the user
@@ -356,7 +375,7 @@ impl LocalSigner {
     fn assert_reviewed_summary_matches(
         &self,
         claimed: &TransactionSummary,
-        effect: &SpendEffect,
+        split: &OwnedSplit,
     ) -> WalletResult<()> {
         let mismatch = |what: &str| {
             WalletError::new(
@@ -365,13 +384,13 @@ impl LocalSigner {
             )
         };
 
-        if claimed.fee.mojos() != effect.fee {
+        if claimed.fee.mojos() != split.fee {
             return Err(mismatch("fee"));
         }
 
         // The recipient set: derived recipients (real puzzle hashes) vs the claimed outputs carrying a
         // real address, compared as a sorted multiset of (puzzle hash, amount, asset).
-        let mut derived_recipients: Vec<(Vec<u8>, u64, Option<String>)> = effect
+        let mut derived_recipients: Vec<(Vec<u8>, u64, Option<String>)> = split
             .recipients
             .iter()
             .map(|output| {
@@ -409,7 +428,7 @@ impl LocalSigner {
         // puzzle, so it is NOT part of the comparison.
         // Zero-value settlement outputs are announcement carriers, not value leaving the wallet, so
         // they are not part of the reviewed egress (mirrors `verify::summarize`).
-        let mut derived_sinks: Vec<(u64, Option<String>)> = effect
+        let mut derived_sinks: Vec<(u64, Option<String>)> = split
             .protocol_sink
             .iter()
             .filter(|output| output.amount > 0)
@@ -1870,6 +1889,116 @@ mod tests {
             .expect("the signed tip must be accepted by the simulator");
     }
 
+    /// #2239 / #1511 PR-A (focused): a CAT send whose CHANGE coin is MEMO-HINTED (exactly the dig-cat
+    /// tip shape that misled the old key-free memo heuristic). Because `analyze` now returns the
+    /// outputs UNDIVIDED, the signer classifies them purely by KEY OWNERSHIP: the memo-hinted change
+    /// to the wallet's own puzzle hash is recognized as owned → change (dropped from egress), so
+    /// `reviewable_summary` lists ONLY the true recipient. The memo can no longer inflate the egress.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn memo_hinted_change_is_classified_as_change_by_ownership() {
+        use chia_puzzle_types::standard::StandardArgs;
+
+        let recipient = Bytes32::new([0x77u8; 32]);
+        let wallet_ph = Bytes32::from(
+            StandardArgs::curry_tree_hash(master("pra-memo-change").wallet_public_key(0))
+                .to_bytes(),
+        );
+
+        // Pay 1_000 to a real recipient (hinted) + 9_000 memo-HINTED "change" home (total 10_000
+        // conserves). The un-fixed heuristic would count the hinted change as a second recipient.
+        let (signer, coin_spends) = wallet_cat_spend(
+            "pra-memo-change",
+            10_000,
+            &[(recipient, 1_000, true), (wallet_ph, 9_000, true)],
+        );
+
+        // `analyze` is agnostic: both hinted coins land in the one undivided `outputs` bucket.
+        let effect = verify::analyze(&coin_spends).unwrap();
+        assert_eq!(effect.outputs.len(), 2, "both coins are undivided outputs");
+
+        // The key-aware reviewable summary drops the owned change and surfaces ONLY the recipient.
+        let reviewable = signer.reviewable_summary(&coin_spends).unwrap();
+        assert_eq!(reviewable.outputs.len(), 1);
+        assert_eq!(reviewable.outputs[0].amount, crate::types::Amount(1_000));
+        assert_eq!(reviewable.outputs[0].address, xch_addr(recipient));
+    }
+
+    /// #2239 test #4: an un-hinted change coin sent to an owned FRESH derivation address (index 1, not
+    /// the primary index 0) is classified as change by the ownership walk — proving the split uses key
+    /// derivation across the gap, not memo hints. The recipient list holds only the real payee.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn unhinted_change_to_a_fresh_owned_address_is_change() {
+        use chia_puzzle_types::standard::StandardArgs;
+
+        let attacker = Bytes32::new([0x55u8; 32]);
+        // A FRESH owned address: derivation index 1 (the ownership walk scans 0..gap).
+        let fresh_change = Bytes32::from(
+            StandardArgs::curry_tree_hash(master("fresh-change").wallet_public_key(1)).to_bytes(),
+        );
+
+        // 2_000-coin: 1_200 to a non-owned payee (un-hinted) + 800 un-hinted change to the fresh
+        // owned address (conserves, fee 0).
+        let (signer, coin_spends) = wallet_xch_spend(
+            "fresh-change",
+            2_000,
+            &[(attacker, 1_200, false), (fresh_change, 800, false)],
+            false,
+        );
+
+        let reviewable = signer.reviewable_summary(&coin_spends).unwrap();
+        assert_eq!(
+            reviewable.outputs.len(),
+            1,
+            "the fresh-address change is owned, so only the real payee is egress"
+        );
+        assert_eq!(reviewable.outputs[0].address, xch_addr(attacker));
+        assert_eq!(reviewable.outputs[0].amount, crate::types::Amount(1_200));
+    }
+
+    /// #2239 test #5: a multi-asset bundle (an XCH standard send + a CAT send) is decoded with BOTH
+    /// assets' created coins in the ONE undivided `outputs` bucket — a native-XCH output (`asset_id:
+    /// None`) alongside a CAT output (`asset_id: Some`) — with no recipient/change split at the
+    /// `analyze` seam and no protocol sink.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn multi_asset_xch_and_cat_outputs_are_undivided() {
+        use chia_puzzle_types::standard::StandardArgs;
+
+        let payee = Bytes32::new([0x77u8; 32]);
+        let wallet_ph = Bytes32::from(
+            StandardArgs::curry_tree_hash(master("multi-asset").wallet_public_key(0)).to_bytes(),
+        );
+
+        // A conserving XCH send (1_200 payee + 800 change) ...
+        let (_s1, mut coin_spends) = wallet_xch_spend(
+            "multi-asset",
+            2_000,
+            &[(payee, 1_200, false), (wallet_ph, 800, false)],
+            false,
+        );
+        // ... plus a conserving CAT send (600 payee + 400 change) in the same bundle.
+        let (_s2, cat_spends) = wallet_cat_spend(
+            "multi-asset",
+            1_000,
+            &[(payee, 600, false), (wallet_ph, 400, false)],
+        );
+        coin_spends.extend(cat_spends);
+
+        let effect = verify::analyze(&coin_spends).unwrap();
+        assert!(effect.protocol_sink.is_empty());
+        assert_eq!(effect.outputs.len(), 4, "both assets' coins are undivided");
+        assert!(
+            effect.outputs.iter().any(|o| o.asset_id.is_none()),
+            "a native-XCH output is present"
+        );
+        assert!(
+            effect.outputs.iter().any(|o| o.asset_id.is_some()),
+            "a CAT output is present"
+        );
+    }
+
     /// Hand-build a CAT spend of `label`'s wallet key that pays `outputs` (each `(ph, amount,
     /// hinted)`), returning change to the wallet. `hinted` outputs are memo-tagged so `analyze`
     /// classifies them as recipients; un-hinted ones are change. The CAT is issued off a fabricated
@@ -1967,7 +2096,7 @@ mod tests {
         );
         let asset = AssetId(hex::encode(
             // the fabricated CAT's asset id is recovered from the derived effect.
-            verify::analyze(&coin_spends).unwrap().recipients[0]
+            verify::analyze(&coin_spends).unwrap().outputs[0]
                 .asset_id
                 .unwrap(),
         ));
@@ -2396,19 +2525,19 @@ mod tests {
         )
     }
 
-    /// #2209 FINDING-2 (the headline): the key-FREE consent view fails OPEN on an un-hinted,
-    /// NON-owned output — it buckets it as "change" and DROPS it — while the signer's key-AWARE gate
-    /// would authorize a spend that pays it. The key-aware [`LocalSigner::decode_verified`] closes the
-    /// divergence: it SURFACES that egress as a recipient line, so the approved screen equals the
-    /// signed bytes.
+    /// #2209 FINDING-2 + #2239 review-surface FIX: an un-hinted, NON-owned egress must never be
+    /// hidden. Formerly the key-FREE view bucketed it as "change" and DROPPED it (fail-open); now that
+    /// `analyze` returns UNDIVIDED outputs, the key-free `derive_summary` conservatively SURFACES
+    /// every output (payment AND change) — it can no longer drop the non-owned egress. The key-AWARE
+    /// [`LocalSigner::decode_verified`] additionally drops the wallet-owned change, showing EXACTLY the
+    /// 1-XCH attacker egress the signer authorizes, so the approved screen equals the signed bytes.
     ///
     /// The spend is a REAL, `analyze`-VALID standard-layer spend of a 2-XCH wallet-owned coin (the
-    /// signer's own canonical key decides ownership) paying 1 XCH to an attacker address UN-HINTED
-    /// (so the memo heuristic mislabels it change) + 1 XCH back home. Anchored to a real spend + real
-    /// keys, never a mock.
+    /// signer's own canonical key decides ownership) paying 1 XCH to an attacker address UN-HINTED +
+    /// 1 XCH back home. Anchored to a real spend + real keys, never a mock.
     #[cfg(feature = "engine")]
     #[test]
-    fn consent_decode_surfaces_an_unhinted_non_owned_egress_the_keyfree_view_hides() {
+    fn consent_decode_surfaces_an_unhinted_non_owned_egress() {
         use chia_puzzle_types::standard::StandardArgs;
 
         const ONE_XCH: u64 = 1_000_000_000_000;
@@ -2430,12 +2559,22 @@ mod tests {
             "the spend is a valid, conserving standard-layer send"
         );
 
-        // The OLD key-FREE summarizer HIDES the egress: both outputs are un-hinted, so both are
-        // bucketed as change and the rendered summary is EMPTY. This is the fail-open gap.
+        // #2239: the key-FREE summarizer now conservatively SURFACES every output — the attacker
+        // egress AND the wallet change (2 XCH total, undivided) — so it can no longer HIDE the
+        // non-owned egress (the old fail-open gap is closed at the source).
         let key_free = verify::derive_summary(&coin_spends).unwrap();
+        assert_eq!(
+            key_free.outputs.len(),
+            2,
+            "the key-free view surfaces all outputs undivided, never dropping the non-owned egress"
+        );
         assert!(
-            key_free.outputs.is_empty(),
-            "the key-free view drops the un-hinted non-owned egress (Finding-2 gap)"
+            key_free
+                .outputs
+                .iter()
+                .any(|o| o.address == xch_addr(attacker)
+                    && o.amount == crate::types::Amount(ONE_XCH)),
+            "the previously-hidden non-owned egress is now surfaced by the key-free view"
         );
 
         // The KEY-AWARE consent decode SURFACES the 1-XCH → attacker egress as a recipient line.
@@ -2493,16 +2632,19 @@ mod tests {
             summary: empty_summary(),
         };
 
-        // The key-free decode's re-derivation SUCCEEDS here, but the summary hides the egress. It must
-        // therefore refuse to claim `verified` — a key-free decode can never carry ownership assurance.
+        // The key-free decode's re-derivation SUCCEEDS here. Even though it now conservatively
+        // surfaces every output (#2239), it STILL must refuse to claim `verified`: with no keys it
+        // cannot split recipients from change, so it over-lists the wallet's own change as egress and
+        // carries no ownership assurance. `verified = true` is reserved for the key-aware decode.
         let key_free = review::decode(&unsigned);
         assert!(
             !key_free.verified,
             "the key-free decode must never present verified = true"
         );
-        assert!(
-            key_free.lines.is_empty(),
-            "the key-free heuristic still drops the un-hinted egress — which is exactly why it is unverified"
+        assert_eq!(
+            key_free.lines.len(),
+            2,
+            "the key-free view surfaces both outputs undivided (over-listing change), yet stays unverified"
         );
     }
 

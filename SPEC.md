@@ -385,19 +385,24 @@ Used by dig-app. The subscriber + identity provider + signer.
   (a live filtered stream over the engine broadcast), and the `CatchUp::catch_up(since, filter)`
   backfill trait. §5.
 - **`client::verify`** — INDEPENDENT re-derivation of a spend's value flow from its `CoinSpend`s
-  alone (never the engine-supplied summary). `analyze(&[CoinSpend]) -> SpendEffect { recipients,
-  change, fee }` parses each coin spend back through the chia-wallet-sdk drivers it was built with
-  (`Cat::parse` for a CAT, `StandardLayer` for standard XCH), runs each puzzle+solution to obtain its
-  conditions, sorts `CREATE_COIN`s into hinted (recipient) vs un-hinted (change), sums `RESERVE_FEE`,
+  alone (never the engine-supplied summary). `analyze(&[CoinSpend]) -> SpendEffect { outputs,
+  protocol_sink, fee }` parses each coin spend back through the chia-wallet-sdk drivers it was built
+  with (`Cat::parse` for a CAT, `StandardLayer` for standard XCH), runs each puzzle+solution to obtain
+  its conditions, collects every free-address `CREATE_COIN` UNDIVIDED into `outputs` (it performs NO
+  recipient-vs-change split — that split is inherently key-relative and is deferred to the key-holding
+  consumer, #2239), routes canonical-structural `CREATE_COIN`s to `protocol_sink`, sums `RESERVE_FEE`,
   and enforces per-asset value conservation. Before trusting a reveal it MUST bind the reveal to the
   coin: `sha256tree(puzzle_reveal)` MUST equal `coin.puzzle_hash`, or the reveal is a substituted
   puzzle the coin never committed to and the spend is refused (#1518). For every standard-layer coin
   it MUST also find EXACTLY ONE `AGG_SIG_ME` condition whose message equals `sha256tree(delegated_
   puzzle)` — zero (nothing binds a signature to the coin), more than one (a second `AGG_SIG_ME` could
   launder a blank-check signature for another coin through a benign carrier), or a wrong-hash
-  `AGG_SIG_ME` are each refused (#1519). `derive_summary(&[CoinSpend]) -> TransactionSummary`
-  wraps it for display; `summarize(&SpendEffect) -> TransactionSummary` is the shared renderer both it
-  and the signer's key-aware summary use. The standard-XCH-send, CAT-send, $DIG-**tip**, the three
+  `AGG_SIG_ME` are each refused (#1519). `derive_summary(&[CoinSpend]) -> TransactionSummary` wraps it
+  for a KEY-FREE, NON-AUTHORITATIVE display view — with no keys it renders EVERY `outputs` entry as
+  egress (conservative: it over-lists the wallet's own change but NEVER drops a non-owned coin);
+  `summarize_egress(egress, protocol_sink, fee) -> TransactionSummary` is the shared renderer both it
+  (passing ALL of `outputs`) and the signer's key-aware summary (passing only the not-owned outputs)
+  use, so both encode addresses + asset ids identically. The standard-XCH-send, CAT-send, $DIG-**tip**, the three
   **offer** shapes (make / take / cancel), and the covered-option **transfer** the engine
   builds are decodable (a tip is a single-key CAT payment through the same `Cat::parse` path, #1511 PR-A;
   offers commit value to the canonical settlement puzzle, #1511 PR-B; a transfer decodes through
@@ -414,7 +419,7 @@ Used by dig-app. The subscriber + identity provider + signer.
   launcher (`SINGLETON_LAUNCHER_HASH`, #1511 PR-C). A `CREATE_COIN` routes to `protocol_sink` ONLY when
   its destination is one of those canonical hashes (`is_protocol_sink_hash`), never a free address, so an
   attacker address can never be laundered as a "sink". Value
-  conservation generalizes to `in == recipients + change + protocol_sink + fee` (still TOTAL arithmetic —
+  conservation generalizes to `in == outputs + protocol_sink + fee` (still TOTAL arithmetic —
   never wrapping). The offer-binding rule (MR-6) is enforced at the BUNDLE level (#2241): the security
   property is that no settlement-sink egress may occur without the requested-payment binding being
   enforced ATOMICALLY in the same bundle. A `dig-offers` make binds the requested payment with an
@@ -441,10 +446,12 @@ Used by dig-app. The subscriber + identity provider + signer.
   (which gates on `SETTLEMENT_PAYMENT_HASH`); they carry NO signature (claimed by announcement), so
   their `AGG_SIG_ME`/quote-form guards are skipped and their notarized payments are accounted as
   outputs — a cancel is an ordinary standard/CAT reclaim and decodes with no settlement leg.
-  Splitting outputs into recipients vs change is inherently KEY-RELATIVE: `analyze` makes a key-free
-  best-effort split on memo-hinting, but `dig-cat` (so every tip) memo-hints its change coin too, so
-  the AUTHORITATIVE split is the key-aware one in `LocalSigner` (below) — the signer's gate never
-  relies on the memo heuristic.
+  Splitting outputs into recipients vs change is inherently KEY-RELATIVE (both are plain `CREATE_COIN`s
+  on chain), so `analyze` performs NO split and returns them UNDIVIDED in `outputs` (#2239). The ONE
+  authoritative split lives in `LocalSigner` (below), which classifies each output by KEY OWNERSHIP
+  (owned → change, dropped from egress; not-owned → recipient). The removed key-free memo heuristic was
+  unreliable — `dig-cat` (so every tip) memo-hints its change coin too, and a memo-hinted change coin
+  was misclassified in practice (#1511 PR-A) — so it is no longer a source of truth anywhere.
   Every value accumulation on the conservation path — XCH inputs, XCH outputs, per-asset CAT inputs,
   per-asset CAT outputs, reserved fees, and `outputs + fee` — MUST be TOTAL arithmetic over the full
   `u64` range: a sum that is not representable MUST be refused with
@@ -461,29 +468,31 @@ Used by dig-app. The subscriber + identity provider + signer.
   SINGLE authoritative interpreter of what a spend means). They differ in fallback behaviour AND — the
   point of #2209 — in WHICH recipient/change split they render:
   - **`client::review::decode(&UnsignedSpend) -> HumanReadableSummary`** — DISPLAY-ONLY, key-FREE, and
-    ALWAYS `HumanReadableSummary::verified = false` (#2255). It renders `verify::derive_summary`, whose
-    recipient/change split is a memo heuristic with NO ownership check, so an un-hinted output to a
-    NON-owned address is bucketed as "change" and DROPPED from the lines. Because it has no key it
-    cannot split by ownership, so it can silently hide a real egress — therefore it can NEVER present a
-    `verified = true` view (both its success path and its engine-claim fallback return
-    `verified = false`). This makes a `verified = true` consent screen structurally impossible to
-    source from the key-free decode. A caller MUST render + honour the flag; it MUST NOT be used ahead
-    of signing. **Invariant: `verified = true` ⇔ the key-aware ownership split (`decode_verified`).**
+    ALWAYS `HumanReadableSummary::verified = false` (#2255). It renders `verify::derive_summary`, which
+    — having no keys — CONSERVATIVELY lists EVERY undivided output as egress (#2239): it over-lists the
+    wallet's own change but can NEVER drop a non-owned coin (closing the former fail-open gap where an
+    un-hinted non-owned output was mis-bucketed as change and hidden). Because it cannot split by
+    ownership it carries no ownership assurance, so it NEVER presents a `verified = true` view (both its
+    success path and its engine-claim fallback return `verified = false`). This makes a
+    `verified = true` consent screen structurally impossible to source from the key-free decode. A
+    caller MUST render + honour the flag; it MUST NOT be used ahead of signing. **Invariant:
+    `verified = true` ⇔ the key-aware ownership split (`decode_verified`).**
   - **`client::signer::LocalSigner::decode_verified(&UnsignedSpend) -> WalletResult<HumanReadableSummary>`**
     — the pre-sign CONSENT decode. It is a METHOD on the key-holding signer (a free function cannot be
     key-aware) with NO fallback: it re-derives through `verify::analyze` and, if that fails, returns
     `Err(SpendValidationFailed)` — NEVER the engine's claim. It renders exactly the signer's key-AWARE
-    `LocalSigner::reviewable_summary` (every wallet-owned output is change; every NON-owned output —
-    including an un-hinted one the key-free split would hide — is a recipient line). The returned
-    summary is always `verified`.
+    `LocalSigner::reviewable_summary` (every wallet-owned output is change, dropped from egress; every
+    NON-owned output is a recipient line — so the screen shows EXACTLY what leaves the wallet, whereas
+    the key-free view over-lists the wallet's own change). The returned summary is always `verified`.
   - **Consent == signed bytes, by construction (MUST NOT drift):** the screen a user consents to
     before signing and the bytes `LocalSigner::verify_before_signing` gates on derive from the SAME
     `verify::analyze` interpreter AND the SAME key-aware ownership split (`reclassify_by_ownership` via
     `reviewable_summary`) — `decode_verified` renders precisely what the signing gate authorizes, so
-    no egress the signer would sign can be missing from the approved screen. A key-FREE consent summary
-    would fail OPEN here (it hides un-hinted non-owned outputs the key-aware gate still signs), so the
-    consent decode MUST be the key-aware one on `LocalSigner`. Only the lenient key-free `decode` may
-    degrade, and only for a display surface that shows the `verified` flag.
+    no egress the signer would sign can be missing from the approved screen. The key-FREE `decode`
+    cannot apply the ownership split, so it over-lists the wallet's own change and carries no ownership
+    assurance; the consent decode MUST therefore be the key-aware one on `LocalSigner`. Only the
+    lenient key-free `decode` may degrade to the engine claim, and only for a display surface that
+    shows the `verified` flag.
   - **Received leg — the offer MAKE shows the trade both ways (#2241).** `TransactionSummary` carries a
     `received` bucket, DISTINCT from `outputs` (value leaving) and never conflated with it. An offer
     MAKE populates `received` with the REQUESTED payments the maker gets, each to the maker's own

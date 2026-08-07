@@ -91,20 +91,19 @@ fn render_amount(amount: Amount, is_xch: bool) -> String {
 /// the loud one: a caller that reaches for `decode` is opting into a possibly-unverified,
 /// key-free screen.
 ///
-/// # Key-free — do not trust its recipient/change split
-/// `decode` renders the KEY-FREE [`super::verify::derive_summary`], whose recipient/change split is a
-/// memo heuristic with no ownership check. An un-hinted output to a NON-owned address is bucketed as
-/// "change" and dropped from the rendered lines — so this view can hide a real egress. Only the
-/// key-aware [`super::signer::LocalSigner::decode_verified`] (which the signer authorizes against)
-/// surfaces every non-owned output. This lenient decode is for a display surface only.
+/// # Key-free — cannot distinguish change from recipients
+/// `decode` renders the KEY-FREE [`super::verify::derive_summary`], which — having no keys — lists
+/// EVERY created output as egress (#2239). It therefore OVER-lists (a spend's own change appears as
+/// egress) but never HIDES a non-owned output. Only the key-aware
+/// [`super::signer::LocalSigner::decode_verified`] (which the signer authorizes against) drops
+/// wallet-owned change to show exactly what leaves. This lenient decode is for a display surface only.
 pub fn decode(unsigned: &UnsignedSpend) -> HumanReadableSummary {
     match super::verify::derive_summary(&unsigned.coin_spends) {
-        // A key-free decode is ALWAYS `verified = false` (#2255). Even when the key-free
-        // re-derivation succeeds it uses the memo-based `classify`, which buckets un-hinted non-owned
-        // outputs as change and DROPS them — so a `verified = true` here would be a FALSE assurance,
-        // hiding a real egress that the signer would still sign. `verified = true` is reserved for the
-        // key-aware ownership split ([`super::signer::LocalSigner::decode_verified`]), the ONLY decode
-        // that structurally surfaces every non-owned output.
+        // A key-free decode is ALWAYS `verified = false` (#2255): with no keys it cannot split
+        // recipients from change, so it over-lists change as egress and cannot carry ownership
+        // assurance. `verified = true` is reserved for the key-aware ownership split
+        // ([`super::signer::LocalSigner::decode_verified`]), the ONLY decode that authoritatively
+        // separates the outputs that actually leave the wallet.
         Ok(summary) => render(unsigned, &summary, false),
         // Fall back to the engine's (untrusted) claim, likewise unverified. The signer refuses to sign
         // such a spend regardless (`verify_before_signing` re-runs `analyze` fail-closed).
@@ -343,6 +342,9 @@ mod tests {
             !summary.verified,
             "a key-free decode is always ownership-unverified (#2255)"
         );
-        assert_eq!(summary.lines.len(), 1);
+        // #2239: the key-free decode surfaces every undivided output — the 600 payment AND the 390
+        // change — because with no keys it cannot drop the wallet's own change. Two lines, but still
+        // unverified: over-listing change is exactly why a key-free view carries no ownership assurance.
+        assert_eq!(summary.lines.len(), 2);
     }
 }
