@@ -697,6 +697,7 @@ mod tests {
 
     fn empty_summary() -> TransactionSummary {
         TransactionSummary {
+            received: vec![],
             outputs: vec![],
             fee: Amount(0),
         }
@@ -1381,6 +1382,7 @@ mod tests {
                 message: bound_message("settlement"),
             }],
             summary: TransactionSummary {
+                received: vec![],
                 outputs: vec![SpendOutput {
                     address: crate::types::Address("xch1whatever".into()),
                     amount: Amount(1_000),
@@ -1433,6 +1435,7 @@ mod tests {
             coin_spends,
             required_signatures: vec![],
             summary: TransactionSummary {
+                received: vec![],
                 outputs: vec![],
                 fee: Amount(0),
             },
@@ -1540,6 +1543,7 @@ mod tests {
             coin_spends,
             required_signatures: vec![],
             summary: TransactionSummary {
+                received: vec![],
                 outputs: vec![],
                 fee: Amount(0),
             },
@@ -1976,6 +1980,7 @@ mod tests {
             coin_spends: coin_spends.clone(),
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
+                received: vec![],
                 outputs: vec![SpendOutput {
                     address: xch_addr(honest),
                     amount: Amount(1_000),
@@ -1996,6 +2001,7 @@ mod tests {
             coin_spends: coin_spends.clone(),
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
+                received: vec![],
                 outputs: vec![
                     SpendOutput {
                         address: xch_addr(honest),
@@ -2218,6 +2224,20 @@ mod tests {
             "the re-derived make summary must equal the builder's (offered CAT → settlement sink)",
         );
 
+        // #2241: the CONSENT decode surfaces the requested payment as a distinct receive line, so the
+        // maker sees what they receive (50_000 XCH) alongside what they give (the offered CAT).
+        let consent = maker
+            .signer
+            .decode_verified(&pending.unsigned)
+            .expect("a genuine make decodes for consent");
+        assert_eq!(
+            consent.receive_lines.len(),
+            1,
+            "the make's requested payment renders as a distinct receive line",
+        );
+        // 50_000 mojos renders as 0.00000005 XCH (mojos → decimal XCH, trailing zeros trimmed).
+        assert!(consent.receive_lines[0].starts_with("Receive 0.00000005 XCH to xch1"));
+
         let offer = maker_builder
             .assemble_make(AssembleOfferRequest {
                 build_id: pending.build_id,
@@ -2356,7 +2376,10 @@ mod tests {
             conditions = conditions.create_coin(ph, amount, memos);
         }
         if bind {
-            conditions = conditions.assert_concurrent_spend(Bytes32::new([0x44; 32]));
+            // The offer binding a make/take asserts is an ANNOUNCEMENT assertion (the requested
+            // payment's settlement announcement) — the only kind that binds the settlement egress to a
+            // value-carrying counter-payment (#2241). A concurrency assertion no longer counts.
+            conditions = conditions.assert_puzzle_announcement(Bytes32::new([0x44; 32]));
         }
         StandardLayer::new(pk)
             .spend(&mut ctx, coin, conditions)
@@ -2456,6 +2479,7 @@ mod tests {
             coin_spends: vec![bad_spend],
             required_signatures: vec![],
             summary: TransactionSummary {
+                received: vec![],
                 outputs: vec![SpendOutput {
                     address: Address("xch1attacker".into()),
                     amount: Amount(1_000_000_000_000),
@@ -2517,6 +2541,7 @@ mod tests {
             coin_spends: coin_spends.clone(),
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
+                received: vec![],
                 outputs: vec![SpendOutput {
                     address: crate::types::Address(String::new()),
                     amount: Amount(50_000),
@@ -2540,6 +2565,7 @@ mod tests {
             coin_spends: real_spends.clone(),
             required_signatures: signer2.required_signatures_from(&real_spends).unwrap(),
             summary: TransactionSummary {
+                received: vec![],
                 outputs: vec![SpendOutput {
                     address: crate::types::Address(String::new()),
                     amount: Amount(50_000),
@@ -2585,6 +2611,7 @@ mod tests {
             coin_spends: coin_spends.clone(),
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
+                received: vec![],
                 outputs: vec![SpendOutput {
                     address: crate::types::Address(String::new()),
                     amount: Amount(50_000),
@@ -2604,6 +2631,7 @@ mod tests {
             coin_spends: coin_spends.clone(),
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
+                received: vec![],
                 outputs: vec![
                     SpendOutput {
                         address: crate::types::Address(String::new()),
@@ -2635,6 +2663,7 @@ mod tests {
         use crate::types::{Amount, SpendOutput, TransactionSummary};
 
         let sink_summary = || TransactionSummary {
+            received: vec![],
             outputs: vec![SpendOutput {
                 address: crate::types::Address(String::new()),
                 amount: Amount(50_000),
@@ -2708,6 +2737,7 @@ mod tests {
         let attacker = Bytes32::new([0x6e; 32]);
         let signer = canonical_mainnet_signer("mr8");
         let empty = TransactionSummary {
+            received: vec![],
             outputs: vec![],
             fee: Amount(0),
         };

@@ -3,6 +3,25 @@
 High-signal, durable realizations from developing this crate. Concise facts with context — NOT a
 change diary.
 
+## An offer requested payment is NOT re-derivable from the coin spends (#2241)
+
+The maker's offered coins bind the requested payment by asserting a settlement PUZZLE announcement
+whose id is `sha256(settlement_puzzle_hash || tree_hash(notarized_payment))` — a NON-invertible hash.
+So the client's coin-spends-only interpreter (`verify::analyze`) cannot recover WHAT the maker will
+receive; it can only see that SOME announcement is asserted. Consequences: (1) the reviewed "received"
+leg (#2241) is engine-DECLARED metadata carried on `TransactionSummary::received`, rendered
+informationally in both the display and consent decodes, and deliberately OUTSIDE the signer's egress
+gate (`assert_reviewed_summary_matches` compares only `outputs` + `fee`). It is safe because the offer
+mechanism itself consensus-binds fulfilment — the offered coins are unspendable unless a settlement
+coin announces exactly that requested payment — so a mis-declared received line cannot make the maker
+lose more than the OFFERED leg they still independently verify + consent to. (2) The MR-6
+offer-binding check accepts ONLY announcement assertions, never concurrency assertions: a concurrent
+spend binds "co-spent with coin X", which says nothing about value received, so a settlement egress
+bound only by concurrency is a give-it-away-for-nothing and is refused. Fully verifying the received
+leg against the asserted announcement would require reconstructing the exact nonce ordering +
+notarized-payment hashing — better exposed as a vetted `dig-offers` verify helper (release-first) than
+re-implemented client-side (byte-drift risk).
+
 ## Consent decode must require the interpreter, never the builder's claim (#2209)
 
 A spend decode that falls back to the engine-supplied summary when re-derivation fails is fine for a

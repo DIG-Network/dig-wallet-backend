@@ -253,6 +253,7 @@ async fn no_secret_material_is_ever_persisted() {
                 tx_id: "tx".into(),
                 confirmed_height: Some(2),
                 summary: TransactionSummary {
+                    received: vec![],
                     outputs: vec![],
                     fee: Amount(1),
                 },

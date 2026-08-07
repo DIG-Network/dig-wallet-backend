@@ -412,9 +412,15 @@ Used by dig-app. The subscriber + identity provider + signer.
   its destination is one of those canonical hashes (`is_protocol_sink_hash`), never a free address, so an
   attacker address can never be laundered as a "sink". Value
   conservation generalizes to `in == recipients + change + protocol_sink + fee` (still TOTAL arithmetic —
-  never wrapping). A wallet coin that spends into settlement MUST also carry an offer-binding assertion
-  (announcement/concurrency), or it is refused as give-it-away-for-nothing (MR-6) — EXCEPT in an option
-  (transfer) bundle, which emits no settlement egress from a wallet-signed coin. Settlement-layer coins
+  never wrapping). A wallet coin that spends into settlement MUST also carry an offer-binding assertion,
+  or it is refused as give-it-away-for-nothing (MR-6) — EXCEPT in an option (transfer) bundle, which
+  emits no settlement egress from a wallet-signed coin. The accepted offer-binding kinds are the
+  ANNOUNCEMENT assertions ONLY — `AssertPuzzleAnnouncement` / `AssertCoinAnnouncement` (#2241): only an
+  announcement binds the settlement egress to a specific requested payment (a make asserts the requested
+  payment's settlement-puzzle announcement; a take asserts the maker offered-coins' announcement).
+  Concurrency assertions (`AssertConcurrentSpend` / `AssertConcurrentPuzzle`) are NOT accepted as a
+  binding: they bind spend concurrency, not the VALUE received in return, so a settlement egress bound
+  only by concurrency is refused fail-closed. Settlement-layer coins
   the wallet CLAIMS (take/cancel) are decoded through
   `SettlementLayer`
   (which gates on `SETTLEMENT_PAYMENT_HASH`); they carry NO signature (claimed by announcement), so
@@ -457,6 +463,20 @@ Used by dig-app. The subscriber + identity provider + signer.
     would fail OPEN here (it hides un-hinted non-owned outputs the key-aware gate still signs), so the
     consent decode MUST be the key-aware one on `LocalSigner`. Only the lenient key-free `decode` may
     degrade, and only for a display surface that shows the `verified` flag.
+  - **Received leg — the offer MAKE shows the trade both ways (#2241).** `TransactionSummary` carries a
+    `received` bucket, DISTINCT from `outputs` (value leaving) and never conflated with it. An offer
+    MAKE populates `received` with the REQUESTED payments the maker gets, each to the maker's own
+    receive address; a plain one-way send leaves it empty. `HumanReadableSummary` renders these as
+    separate `receive_lines` ("Receive 1 XCH to xch1…"), shown alongside the "Send …" recipient lines
+    on BOTH the display `decode` and the consent `decode_verified` paths (both source `received` from
+    the reviewed spend's own `summary`). The received leg is INFORMATIONAL, NOT part of the signer's
+    egress gate: it is not re-derivable from the coin spends (a make binds the requested payment as a
+    non-invertible settlement-announcement hash, not a readable output), so `verify::analyze` /
+    `summarize` leave it empty and `assert_reviewed_summary_matches` never inspects it. Its fulfilment
+    is consensus-enforced by the offer mechanism itself — the maker's offered coins are unspendable
+    unless a settlement coin announces exactly this requested payment — so it is a faithful "you will
+    receive" hint, while the maker still independently verifies + consents to the OFFERED legs (what
+    actually leaves) via the signer gate.
 - **`client::signer`** — `IdentitySigner { identity(), sign(UnsignedSpend) -> SignedBundle }` and
   `LocalSigner` (holds a `chia::bls::SecretKey`, exposes only `public_key()` + `identity()` +
   `identity_public_key_bytes()` + `decap(peer_g1)`). `LocalSigner` also implements the engine's

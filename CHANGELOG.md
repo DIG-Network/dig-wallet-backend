@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.22.0] - 2026-08-07
+
+### Features
+- **client:** Surface the offer-make requested payment as a distinct `received` leg so the maker sees
+  the trade both ways at the confirm (#2241)
+
+### Security
+- **client:** Narrow the accepted offer-binding assertion to the announcement kinds only
+  (`AssertPuzzleAnnouncement` / `AssertCoinAnnouncement`); a settlement egress bound only by a
+  concurrent-spend / concurrent-puzzle assertion is now refused (#2241)
+
 ## [0.21.0] - 2026-08-06
 
 ### Features

@@ -577,6 +577,11 @@ pub fn summarize(effect: &SpendEffect) -> WalletResult<TransactionSummary> {
     );
     Ok(TransactionSummary {
         outputs,
+        // The received leg is not re-derivable from coin spends (a make binds the requested payment
+        // as a non-invertible settlement-announcement hash, not a readable output), so the key-free /
+        // key-aware re-derivation leaves it empty; the engine-declared received leg is surfaced by the
+        // review renderer from the reviewed spend's own summary (#2241).
+        received: Vec::new(),
         fee: Amount(effect.fee),
     })
 }
@@ -628,22 +633,29 @@ fn route_output(
     }
 }
 
-/// True when `conditions` carry at least one announcement/concurrency assertion — the binding that
-/// ties a coin's settlement egress to receiving the counter-payment (#1511 MR-6).
+/// True when `conditions` carry at least one ANNOUNCEMENT assertion — the binding that ties a coin's
+/// settlement egress to a value-carrying counter-payment (#1511 MR-6, narrowed #2241).
 ///
 /// A wallet coin that spends its value INTO the settlement puzzle with no such assertion is a
-/// give-it-away-for-nothing: nothing forces the offered value to be exchanged for anything. A genuine
-/// make asserts the requested payment's puzzle announcement; a genuine take binds to the maker's
-/// offered coins via a concurrency assertion. This is defense-in-depth BEYOND the sole-AGG_SIG_ME
+/// give-it-away-for-nothing: nothing forces the offered value to be exchanged for anything.
+///
+/// Only the announcement-assertion kinds ([`Condition::AssertPuzzleAnnouncement`] /
+/// [`Condition::AssertCoinAnnouncement`]) count as an offer binding here, because ONLY they can bind
+/// the egress to a specific requested payment: a genuine make asserts the requested payment's
+/// settlement PUZZLE announcement (its notarized-payment tree hash), and a genuine take asserts the
+/// maker offered COINS' announcement. Concurrent-spend / concurrent-puzzle assertions
+/// (`AssertConcurrentSpend`/`AssertConcurrentPuzzle`) are DELIBERATELY EXCLUDED (#2241): they bind
+/// spend CONCURRENCY (that some other coin is spent in the same bundle) but say nothing about the
+/// VALUE received in return, so a coin whose only "binding" is a concurrency assertion could still be
+/// given away for nothing. The real `dig-offers` make emits an announcement assertion for the
+/// requested payment, so tightening to the announcement kinds keeps legitimate offers valid while
+/// closing the concurrency-only loophole. This is defense-in-depth BEYOND the sole-AGG_SIG_ME
 /// tree-hash commitment (which already binds the exact conditions to the signature).
 fn has_offer_binding_assertion(conditions: &[Condition]) -> bool {
     conditions.iter().any(|condition| {
         matches!(
             condition,
-            Condition::AssertPuzzleAnnouncement(_)
-                | Condition::AssertCoinAnnouncement(_)
-                | Condition::AssertConcurrentSpend(_)
-                | Condition::AssertConcurrentPuzzle(_)
+            Condition::AssertPuzzleAnnouncement(_) | Condition::AssertCoinAnnouncement(_)
         )
     })
 }
@@ -1348,7 +1360,7 @@ mod tests {
             wallet_coin(50_000, 1),
             Conditions::new()
                 .create_coin(settlement_ph(), 50_000, Memos::None)
-                .assert_concurrent_spend(Bytes32::new([0x44; 32])),
+                .assert_puzzle_announcement(Bytes32::new([0x44; 32])),
         ))
         .expect("a bound settlement egress is a valid offered leg");
         assert!(
@@ -1371,6 +1383,39 @@ mod tests {
         ))
         .expect_err("an unbound settlement egress must be refused");
         assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    /// #2241: a settlement egress whose ONLY "binding" is a concurrent-spend / concurrent-puzzle
+    /// assertion is REFUSED. Concurrency binds only that some other coin is co-spent, never the VALUE
+    /// received in return, so such a coin could still be given away for nothing — only an ANNOUNCEMENT
+    /// assertion (which the real dig-offers make emits) ties the egress to a requested payment. The
+    /// announcement-bound control (`a_settlement_egress_routes_to_protocol_sink`) proves the refusal is
+    /// the narrowed binding kind, not the settlement routing itself.
+    #[test]
+    fn a_settlement_egress_bound_only_by_concurrency_is_refused_2241() {
+        let concurrent_spend = analyze(&standard_spend(
+            wallet_coin(50_000, 1),
+            Conditions::new()
+                .create_coin(settlement_ph(), 50_000, Memos::None)
+                .assert_concurrent_spend(Bytes32::new([0x44; 32])),
+        ))
+        .expect_err("a concurrent-spend-only settlement egress must be refused");
+        assert_eq!(
+            concurrent_spend.code,
+            WalletErrorCode::SpendValidationFailed
+        );
+
+        let concurrent_puzzle = analyze(&standard_spend(
+            wallet_coin(50_000, 1),
+            Conditions::new()
+                .create_coin(settlement_ph(), 50_000, Memos::None)
+                .assert_concurrent_puzzle(Bytes32::new([0x55; 32])),
+        ))
+        .expect_err("a concurrent-puzzle-only settlement egress must be refused");
+        assert_eq!(
+            concurrent_puzzle.code,
+            WalletErrorCode::SpendValidationFailed
+        );
     }
 
     /// A CLAIMED settlement (XCH) coin — the canonical settlement puzzle spent by announcement, no
@@ -1423,7 +1468,7 @@ mod tests {
             Conditions::new()
                 .create_coin(settlement_ph(), u64::MAX, Memos::None)
                 .create_coin(ph, 1_001, Memos::None)
-                .assert_concurrent_spend(Bytes32::new([0x44; 32])),
+                .assert_puzzle_announcement(Bytes32::new([0x44; 32])),
         ))
         .expect_err("a protocol-sink-inclusive spend past u64::MAX must be refused");
         assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
@@ -1439,7 +1484,7 @@ mod tests {
             Conditions::new()
                 .create_coin(settlement_ph(), 600, Memos::None)
                 .create_coin(ph, 400, Memos::None)
-                .assert_concurrent_spend(Bytes32::new([0x44; 32])),
+                .assert_puzzle_announcement(Bytes32::new([0x44; 32])),
         ))
         .expect("truthful protocol-sink-inclusive amounts conserve");
         assert_eq!(effect.protocol_sink[0].amount, 600);

@@ -159,6 +159,7 @@ impl OptionBuilder for SdkSpendBuilder {
                     amount: underlying_amount,
                     asset_id: None,
                 }],
+                received: vec![],
                 fee: Amount(implicit_fee),
             },
         };
@@ -219,6 +220,7 @@ impl OptionBuilder for SdkSpendBuilder {
                     amount: Amount(created.option.coin.amount),
                     asset_id: None,
                 }],
+                received: vec![],
                 fee: Amount(fee),
             },
         })
@@ -285,6 +287,7 @@ impl OptionBuilder for SdkSpendBuilder {
                     amount: Amount(strike_amount),
                     asset_id: None,
                 }],
+                received: vec![],
                 fee: Amount(implicit_fee),
             },
         })

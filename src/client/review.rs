@@ -13,8 +13,12 @@ const MOJOS_PER_XCH: u64 = 1_000_000_000_000;
 /// A human-readable rendering of an unsigned spend for the confirm dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HumanReadableSummary {
-    /// One line per recipient output.
+    /// One line per recipient output — value LEAVING the wallet.
     pub lines: Vec<String>,
+    /// One line per RECEIVED output — value the spend causes the wallet to receive (an offer MAKE's
+    /// requested payments). Distinct from [`lines`] so the confirm shows the trade both ways without
+    /// conflating what leaves with what arrives; empty for a plain one-way send (#2241).
+    pub receive_lines: Vec<String>,
     /// The fee, rendered.
     pub fee_line: String,
     /// The number of coin spends the transaction contains.
@@ -94,28 +98,46 @@ pub(crate) fn render(
     let lines = summary
         .outputs
         .iter()
-        .map(|out| {
-            let is_xch = out.asset_id.is_none();
-            let unit = match &out.asset_id {
-                None => "XCH".to_string(),
-                Some(asset) => format!("CAT {}", asset.0),
-            };
-            format!(
-                "Send {} {} to {}",
-                render_amount(out.amount, is_xch),
-                unit,
-                out.address.0
-            )
-        })
+        .map(|out| render_output_line("Send", out))
+        .collect();
+
+    // The received legs are rendered from the engine-declared `unsigned.summary`, NOT from the
+    // (possibly re-derived) `summary` argument: a make's requested payment is bound as a
+    // non-invertible settlement-announcement hash, so it is not independently re-derivable and the
+    // key-free / key-aware re-derivation leaves `received` empty. Sourcing it from the reviewed
+    // spend's own summary makes the receive lines identical on both the display decode and the
+    // consent decode (#2241).
+    let receive_lines = unsigned
+        .summary
+        .received
+        .iter()
+        .map(|out| render_output_line("Receive", out))
         .collect();
 
     HumanReadableSummary {
         lines,
+        receive_lines,
         fee_line: format!("Fee {} XCH", render_amount(summary.fee, true)),
         coin_spend_count: unsigned.coin_spends.len(),
         required_signature_count: unsigned.required_signatures.len(),
         verified,
     }
+}
+
+/// Render one output as a `"<verb> <amount> <unit> to <address>"` line (e.g. `Send`/`Receive`).
+fn render_output_line(verb: &str, out: &crate::types::SpendOutput) -> String {
+    let is_xch = out.asset_id.is_none();
+    let unit = match &out.asset_id {
+        None => "XCH".to_string(),
+        Some(asset) => format!("CAT {}", asset.0),
+    };
+    format!(
+        "{} {} {} to {}",
+        verb,
+        render_amount(out.amount, is_xch),
+        unit,
+        out.address.0
+    )
 }
 
 #[cfg(test)]
@@ -127,8 +149,34 @@ mod tests {
         UnsignedSpend {
             coin_spends: vec![],
             required_signatures: vec![],
-            summary: TransactionSummary { outputs, fee },
+            summary: TransactionSummary {
+                outputs,
+                received: vec![],
+                fee,
+            },
         }
+    }
+
+    /// #2241: a summary carrying a `received` leg renders a distinct "Receive …" line, separate from
+    /// the "Send …" recipient lines, so an offer make shows the trade both ways at the confirm.
+    #[test]
+    fn decode_renders_received_legs_as_distinct_receive_lines() {
+        let mut spend = unsigned(
+            vec![SpendOutput {
+                address: Address(String::new()),
+                amount: Amount(1000),
+                asset_id: Some(AssetId("dig".into())),
+            }],
+            Amount(0),
+        );
+        spend.summary.received = vec![SpendOutput {
+            address: Address("xch1maker".into()),
+            amount: Amount(MOJOS_PER_XCH),
+            asset_id: None,
+        }];
+        let summary = decode(&spend);
+        assert_eq!(summary.lines.len(), 1);
+        assert_eq!(summary.receive_lines, vec!["Receive 1 XCH to xch1maker"]);
     }
 
     #[test]
