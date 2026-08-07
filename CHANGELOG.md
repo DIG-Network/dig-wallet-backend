@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.26.0] - 2026-08-07
+
+### Refactor
+- **dig-wallet-backend:** Centralize two custody-adjacent conventions (#2282)
+
 ## [0.25.0] - 2026-08-07
 
 ### Features
