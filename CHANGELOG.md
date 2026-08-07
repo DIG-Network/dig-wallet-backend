@@ -6,11 +6,8 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ## [0.23.0] - 2026-08-07
 
-### Changed
-- **client:** Key-free `review::decode` is now always ownership-unverified (`verified = false`) — a
-  `verified = true` consent view can only come from the key-aware `LocalSigner::decode_verified`
-  (#2255). Behaviour tightening: the key-free memo split can hide an un-hinted non-owned egress, so it
-  must never claim independent verification.
+### Features
+- Key-free review::decode is always ownership-unverified (#2255)
 
 ## [0.22.0] - 2026-08-07
 
