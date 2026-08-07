@@ -2461,6 +2461,51 @@ mod tests {
         assert_eq!(reviewable.outputs[0].amount, crate::types::Amount(ONE_XCH));
     }
 
+    /// #2255: the key-free [`review::decode`] must NEVER present `verified = true`, even on the path
+    /// where its re-derivation "succeeds". On this exact un-hinted non-owned egress — the spend that
+    /// the key-free `classify` buckets as change and DROPS — a `verified = true` view would be a FALSE
+    /// assurance: it renders no egress yet claims independent verification. `verified = true` must come
+    /// ONLY from the key-aware ownership split ([`LocalSigner::decode_verified`]); a key-free decode is
+    /// inherently ownership-unverified, so it is always `verified = false`.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn keyfree_decode_never_claims_verified_on_an_unhinted_non_owned_egress() {
+        use chia_puzzle_types::standard::StandardArgs;
+
+        const ONE_XCH: u64 = 1_000_000_000_000;
+        let attacker = Bytes32::new([0x33u8; 32]);
+        let wallet_ph = Bytes32::from(
+            StandardArgs::curry_tree_hash(master("keyfree-unverified").wallet_public_key(0))
+                .to_bytes(),
+        );
+
+        // The same fail-open spend as the consent test: 1 XCH to a NON-owned attacker (un-hinted, so
+        // the key-free heuristic mislabels it change) + 1 XCH change home, from a 2-XCH coin.
+        let (_signer, coin_spends) = wallet_xch_spend(
+            "keyfree-unverified",
+            2 * ONE_XCH,
+            &[(attacker, ONE_XCH, false), (wallet_ph, ONE_XCH, false)],
+            false,
+        );
+        let unsigned = UnsignedSpend {
+            coin_spends,
+            required_signatures: vec![],
+            summary: empty_summary(),
+        };
+
+        // The key-free decode's re-derivation SUCCEEDS here, but the summary hides the egress. It must
+        // therefore refuse to claim `verified` — a key-free decode can never carry ownership assurance.
+        let key_free = review::decode(&unsigned);
+        assert!(
+            !key_free.verified,
+            "the key-free decode must never present verified = true"
+        );
+        assert!(
+            key_free.lines.is_empty(),
+            "the key-free heuristic still drops the un-hinted egress — which is exactly why it is unverified"
+        );
+    }
+
     /// #2209: the key-aware [`LocalSigner::decode_verified`] REFUSES exactly where the lenient
     /// key-free [`review::decode`] silently degrades to the engine's (untrusted) claim
     /// (`verified: false`). Migrated from the removed free-function `review::decode_verified`.
