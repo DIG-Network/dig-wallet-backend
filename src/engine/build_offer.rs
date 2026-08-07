@@ -1055,6 +1055,41 @@ mod tests {
         assert_eq!(summary.received[0].address, payee);
     }
 
+    /// #2241 (bundle-level binding): a MULTI-asset make — offering BOTH XCH and a CAT — carries the
+    /// requested-payment announcement on exactly ONE offered coin and rings the other offered coins
+    /// together with `AssertConcurrentSpend` (dig-offers' `emit_relation`). The verifier's fail-closed
+    /// re-derivation must ACCEPT it: every settlement sink is transitively tied through the
+    /// concurrency ring to the announcement-bearing coin. The earlier per-coin check wrongly refused
+    /// the concurrency-only leg. Anchored to a real dig-offers make built through
+    /// `resolve_offered_side`, not a hand-rolled bundle.
+    #[test]
+    fn a_multi_asset_make_offering_xch_and_a_cat_is_accepted_by_verify_2241() {
+        let mut sim = Simulator::new();
+        let maker = sim.bls(50_000);
+        let (maker_cat, asset) = issue_cat_to(&mut sim, &maker, 1_000);
+
+        let pending = builder_for(&maker, vec![maker.coin], vec![maker_cat])
+            .build_make(MakeOfferRequest {
+                identity: identity(),
+                offered: OfferedAssets {
+                    xch: Amount(50_000),
+                    cats: vec![(AssetId(hex::encode(asset)), Amount(1_000))],
+                },
+                requested: RequestedAssets {
+                    xch: Amount(25_000),
+                    cats: vec![],
+                    payee: xch_address(maker.puzzle_hash),
+                },
+                fee: Amount(0),
+            })
+            .expect("a multi-asset make (offer XCH + CAT) builds");
+
+        // The multi-offered-coin make re-derives cleanly: one offered coin carries the announcement,
+        // the rest are concurrency-ringed — all bound at the bundle level.
+        crate::client::verify::analyze(&pending.unsigned.coin_spends)
+            .expect("bundle-level binding accepts a legitimate multi-asset make");
+    }
+
     /// A make/summarize response carries the offer's stable ecosystem id (#1318 task 4).
     #[test]
     fn offer_string_and_summary_carry_the_offer_id() {

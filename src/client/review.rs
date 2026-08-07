@@ -18,6 +18,14 @@ pub struct HumanReadableSummary {
     /// One line per RECEIVED output — value the spend causes the wallet to receive (an offer MAKE's
     /// requested payments). Distinct from [`lines`] so the confirm shows the trade both ways without
     /// conflating what leaves with what arrives; empty for a plain one-way send (#2241).
+    ///
+    /// # Engine-declared, NOT verified
+    /// Unlike [`lines`] (the egress the signer cryptographically gates on), these lines are the
+    /// engine's DECLARED upside: a make binds its requested payment as a non-invertible
+    /// settlement-announcement hash, so the received value is not re-derivable from the coin spends
+    /// and cannot be independently verified. Each line is prefixed with an explicit "(unverified)"
+    /// marker so a maker never attributes egress-grade assurance to the receive side. Full
+    /// crypto-verification of the requested payment is a separate follow-up.
     pub receive_lines: Vec<String>,
     /// The fee, rendered.
     pub fee_line: String,
@@ -106,12 +114,14 @@ pub(crate) fn render(
     // non-invertible settlement-announcement hash, so it is not independently re-derivable and the
     // key-free / key-aware re-derivation leaves `received` empty. Sourcing it from the reviewed
     // spend's own summary makes the receive lines identical on both the display decode and the
-    // consent decode (#2241).
+    // consent decode (#2241). The "(unverified)" verb marks these as engine-declared — the received
+    // value is bound as a non-invertible announcement hash, so it is NOT independently re-derivable
+    // like the gated "Send" egress; a maker must not read egress-grade assurance into the upside.
     let receive_lines = unsigned
         .summary
         .received
         .iter()
-        .map(|out| render_output_line("Receive", out))
+        .map(|out| render_output_line("Receive (unverified)", out))
         .collect();
 
     HumanReadableSummary {
@@ -176,7 +186,12 @@ mod tests {
         }];
         let summary = decode(&spend);
         assert_eq!(summary.lines.len(), 1);
-        assert_eq!(summary.receive_lines, vec!["Receive 1 XCH to xch1maker"]);
+        // The receive leg is engine-declared, so it renders with an explicit "(unverified)" marker,
+        // distinct from the cryptographically-gated "Send" lines (#2241).
+        assert_eq!(
+            summary.receive_lines,
+            vec!["Receive (unverified) 1 XCH to xch1maker"]
+        );
     }
 
     #[test]

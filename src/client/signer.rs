@@ -2235,8 +2235,9 @@ mod tests {
             1,
             "the make's requested payment renders as a distinct receive line",
         );
-        // 50_000 mojos renders as 0.00000005 XCH (mojos → decimal XCH, trailing zeros trimmed).
-        assert!(consent.receive_lines[0].starts_with("Receive 0.00000005 XCH to xch1"));
+        // 50_000 mojos renders as 0.00000005 XCH (mojos → decimal XCH, trailing zeros trimmed); the
+        // receive leg is engine-declared, so it carries the explicit "(unverified)" marker (#2241).
+        assert!(consent.receive_lines[0].starts_with("Receive (unverified) 0.00000005 XCH to xch1"));
 
         let offer = maker_builder
             .assemble_make(AssembleOfferRequest {

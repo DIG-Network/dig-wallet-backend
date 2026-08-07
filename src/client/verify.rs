@@ -54,7 +54,7 @@
 //! [`LocalSigner`](super::signer::LocalSigner), which treats every output it can derive a key for as
 //! change; that is what the signer's summary gate compares against.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chia_protocol::{Bytes32, CoinSpend};
 use chia_puzzle_types::Memos;
@@ -154,6 +154,11 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     let mut cat_in: BTreeMap<Bytes32, u64> = BTreeMap::new();
     let mut cat_out: BTreeMap<Bytes32, u64> = BTreeMap::new();
 
+    // Offer-binding facts (#2241) gathered from every WALLET-SIGNED coin, checked at the bundle level
+    // AFTER the loop. A make emits the requested-payment announcement on ONE offered coin and rings
+    // the rest with concurrency, so the binding is a property of the whole bundle, never one coin.
+    let mut bindings: Vec<CoinBinding> = Vec::new();
+
     // OPTION MODE is gated on the presence of an option-layer coin. For a signable option action that
     // means a TRANSFER's singleton ([`OptionContract`]); an EXERCISE bundle (its [`P2OneOfManyLayer`]
     // underlying leg) is detected here too but refused fail-closed in the loop below before conservation
@@ -245,7 +250,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             let committed_message = committed_delegated_puzzle_message(&allocator, inner_solution)?;
             let conditions = run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)?;
             enforce_sole_agg_sig_me(&conditions, committed_message)?;
-            enforce_settlement_binding(&conditions)?;
+            bindings.push(coin_binding(&spend.coin, &conditions));
             for condition in &conditions {
                 reject_unexpected_agg_sig(condition)?;
                 if let Some(create) = condition.as_create_coin() {
@@ -395,10 +400,10 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
             // no fee). It legitimately commits no value to the settlement puzzle, so MR-6's
             // give-it-away-for-nothing binding does not apply — skip it in option mode. Only the strict
             // offer path requires MR-6. (Exercise never reaches here: its option-singleton melt/message
-            // leg is refused fail-closed above, at the signature source.)
-            if !option_mode {
-                enforce_settlement_binding(&conditions)?;
-            }
+            // leg is refused fail-closed above, at the signature source.) The binding is now enforced
+            // at the bundle level after the loop; an option-mode farmer-fee coin commits no value to
+            // settlement (no sink), so it is inert in that pass.
+            bindings.push(coin_binding(&spend.coin, &conditions));
             for condition in &conditions {
                 reject_unexpected_agg_sig(condition)?;
                 if let Some(reserve) = condition.as_reserve_fee() {
@@ -457,6 +462,10 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
              refusing to sign",
         ));
     }
+
+    // Bundle-level offer-binding (#2241): every settlement-sink egress must be tied — directly or
+    // through the concurrency ring — to an announcement that binds the requested payment.
+    enforce_bundle_settlement_binding(&bindings)?;
 
     // XCH value conservation. Two modes:
     // - STRICT (XCH/CAT/offer, byte-unchanged): `in == out + reserve_fee`, a leak/mint is refused.
@@ -634,23 +643,18 @@ fn route_output(
 }
 
 /// True when `conditions` carry at least one ANNOUNCEMENT assertion — the binding that ties a coin's
-/// settlement egress to a value-carrying counter-payment (#1511 MR-6, narrowed #2241).
-///
-/// A wallet coin that spends its value INTO the settlement puzzle with no such assertion is a
-/// give-it-away-for-nothing: nothing forces the offered value to be exchanged for anything.
+/// settlement egress to a value-carrying counter-payment (#1511 MR-6, #2241).
 ///
 /// Only the announcement-assertion kinds ([`Condition::AssertPuzzleAnnouncement`] /
-/// [`Condition::AssertCoinAnnouncement`]) count as an offer binding here, because ONLY they can bind
-/// the egress to a specific requested payment: a genuine make asserts the requested payment's
-/// settlement PUZZLE announcement (its notarized-payment tree hash), and a genuine take asserts the
-/// maker offered COINS' announcement. Concurrent-spend / concurrent-puzzle assertions
-/// (`AssertConcurrentSpend`/`AssertConcurrentPuzzle`) are DELIBERATELY EXCLUDED (#2241): they bind
-/// spend CONCURRENCY (that some other coin is spent in the same bundle) but say nothing about the
-/// VALUE received in return, so a coin whose only "binding" is a concurrency assertion could still be
-/// given away for nothing. The real `dig-offers` make emits an announcement assertion for the
-/// requested payment, so tightening to the announcement kinds keeps legitimate offers valid while
-/// closing the concurrency-only loophole. This is defense-in-depth BEYOND the sole-AGG_SIG_ME
-/// tree-hash commitment (which already binds the exact conditions to the signature).
+/// [`Condition::AssertCoinAnnouncement`]) count as an offer binding, because ONLY they can bind the
+/// egress to a specific requested payment: a genuine make asserts the requested payment's settlement
+/// PUZZLE announcement (its notarized-payment tree hash), and a genuine take asserts the maker offered
+/// COINS' announcement. Concurrent-spend / concurrent-puzzle assertions
+/// (`AssertConcurrentSpend`/`AssertConcurrentPuzzle`) do NOT count as a binding on their own: they
+/// bind spend CONCURRENCY (that some other coin is co-spent) but say nothing about the VALUE received
+/// in return. They still MATTER — at the bundle level ([`enforce_bundle_settlement_binding`]) they are
+/// the ring that ties a make's non-announcement offered coins to the one coin that DOES carry the
+/// announcement — but the tie must always terminate at an announcement.
 fn has_offer_binding_assertion(conditions: &[Condition]) -> bool {
     conditions.iter().any(|condition| {
         matches!(
@@ -660,21 +664,129 @@ fn has_offer_binding_assertion(conditions: &[Condition]) -> bool {
     })
 }
 
-/// Enforce MR-6 on a WALLET-SIGNED coin: if it spends value into the settlement puzzle (emits a
-/// `CREATE_COIN` to [`SETTLEMENT_PAYMENT_HASH`]) it MUST also carry an offer-binding assertion, or the
-/// value would leave the wallet for nothing. Fail-closed.
-fn enforce_settlement_binding(conditions: &[Condition]) -> WalletResult<()> {
-    let creates_sink = conditions
-        .iter()
-        .filter_map(Condition::as_create_coin)
-        .any(|create| is_protocol_sink_hash(create.puzzle_hash));
-    if creates_sink && !has_offer_binding_assertion(conditions) {
-        return Err(reject(
-            "a coin commits value to settlement with no offer-binding assertion \
-             (give-it-away-for-nothing); refusing to sign",
-        ));
+/// The offer-binding facts gathered from ONE wallet-signed coin, for the bundle-level MR-6 pass
+/// (#2241). A `dig-offers` make binds the requested payment with an announcement on exactly ONE
+/// offered coin, then rings ALL offered coins together with concurrency assertions, so the binding
+/// can only be judged over the whole bundle — never per coin.
+struct CoinBinding {
+    /// This coin's id — the target other coins reference in an `AssertConcurrentSpend`.
+    coin_id: Bytes32,
+    /// This coin's puzzle hash — the target other coins reference in an `AssertConcurrentPuzzle`.
+    puzzle_hash: Bytes32,
+    /// The coin spends value INTO the settlement puzzle (an offered/paid leg that must be bound).
+    creates_sink: bool,
+    /// The coin itself carries an announcement assertion (see [`has_offer_binding_assertion`]).
+    carries_announcement: bool,
+    /// Coin ids this coin asserts are co-spent (`AssertConcurrentSpend`) — edges to follow.
+    requires_coin_ids: Vec<Bytes32>,
+    /// Puzzle hashes this coin asserts are co-spent (`AssertConcurrentPuzzle`) — edges to follow.
+    requires_puzzle_hashes: Vec<Bytes32>,
+}
+
+/// Gather the [`CoinBinding`] facts for one wallet-signed coin from its coin + run conditions.
+fn coin_binding(coin: &chia_protocol::Coin, conditions: &[Condition]) -> CoinBinding {
+    let mut binding = CoinBinding {
+        coin_id: coin.coin_id(),
+        puzzle_hash: coin.puzzle_hash,
+        creates_sink: false,
+        carries_announcement: has_offer_binding_assertion(conditions),
+        requires_coin_ids: Vec::new(),
+        requires_puzzle_hashes: Vec::new(),
+    };
+    for condition in conditions {
+        match condition {
+            Condition::AssertConcurrentSpend(assertion) => {
+                binding.requires_coin_ids.push(assertion.coin_id);
+            }
+            Condition::AssertConcurrentPuzzle(assertion) => {
+                binding.requires_puzzle_hashes.push(assertion.puzzle_hash);
+            }
+            _ => {}
+        }
+        if let Some(create) = condition.as_create_coin() {
+            if is_protocol_sink_hash(create.puzzle_hash) {
+                binding.creates_sink = true;
+            }
+        }
+    }
+    binding
+}
+
+/// Enforce MR-6 at the BUNDLE level (#2241, reworked from the per-coin check). The security property
+/// is "no settlement-sink egress may occur without the requested-payment binding being enforced
+/// ATOMICALLY in the same bundle". A `dig-offers` make binds the requested payment with an
+/// announcement on exactly ONE offered coin, then rings ALL offered coins together with
+/// `AssertConcurrentSpend`/`AssertConcurrentPuzzle` so no offered coin can reach the chain without the
+/// others — the binding coin and every offered sink stand or fall as one.
+///
+/// A settlement sink is ACCEPTED iff it is tied to a requested-payment binding: it carries an
+/// announcement itself, OR it is transitively co-spend-tied (through the concurrency ring) to a coin
+/// that does. It is REFUSED iff a sink coin is NEITHER — the real unbound-egress attack: a coin that
+/// could be peeled off and given away for nothing. (When the bundle carries no announcement at all,
+/// no sink can be tied, so every sink is refused — the give-it-away case the per-coin check caught.)
+///
+/// The per-coin check this replaces over-refused a legitimate MULTI-offered-coin make (offer XCH + a
+/// CAT, or two distinct CATs): only one offered coin carries the announcement, so the others — tied
+/// only by concurrency — were wrongly rejected. Judging at the bundle level accepts them while still
+/// refusing any sink that is not tied to a binding.
+fn enforce_bundle_settlement_binding(bindings: &[CoinBinding]) -> WalletResult<()> {
+    // Index the coins so a concurrency assertion (by coin id or puzzle hash) resolves to the coin(s)
+    // it requires be co-spent.
+    let mut by_coin_id: HashMap<Bytes32, usize> = HashMap::new();
+    let mut by_puzzle_hash: HashMap<Bytes32, Vec<usize>> = HashMap::new();
+    for (index, binding) in bindings.iter().enumerate() {
+        by_coin_id.insert(binding.coin_id, index);
+        by_puzzle_hash
+            .entry(binding.puzzle_hash)
+            .or_default()
+            .push(index);
+    }
+
+    for (index, binding) in bindings.iter().enumerate() {
+        if binding.creates_sink
+            && !tied_to_announcement(index, bindings, &by_coin_id, &by_puzzle_hash)
+        {
+            return Err(reject(
+                "a coin commits value to settlement with no offer-binding announcement reachable \
+                 through the bundle's concurrency ring (give-it-away-for-nothing); refusing to sign",
+            ));
+        }
     }
     Ok(())
+}
+
+/// True when the coin at `start` is bound to a requested payment: it carries an announcement itself,
+/// or it is transitively co-spend-tied to a coin that does. Following the "requires this coin be
+/// co-spent" edges (`AssertConcurrentSpend`/`AssertConcurrentPuzzle`) proves the start coin cannot
+/// reach the chain unless the announcement-bearing coin is also spent — the atomic binding.
+fn tied_to_announcement(
+    start: usize,
+    bindings: &[CoinBinding],
+    by_coin_id: &HashMap<Bytes32, usize>,
+    by_puzzle_hash: &HashMap<Bytes32, Vec<usize>>,
+) -> bool {
+    let mut visited = vec![false; bindings.len()];
+    let mut stack = vec![start];
+    while let Some(index) = stack.pop() {
+        if std::mem::replace(&mut visited[index], true) {
+            continue;
+        }
+        let binding = &bindings[index];
+        if binding.carries_announcement {
+            return true;
+        }
+        for coin_id in &binding.requires_coin_ids {
+            if let Some(&next) = by_coin_id.get(coin_id) {
+                stack.push(next);
+            }
+        }
+        for puzzle_hash in &binding.requires_puzzle_hashes {
+            if let Some(indices) = by_puzzle_hash.get(puzzle_hash) {
+                stack.extend(indices.iter().copied());
+            }
+        }
+    }
+    false
 }
 
 /// A claimed settlement-layer coin is spent by ANNOUNCEMENT and carries no signature; the immutable
@@ -1385,37 +1497,110 @@ mod tests {
         assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
     }
 
-    /// #2241: a settlement egress whose ONLY "binding" is a concurrent-spend / concurrent-puzzle
-    /// assertion is REFUSED. Concurrency binds only that some other coin is co-spent, never the VALUE
-    /// received in return, so such a coin could still be given away for nothing — only an ANNOUNCEMENT
-    /// assertion (which the real dig-offers make emits) ties the egress to a requested payment. The
-    /// announcement-bound control (`a_settlement_egress_routes_to_protocol_sink`) proves the refusal is
-    /// the narrowed binding kind, not the settlement routing itself.
+    /// #2241 (bundle-level): a bundle whose settlement egress is bound ONLY by concurrency — two sink
+    /// coins ringed to each other with `AssertConcurrentSpend` but with NO announcement anywhere — is
+    /// REFUSED. Concurrency binds only that the coins are co-spent, never the VALUE received in
+    /// return, so the ring could still be given away for nothing; only an ANNOUNCEMENT assertion
+    /// (which the real dig-offers make emits on one offered coin) ties the egress to a requested
+    /// payment. The accepted control (`a_multi_coin_make_bundle_with_one_announcement_is_accepted`)
+    /// proves the refusal is the missing announcement, not the multi-coin ring itself.
     #[test]
-    fn a_settlement_egress_bound_only_by_concurrency_is_refused_2241() {
-        let concurrent_spend = analyze(&standard_spend(
-            wallet_coin(50_000, 1),
+    fn a_settlement_bundle_bound_only_by_concurrency_is_refused_2241() {
+        let coin_a = wallet_coin(50_000, 1);
+        let coin_b = wallet_coin(30_000, 2);
+        let mut spends = standard_spend(
+            coin_a,
             Conditions::new()
                 .create_coin(settlement_ph(), 50_000, Memos::None)
-                .assert_concurrent_spend(Bytes32::new([0x44; 32])),
-        ))
-        .expect_err("a concurrent-spend-only settlement egress must be refused");
-        assert_eq!(
-            concurrent_spend.code,
-            WalletErrorCode::SpendValidationFailed
+                .assert_concurrent_spend(coin_b.coin_id()),
         );
+        spends.extend(standard_spend(
+            coin_b,
+            Conditions::new()
+                .create_coin(settlement_ph(), 30_000, Memos::None)
+                .assert_concurrent_spend(coin_a.coin_id()),
+        ));
+        let err = analyze(&spends)
+            .expect_err("a concurrency-only (announcement-free) settlement bundle must be refused");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
 
-        let concurrent_puzzle = analyze(&standard_spend(
+    /// #2241 (bundle-level): a legitimate MULTI-coin make — two coins each spending into settlement,
+    /// ONE carrying the requested-payment announcement and the pair ringed together with
+    /// `AssertConcurrentSpend` (exactly how dig-offers binds an offer with more than one offered coin)
+    /// — is ACCEPTED. The per-coin check wrongly refused the concurrency-only coin; the bundle-level
+    /// check accepts it because it is transitively tied through the ring to the announcement-bearer.
+    #[test]
+    fn a_multi_coin_make_bundle_with_one_announcement_is_accepted_2241() {
+        let coin_a = wallet_coin(50_000, 1);
+        let coin_b = wallet_coin(30_000, 2);
+        let mut spends = standard_spend(
+            coin_a,
+            Conditions::new()
+                .create_coin(settlement_ph(), 50_000, Memos::None)
+                .assert_puzzle_announcement(Bytes32::new([0x44; 32]))
+                .assert_concurrent_spend(coin_b.coin_id()),
+        );
+        spends.extend(standard_spend(
+            coin_b,
+            Conditions::new()
+                .create_coin(settlement_ph(), 30_000, Memos::None)
+                .assert_concurrent_spend(coin_a.coin_id()),
+        ));
+        let effect =
+            analyze(&spends).expect("a bundle-bound multi-coin make is a valid offered side");
+        assert_eq!(effect.protocol_sink.len(), 2, "both offered legs are sinks");
+    }
+
+    /// #2241 (bundle-level): the concurrency tie also resolves through `AssertConcurrentPuzzle` (by
+    /// puzzle hash), not only `AssertConcurrentSpend` (by coin id). A second sink coin tied by puzzle
+    /// hash to the announcement-bearing coin is ACCEPTED — exercising the puzzle-hash edge of the
+    /// reachability walk.
+    #[test]
+    fn a_sink_tied_by_concurrent_puzzle_to_the_announcement_is_accepted_2241() {
+        let coin_a = wallet_coin(50_000, 1);
+        let coin_b = wallet_coin(30_000, 2);
+        let mut spends = standard_spend(
+            coin_a,
+            Conditions::new()
+                .create_coin(settlement_ph(), 50_000, Memos::None)
+                .assert_puzzle_announcement(Bytes32::new([0x44; 32])),
+        );
+        // coin_b asserts co-spend of a coin with coin_a's puzzle hash (both wallet coins share it),
+        // so the reachability walk reaches the announcement-bearing coin_a through the puzzle edge.
+        spends.extend(standard_spend(
+            coin_b,
+            Conditions::new()
+                .create_coin(settlement_ph(), 30_000, Memos::None)
+                .assert_concurrent_puzzle(coin_a.puzzle_hash),
+        ));
+        let effect = analyze(&spends)
+            .expect("a sink tied by concurrent-puzzle to the announcement is bound");
+        assert_eq!(effect.protocol_sink.len(), 2);
+    }
+
+    /// #2241 (bundle-level, true attack): a bundle carrying ONE announcement-bound sink coin PLUS a
+    /// SECOND settlement-sink coin that is NEITHER announcement-bound NOR concurrency-tied to the
+    /// bundle is REFUSED. This proves the bundle-level check did not become a blanket
+    /// "accept if any announcement is present": the unbound second sink is the real give-it-away
+    /// egress an attacker would smuggle beside a legitimately-bound leg.
+    #[test]
+    fn a_second_unbound_settlement_sink_in_the_bundle_is_refused_2241() {
+        let mut spends = standard_spend(
             wallet_coin(50_000, 1),
             Conditions::new()
                 .create_coin(settlement_ph(), 50_000, Memos::None)
-                .assert_concurrent_puzzle(Bytes32::new([0x55; 32])),
-        ))
-        .expect_err("a concurrent-puzzle-only settlement egress must be refused");
-        assert_eq!(
-            concurrent_puzzle.code,
-            WalletErrorCode::SpendValidationFailed
+                .assert_puzzle_announcement(Bytes32::new([0x44; 32])),
         );
+        // A second settlement sink, bound to NOTHING — not its own announcement, not a concurrency
+        // tie to the announcement-bearing coin.
+        spends.extend(standard_spend(
+            wallet_coin(30_000, 2),
+            Conditions::new().create_coin(settlement_ph(), 30_000, Memos::None),
+        ));
+        let err = analyze(&spends)
+            .expect_err("an unbound second settlement sink must be refused beside a bound one");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
     }
 
     /// A CLAIMED settlement (XCH) coin — the canonical settlement puzzle spent by announcement, no
