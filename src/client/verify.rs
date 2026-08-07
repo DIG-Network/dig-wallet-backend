@@ -45,19 +45,21 @@
 //!   a dig-options puzzle change binds the underlying reclaim to the holder in consensus.
 //! - **mint** (REFUSED, deferred #2243) — its cross-seam summary decode is not yet wired.
 //!
-//! # Recipients vs change is key-relative
+//! # Recipients vs change is key-relative — so this module does NOT split them
 //! Splitting a spend's outputs into recipients (value leaving) and change (value returning home) is
-//! inherently a WALLET-RELATIVE judgement: on-chain both are plain `CREATE_COIN`s. This module makes
-//! a key-free best-effort split on memo-hinting (the engine's XCH/CAT builders leave change
-//! un-hinted), but `dig-cat` — and so every $DIG tip — memo-hints its change coin too, so that split
-//! alone would over-count a tip's recipients. The AUTHORITATIVE, key-aware split lives in
-//! [`LocalSigner`](super::signer::LocalSigner), which treats every output it can derive a key for as
-//! change; that is what the signer's summary gate compares against.
+//! inherently a WALLET-RELATIVE judgement: on-chain both are plain `CREATE_COIN`s, indistinguishable
+//! without the wallet's keys. A key-free memo heuristic is unreliable — `dig-cat` (and so every $DIG
+//! tip) memo-hints its change coin too, and a memo-hinted change coin has already been misclassified
+//! in practice (#1511 PR-A). So [`analyze`] returns the created coins UNDIVIDED in
+//! [`SpendEffect::outputs`] and performs NO recipient/change split. The one authoritative split lives
+//! in [`LocalSigner`](super::signer::LocalSigner), which classifies each output by KEY OWNERSHIP
+//! (owned → change, not-owned → recipient); that is what the signer's summary gate compares against.
+//! The key-free [`derive_summary`] renders EVERY output as egress (conservative — it never drops a
+//! non-owned coin), and is non-authoritative display-only.
 
 use std::collections::{BTreeMap, HashMap};
 
 use chia_protocol::{Bytes32, CoinSpend};
-use chia_puzzle_types::Memos;
 use chia_wallet_sdk::driver::{
     Cat, Layer, OptionContract, P2OneOfManyLayer, Puzzle, SettlementLayer, StandardLayer,
 };
@@ -92,22 +94,24 @@ pub struct DecodedOutput {
 
 /// The authoritative value flow of a spend, reconstructed purely from its coin spends.
 ///
-/// [`recipients`](SpendEffect::recipients) are the HINTED (memo-carrying) outputs a payment sends to
-/// a counterparty; [`change`](SpendEffect::change) are the un-hinted outputs a well-formed spend
-/// returns to itself; [`protocol_sink`](SpendEffect::protocol_sink) are outputs the wallet commits to
-/// a consensus-enforced canonical structural puzzle (the offer **settlement** puzzle, #1511 PR-B).
-/// The signer requires every change output to be wallet-owned and every `protocol_sink` output to be a
-/// recognized canonical structural hash, so no value can silently leave the wallet to a free address.
+/// [`outputs`](SpendEffect::outputs) are the created coins UNDIVIDED — every `CREATE_COIN` to a free
+/// address, in coin-spend order, with NO recipient-vs-change split. That split is inherently
+/// key-relative (both are plain `CREATE_COIN`s on chain), so it is deferred to the key-holding
+/// consumer: [`LocalSigner`](super::signer::LocalSigner) classifies each output by KEY OWNERSHIP
+/// (owned → change, not-owned → recipient). [`protocol_sink`](SpendEffect::protocol_sink) are outputs
+/// the wallet commits to a consensus-enforced canonical structural puzzle (the offer **settlement**
+/// puzzle, #1511 PR-B). The signer requires every not-owned output to appear in the reviewed summary
+/// and every `protocol_sink` output to be a recognized canonical structural hash, so no value can
+/// silently leave the wallet to a free address.
 ///
 /// `#[non_exhaustive]` (ref #2242): the bucket set grows as new spend classes are decoded, so
 /// downstream matches must not assume a fixed field set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SpendEffect {
-    /// The hinted outputs (payments to counterparties).
-    pub recipients: Vec<DecodedOutput>,
-    /// The un-hinted outputs (change back to the spender).
-    pub change: Vec<DecodedOutput>,
+    /// The created coins to free addresses, UNDIVIDED (no recipient/change split — that is
+    /// key-relative and classified by the key-holding consumer, never here).
+    pub outputs: Vec<DecodedOutput>,
     /// Outputs the wallet intentionally commits to a consensus-enforced canonical structural puzzle —
     /// the offer settlement-payments puzzle ([`SETTLEMENT_PAYMENT_HASH`]) or the singleton launcher
     /// ([`SINGLETON_LAUNCHER_HASH`]). This is the sanctioned egress of offered/paid assets:
@@ -148,8 +152,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     }
 
     let mut allocator = Allocator::new();
-    let mut recipients = Vec::new();
-    let mut change = Vec::new();
+    let mut outputs = Vec::new();
     let mut protocol_sink = Vec::new();
     let mut fee: u64 = 0;
 
@@ -226,15 +229,13 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
                     let cat_out_total = cat_out.entry(asset).or_default();
                     *cat_out_total = accumulate(*cat_out_total, create.amount, "CAT output total")?;
                     route_output(
-                        &mut recipients,
-                        &mut change,
+                        &mut outputs,
                         &mut protocol_sink,
                         DecodedOutput {
                             puzzle_hash: create.puzzle_hash,
                             amount: create.amount,
                             asset_id: Some(asset),
                         },
-                        &create.memos,
                     );
                 }
                 continue;
@@ -262,15 +263,13 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
                     let cat_out_total = cat_out.entry(asset).or_default();
                     *cat_out_total = accumulate(*cat_out_total, create.amount, "CAT output total")?;
                     route_output(
-                        &mut recipients,
-                        &mut change,
+                        &mut outputs,
                         &mut protocol_sink,
                         DecodedOutput {
                             puzzle_hash: create.puzzle_hash,
                             amount: create.amount,
                             asset_id: Some(asset),
                         },
-                        &create.memos,
                     );
                 }
             }
@@ -355,15 +354,13 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
                     }
                     xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
                     route_output(
-                        &mut recipients,
-                        &mut change,
+                        &mut outputs,
                         &mut protocol_sink,
                         DecodedOutput {
                             puzzle_hash: create.puzzle_hash,
                             amount: create.amount,
                             asset_id: None,
                         },
-                        &create.memos,
                     );
                 }
             }
@@ -418,15 +415,13 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
                 if let Some(create) = condition.as_create_coin() {
                     xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
                     route_output(
-                        &mut recipients,
-                        &mut change,
+                        &mut outputs,
                         &mut protocol_sink,
                         DecodedOutput {
                             puzzle_hash: create.puzzle_hash,
                             amount: create.amount,
                             asset_id: None,
                         },
-                        &create.memos,
                     );
                 }
             }
@@ -447,15 +442,13 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
                 if let Some(create) = condition.as_create_coin() {
                     xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
                     route_output(
-                        &mut recipients,
-                        &mut change,
+                        &mut outputs,
                         &mut protocol_sink,
                         DecodedOutput {
                             puzzle_hash: create.puzzle_hash,
                             amount: create.amount,
                             asset_id: None,
                         },
-                        &create.memos,
                     );
                 }
             }
@@ -518,8 +511,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     }
 
     Ok(SpendEffect {
-        recipients,
-        change,
+        outputs,
         protocol_sink,
         fee: effective_fee,
     })
@@ -553,30 +545,36 @@ fn is_option_bundle(allocator: &mut Allocator, coin_spends: &[CoinSpend]) -> Wal
     Ok(false)
 }
 
-/// Re-derive the human-facing [`TransactionSummary`] from `coin_spends` alone — the authoritative
-/// summary the confirm surface renders and the signer gates on (never the engine's claim).
+/// Re-derive the human-facing [`TransactionSummary`] from `coin_spends` alone — a KEY-FREE,
+/// NON-AUTHORITATIVE display view.
 ///
-/// This is the KEY-FREE view: it splits recipients from change purely on memo-hinting (see
-/// [`classify`]). A spend whose change coin is itself memo-hinted (a `dig-cat`/$DIG-tip send) will
-/// therefore list that change among the recipients; the KEY-AWARE
-/// [`LocalSigner::reviewable_summary`](super::signer::LocalSigner::reviewable_summary) corrects that
-/// by treating every wallet-owned output as change.
+/// With no keys it cannot split recipients from change, so it renders EVERY created output as egress
+/// (conservative — it NEVER drops a non-owned coin, unlike the old memo heuristic that could hide an
+/// un-hinted non-owned egress). It therefore OVER-lists: a spend's own change coins appear as egress
+/// too. The AUTHORITATIVE, key-aware view is
+/// [`LocalSigner::reviewable_summary`](super::signer::LocalSigner::reviewable_summary), which drops
+/// wallet-owned change. Never use `derive_summary` ahead of signing — it is display-only.
 pub fn derive_summary(coin_spends: &[CoinSpend]) -> WalletResult<TransactionSummary> {
-    summarize(&analyze(coin_spends)?)
+    let effect = analyze(coin_spends)?;
+    summarize_egress(&effect.outputs, &effect.protocol_sink, effect.fee)
 }
 
-/// Render a re-derived [`SpendEffect`]'s value LEAVING the wallet — recipients (to a real address)
-/// plus `protocol_sink` (to a consensus-enforced settlement structure) — and the fee, as a
-/// [`TransactionSummary`] (the outputs a human reviews). Shared by the key-free [`derive_summary`] and
-/// the signer's key-aware summary, so both encode addresses + asset ids identically.
+/// Render the outputs LEAVING the wallet — `egress` (to real addresses) plus `protocol_sink` (to a
+/// consensus-enforced settlement structure) — and the fee, as a [`TransactionSummary`] a human
+/// reviews. Shared by the key-free [`derive_summary`] (which passes ALL of `effect.outputs` as egress)
+/// and the signer's key-aware summary (which passes only the not-owned outputs), so both encode
+/// addresses + asset ids identically.
 ///
 /// A `protocol_sink` output is rendered with an EMPTY address: its destination is the fixed settlement
 /// puzzle, not a chosen recipient, so there is no meaningful address to show — the offer builders emit
 /// the offered/paid assets the same way, and the signer's summary gate compares these by amount+asset,
 /// never by address (#1511 PR-B).
-pub fn summarize(effect: &SpendEffect) -> WalletResult<TransactionSummary> {
-    let mut outputs = effect
-        .recipients
+pub fn summarize_egress(
+    egress: &[DecodedOutput],
+    protocol_sink: &[DecodedOutput],
+    fee: u64,
+) -> WalletResult<TransactionSummary> {
+    let mut outputs = egress
         .iter()
         .map(|output| {
             Ok(SpendOutput {
@@ -590,8 +588,7 @@ pub fn summarize(effect: &SpendEffect) -> WalletResult<TransactionSummary> {
     // offered coins), not value leaving the wallet — omit it so the reviewed summary lists only real
     // egress.
     outputs.extend(
-        effect
-            .protocol_sink
+        protocol_sink
             .iter()
             .filter(|output| output.amount > 0)
             .map(|output| SpendOutput {
@@ -607,7 +604,7 @@ pub fn summarize(effect: &SpendEffect) -> WalletResult<TransactionSummary> {
         // key-aware re-derivation leaves it empty; the engine-declared received leg is surfaced by the
         // review renderer from the reviewed spend's own summary (#2241).
         received: Vec::new(),
-        fee: Amount(effect.fee),
+        fee: Amount(fee),
     })
 }
 
@@ -623,38 +620,21 @@ fn run_conditions(
         .map_err(|e| reject(format!("undecodable conditions: {e:?}")))
 }
 
-/// Sort a decoded output into recipients (hinted) vs change (un-hinted). The engine hints every
-/// counterparty payment with a memo and leaves change memo-less, so the memo presence is the
-/// recipient/change discriminator.
-fn classify(
-    recipients: &mut Vec<DecodedOutput>,
-    change: &mut Vec<DecodedOutput>,
-    output: DecodedOutput,
-    memos: &Memos<clvmr::NodePtr>,
-) {
-    if matches!(memos, Memos::Some(_)) {
-        recipients.push(output);
-    } else {
-        change.push(output);
-    }
-}
-
-/// Route a decoded output into the three buckets (#1511 PR-B): a `CREATE_COIN` to a recognized
-/// canonical structural puzzle (settlement) is a [`SpendEffect::protocol_sink`] — the sanctioned
-/// egress of an offered/paid asset — regardless of its memos; everything else falls through to the
-/// key-free recipient/change [`classify`]. Routing on the DESTINATION HASH (never on a caller-chosen
-/// flag) is what stops a plain payment to an attacker being mislabelled as a benign sink (MR-3/MR-5).
+/// Route a decoded output into one of the two buckets (#1511 PR-B, #2239): a `CREATE_COIN` to a
+/// recognized canonical structural puzzle (settlement / launcher) is a [`SpendEffect::protocol_sink`]
+/// — the sanctioned egress of an offered/paid asset; everything else is an ordinary output added
+/// UNDIVIDED to [`SpendEffect::outputs`] (the recipient-vs-change split is key-relative and deferred
+/// to the key-holding consumer). Routing on the DESTINATION HASH (never on a caller-chosen flag or a
+/// memo) is what stops a plain payment to an attacker being mislabelled as a benign sink (MR-3/MR-5).
 fn route_output(
-    recipients: &mut Vec<DecodedOutput>,
-    change: &mut Vec<DecodedOutput>,
+    outputs: &mut Vec<DecodedOutput>,
     protocol_sink: &mut Vec<DecodedOutput>,
     output: DecodedOutput,
-    memos: &Memos<clvmr::NodePtr>,
 ) {
     if is_protocol_sink_hash(output.puzzle_hash) {
         protocol_sink.push(output);
     } else {
-        classify(recipients, change, output, memos);
+        outputs.push(output);
     }
 }
 
@@ -1037,6 +1017,7 @@ mod tests {
     use crate::types::{IdentityRef, Network, SendCatRequest, SendXchRequest, WalletId};
     use chia_protocol::Coin;
     use chia_puzzle_types::standard::StandardArgs;
+    use chia_puzzle_types::Memos;
     use chia_wallet_sdk::driver::{Cat, SpendContext};
     use chia_wallet_sdk::types::Conditions;
     use std::sync::Arc;
@@ -1117,21 +1098,34 @@ mod tests {
         }
     }
 
-    /// Golden: the re-derived summary reproduces exactly what the XCH builder claimed.
+    /// #2239: the key-free `derive_summary` re-derives the engine's declared egress AND conservatively
+    /// over-lists the wallet's own change (it has no keys to drop it). So it SURFACES the 600 payment
+    /// the builder claimed, plus the 390 change, with the same fee. (The key-AWARE
+    /// `LocalSigner::reviewable_summary` reproduces the engine summary exactly — covered in the signer
+    /// tests.)
     #[tokio::test]
-    async fn derive_summary_matches_the_xch_builder() {
+    async fn derive_summary_surfaces_the_xch_builders_egress_plus_change() {
         let unsigned = builder(vec![wallet_coin(1000, 1)], vec![])
             .build_send_xch(xch_request(600, 10))
             .await
             .unwrap();
         let derived = derive_summary(&unsigned.coin_spends).unwrap();
-        assert_eq!(derived, unsigned.summary);
+        assert_eq!(derived.fee, Amount(10));
+        // The engine's declared recipient output is present in the (over-listed) key-free view.
+        for claimed in &unsigned.summary.outputs {
+            assert!(
+                derived.outputs.contains(claimed),
+                "key-free derive_summary must surface every engine-declared output"
+            );
+        }
+        // Plus the 390 change (1000 − 600 − 10), which the key-free view cannot drop.
+        assert!(derived.outputs.iter().any(|o| o.amount == Amount(390)));
     }
 
-    /// Golden: the re-derived summary reproduces exactly what the CAT builder claimed (the engine
-    /// summary's asset id must be the real tail hash for byte-equality).
+    /// #2239: the same over-listing property for a CAT send — the key-free view surfaces the builder's
+    /// declared CAT egress (asset id = the real tail hash) among its undivided outputs.
     #[tokio::test]
-    async fn derive_summary_matches_the_cat_builder() {
+    async fn derive_summary_surfaces_the_cat_builders_egress() {
         let cat = issued_cat(1000);
         let asset_hex = hex::encode(cat.info.asset_id);
         let unsigned = builder(vec![], vec![cat])
@@ -1145,12 +1139,21 @@ mod tests {
             .await
             .unwrap();
         let derived = derive_summary(&unsigned.coin_spends).unwrap();
-        assert_eq!(derived, unsigned.summary);
+        assert_eq!(derived.fee, Amount(0));
+        for claimed in &unsigned.summary.outputs {
+            assert!(
+                derived.outputs.contains(claimed),
+                "key-free derive_summary must surface every engine-declared CAT output"
+            );
+        }
     }
 
-    /// The change output is classified as change (un-hinted) and the recipient as a recipient.
+    /// #2239: `analyze` returns the created coins UNDIVIDED — BOTH the payment and the change land in
+    /// one `outputs` bucket, with NO recipient/change verdict on `SpendEffect` (that split is
+    /// key-relative and belongs to the key-holding signer). A 600-mojo payment + a 390-mojo change
+    /// (1000 − 600 − 10 fee) from one coin yields exactly two undivided outputs.
     #[tokio::test]
-    async fn analyze_separates_recipient_from_change() {
+    async fn analyze_returns_undivided_outputs() {
         let effect = analyze(
             &builder(vec![wallet_coin(1000, 1)], vec![])
                 .build_send_xch(xch_request(600, 10))
@@ -1159,13 +1162,17 @@ mod tests {
                 .coin_spends,
         )
         .unwrap();
-        assert_eq!(effect.recipients.len(), 1);
-        assert_eq!(effect.recipients[0].amount, 600);
+        // Both created coins are present, undivided; the fee is still derived.
+        assert_eq!(effect.outputs.len(), 2);
         assert_eq!(effect.fee, 10);
-        // Change (1000 - 600 - 10 = 390) goes back to the wallet, un-hinted.
-        assert_eq!(effect.change.len(), 1);
-        assert_eq!(effect.change[0].amount, 390);
-        assert_eq!(effect.change[0].puzzle_hash, wallet_ph());
+        let mut amounts: Vec<u64> = effect.outputs.iter().map(|o| o.amount).collect();
+        amounts.sort_unstable();
+        assert_eq!(amounts, vec![390, 600]);
+        // The change coin (390, back to the wallet) is present as a plain output — NOT bucketed apart.
+        assert!(effect
+            .outputs
+            .iter()
+            .any(|o| o.amount == 390 && o.puzzle_hash == wallet_ph()));
     }
 
     /// An empty coin-spend set is refused fail-closed.
@@ -1354,7 +1361,7 @@ mod tests {
                 .create_coin(Bytes32::new([0xA2; 32]), 400, Memos::None),
         );
         let effect = analyze(&spends).expect("a conserving two-output spend is valid");
-        assert_eq!(effect.change.len(), 2);
+        assert_eq!(effect.outputs.len(), 2);
         assert_eq!(effect.fee, 0);
     }
 
@@ -1394,7 +1401,7 @@ mod tests {
             Coin::new(Bytes32::new([0xB2; 32]), ph, 1_001),
             Conditions::new().create_coin(ph, 1_001, Memos::None),
         ));
-        assert_eq!(analyze(&spends).unwrap().change.len(), 2);
+        assert_eq!(analyze(&spends).unwrap().outputs.len(), 2);
     }
 
     /// Spend `cat` with hand-chosen inner p2 conditions (the CAT ring the verifier re-derives).
@@ -1436,7 +1443,7 @@ mod tests {
                 .create_coin(Bytes32::new([0xC1; 32]), 600, Memos::None)
                 .create_coin(Bytes32::new([0xC2; 32]), 400, Memos::None),
         );
-        assert_eq!(analyze(&spends).unwrap().change.len(), 2);
+        assert_eq!(analyze(&spends).unwrap().outputs.len(), 2);
     }
 
     /// #1708: the accumulator itself, exercised at and one past its bound. A bound tested only from
@@ -1492,8 +1499,8 @@ mod tests {
         ))
         .expect("a bound settlement egress is a valid offered leg");
         assert!(
-            effect.recipients.is_empty(),
-            "offered value is not a recipient"
+            effect.outputs.is_empty(),
+            "offered value is a protocol sink, not a free-address output"
         );
         assert_eq!(effect.protocol_sink.len(), 1);
         assert_eq!(effect.protocol_sink[0].amount, 50_000);
@@ -1644,15 +1651,10 @@ mod tests {
         ctx.spend(coin, Spend::new(puzzle, solution)).unwrap();
 
         let effect = analyze(&ctx.take()).expect("a claimed settlement coin decodes");
-        // The 1_000 leaves to the payee (a change/recipient split the key-aware signer resolves);
-        // per-asset value conserves (input 1_000 == output 1_000), and nothing is a protocol sink.
+        // The 1_000 leaves to the payee as a plain undivided output (a change/recipient split the
+        // key-aware signer resolves); per-asset value conserves (in 1_000 == out 1_000), no sink.
         assert!(effect.protocol_sink.is_empty());
-        let payout: u64 = effect
-            .recipients
-            .iter()
-            .chain(&effect.change)
-            .map(|o| o.amount)
-            .sum();
+        let payout: u64 = effect.outputs.iter().map(|o| o.amount).sum();
         assert_eq!(payout, 1_000);
     }
 
@@ -1689,7 +1691,7 @@ mod tests {
         ))
         .expect("truthful protocol-sink-inclusive amounts conserve");
         assert_eq!(effect.protocol_sink[0].amount, 600);
-        assert_eq!(effect.change[0].amount, 400);
+        assert_eq!(effect.outputs[0].amount, 400);
     }
 
     /// The `protocol_sink` recognizer accepts exactly the canonical structural hashes — the settlement

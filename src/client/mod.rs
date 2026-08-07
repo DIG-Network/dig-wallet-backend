@@ -27,7 +27,7 @@ pub use review::{decode, HumanReadableSummary};
 pub use signer::{IdentitySigner, LocalSigner};
 pub use transport::{ControlTransport, IpcWalletClient};
 pub use verify::{
-    analyze, derive_summary, is_protocol_sink_hash, summarize, DecodedOutput, SpendEffect,
+    analyze, derive_summary, is_protocol_sink_hash, summarize_egress, DecodedOutput, SpendEffect,
 };
 
 // The subscription shape contract itself — `CatchUp` + `filter_events` — is the canonical
