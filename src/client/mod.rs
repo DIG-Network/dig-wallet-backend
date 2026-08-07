@@ -12,6 +12,11 @@
 //! crosses to the engine (SPEC §1.4).
 
 pub mod addressbook;
+// The key-free spend builder + coin selection, re-exported for app-local building (SPEC §1.3).
+// Gated on `engine` because it re-exports the engine seam's key-free builder — present under the
+// DEFAULT feature set dig-app consumes (engine + client), mirroring the `subscribe` re-export below.
+#[cfg(feature = "engine")]
+pub mod build;
 pub mod hd;
 pub mod identity;
 pub mod review;
