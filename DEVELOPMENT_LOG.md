@@ -3,6 +3,19 @@
 High-signal, durable realizations from developing this crate. Concise facts with context — NOT a
 change diary.
 
+## `verified = true` means OWNERSHIP-verified, and only the key-aware decode can source it (#2255)
+
+`HumanReadableSummary::verified` is NOT "the lines were re-derived from the coin spends" — it is the
+stronger "the lines were split by real KEY OWNERSHIP". Only `LocalSigner::decode_verified`
+(→ `reviewable_summary` → `reclassify_by_ownership`) can satisfy that. The key-free `review::decode`
+re-derives correctly but splits recipient/change with a MEMO heuristic: an un-hinted output to a
+NON-owned address is bucketed as change and DROPPED. So a `verified = true` from the key-free path was
+a FALSE assurance — it could render an empty/benign screen while the signer honestly signs the hidden
+egress (same fail-open class #2209 fixed for the primary path). Fix: `review::decode` returns
+`verified = false` on BOTH paths (success AND engine-claim fallback), making a `verified = true`
+consent view structurally impossible to source without a key. Invariant to keep:
+`verified = true` ⇔ `LocalSigner::decode_verified`.
+
 ## An offer requested payment is NOT re-derivable from the coin spends (#2241)
 
 The maker's offered coins bind the requested payment by asserting a settlement PUZZLE announcement

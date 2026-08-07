@@ -33,12 +33,17 @@ pub struct HumanReadableSummary {
     pub coin_spend_count: usize,
     /// The number of signatures the user's key must produce.
     pub required_signature_count: usize,
-    /// Whether the rendered lines were INDEPENDENTLY re-derived from the coin spends
-    /// ([`super::verify::derive_summary`], or the key-aware
-    /// [`super::signer::LocalSigner::decode_verified`]). When `false` the spend could not be
-    /// independently decoded — the lines fall back to the engine's (untrusted) claim and the confirm
-    /// UI MUST surface this as unverifiable; [`super::signer::LocalSigner::sign_unsigned`] will refuse
-    /// to sign it.
+    /// Whether the rendered lines are OWNERSHIP-VERIFIED — re-derived AND split by real key ownership.
+    /// This is `true` ONLY when produced by the key-aware
+    /// [`super::signer::LocalSigner::decode_verified`] (→ `reviewable_summary` →
+    /// `reclassify_by_ownership`), the sole decode that structurally surfaces every non-owned output.
+    ///
+    /// The key-free [`decode`] is ALWAYS `verified = false` (#2255): its memo-based re-derivation
+    /// buckets un-hinted non-owned outputs as change and drops them, so it can silently hide a real
+    /// egress — a `verified = true` from it would be a false assurance. When `verified` is `false` the
+    /// confirm UI MUST surface the view as ownership-unverifiable, and
+    /// [`super::signer::LocalSigner::sign_unsigned`] refuses to sign a spend it could not independently
+    /// verify.
     pub verified: bool,
 }
 
@@ -63,9 +68,15 @@ fn render_amount(amount: Amount, is_xch: bool) -> String {
 ///
 /// The rendered value flow is re-derived straight from the coin spends
 /// ([`super::verify::derive_summary`], #1058) so the confirm dialog shows what the transaction
-/// ACTUALLY does — the same authoritative summary the signer gates on — never the engine's
-/// (potentially lying) claim. If the spend cannot be independently decoded the engine summary is
-/// shown as a last resort with [`HumanReadableSummary::verified`] `= false`.
+/// ACTUALLY does — never the engine's (potentially lying) claim. If the spend cannot be independently
+/// decoded the engine summary is shown as a last resort.
+///
+/// # Always ownership-UNVERIFIED
+/// The returned [`HumanReadableSummary::verified`] is ALWAYS `false` (#2255) — a key-free decode has
+/// no key, so it cannot split outputs by ownership and can silently drop an un-hinted non-owned egress
+/// (see below). `verified = true` is reserved for the key-aware
+/// [`super::signer::LocalSigner::decode_verified`]; presenting a `verified = true` consent view is
+/// structurally impossible from here.
 ///
 /// # Never use this ahead of signing
 /// This lenient mode can silently degrade from "what the bundle DOES" to "what the (untrusted)
@@ -84,17 +95,23 @@ fn render_amount(amount: Amount, is_xch: bool) -> String {
 /// surfaces every non-owned output. This lenient decode is for a display surface only.
 pub fn decode(unsigned: &UnsignedSpend) -> HumanReadableSummary {
     match super::verify::derive_summary(&unsigned.coin_spends) {
-        Ok(summary) => render(unsigned, &summary, true),
-        // Fall back to the engine's (untrusted) claim, flagged unverified. The signer refuses to
-        // sign such a spend regardless (`verify_before_signing` re-runs `analyze` fail-closed).
+        // A key-free decode is ALWAYS `verified = false` (#2255). Even when the key-free
+        // re-derivation succeeds it uses the memo-based `classify`, which buckets un-hinted non-owned
+        // outputs as change and DROPS them — so a `verified = true` here would be a FALSE assurance,
+        // hiding a real egress that the signer would still sign. `verified = true` is reserved for the
+        // key-aware ownership split ([`super::signer::LocalSigner::decode_verified`]), the ONLY decode
+        // that structurally surfaces every non-owned output.
+        Ok(summary) => render(unsigned, &summary, false),
+        // Fall back to the engine's (untrusted) claim, likewise unverified. The signer refuses to sign
+        // such a spend regardless (`verify_before_signing` re-runs `analyze` fail-closed).
         Err(_) => render(unsigned, &unsigned.summary, false),
     }
 }
 
 /// Render a re-derived [`TransactionSummary`] into the human-readable confirm lines. `verified`
-/// records whether `summary` came from an independent re-derivation
-/// ([`super::signer::LocalSigner::decode_verified`] and the happy path of [`decode`] pass `true`;
-/// [`decode`] passes `false` for its engine-claim fallback).
+/// records whether `summary` is OWNERSHIP-verified: only the key-aware
+/// [`super::signer::LocalSigner::decode_verified`] passes `true`; the key-free [`decode`] passes
+/// `false` on BOTH its paths (#2255) — a key-free decode is inherently ownership-unverified.
 ///
 /// `pub(crate)` so the key-aware consent decode on [`super::signer::LocalSigner`] renders through the
 /// SAME formatter as the lenient display decode — one rendering of confirm lines, no drift.
@@ -250,16 +267,15 @@ mod tests {
         );
     }
 
-    /// A real, decodable spend is rendered from the re-derived (authoritative) summary and flagged
-    /// verified.
-    ///
-    /// The no-fallback CONSENT decode is now key-aware and lives on
+    /// A real, decodable spend is rendered from the re-derived summary — but the key-free `decode` is
+    /// ALWAYS ownership-UNVERIFIED (#2255), so `verified` is `false` even though the lines are correct
+    /// for this owned send. `verified = true` is reserved for the key-aware
     /// [`super::super::signer::LocalSigner::decode_verified`] (a free function structurally cannot
     /// apply the ownership split); its coverage — including the divergence from this key-free view on
-    /// an un-hinted non-owned output — lives in the signer tests (#2209).
+    /// an un-hinted non-owned output — lives in the signer tests (#2209, #2255).
     #[cfg(feature = "engine")]
     #[tokio::test]
-    async fn decode_of_a_real_spend_is_verified() {
+    async fn decode_of_a_real_spend_is_unverified() {
         use crate::engine::build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
         use crate::types::{IdentityRef, Network, SendXchRequest, WalletId};
         use chia_protocol::{Bytes32, Coin};
@@ -319,7 +335,10 @@ mod tests {
             .await
             .unwrap();
         let summary = decode(&unsigned);
-        assert!(summary.verified);
+        assert!(
+            !summary.verified,
+            "a key-free decode is always ownership-unverified (#2255)"
+        );
         assert_eq!(summary.lines.len(), 1);
     }
 }

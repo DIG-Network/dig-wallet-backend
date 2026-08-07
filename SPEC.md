@@ -449,12 +449,15 @@ Used by dig-app. The subscriber + identity provider + signer.
   and required-signature counts) from the value flow re-derived by `client::verify` (→ `analyze`, the
   SINGLE authoritative interpreter of what a spend means). They differ in fallback behaviour AND — the
   point of #2209 — in WHICH recipient/change split they render:
-  - **`client::review::decode(&UnsignedSpend) -> HumanReadableSummary`** — DISPLAY-ONLY, key-FREE, MAY
-    be unverified. It renders `verify::derive_summary`, whose recipient/change split is a memo
-    heuristic with NO ownership check, so an un-hinted output to a NON-owned address is bucketed as
-    "change" and DROPPED from the lines. On re-derivation failure it falls back to the engine's
-    (untrusted) claimed summary with `HumanReadableSummary::verified = false`. A caller MUST render +
-    honour that flag. It MUST NOT be used ahead of signing.
+  - **`client::review::decode(&UnsignedSpend) -> HumanReadableSummary`** — DISPLAY-ONLY, key-FREE, and
+    ALWAYS `HumanReadableSummary::verified = false` (#2255). It renders `verify::derive_summary`, whose
+    recipient/change split is a memo heuristic with NO ownership check, so an un-hinted output to a
+    NON-owned address is bucketed as "change" and DROPPED from the lines. Because it has no key it
+    cannot split by ownership, so it can silently hide a real egress — therefore it can NEVER present a
+    `verified = true` view (both its success path and its engine-claim fallback return
+    `verified = false`). This makes a `verified = true` consent screen structurally impossible to
+    source from the key-free decode. A caller MUST render + honour the flag; it MUST NOT be used ahead
+    of signing. **Invariant: `verified = true` ⇔ the key-aware ownership split (`decode_verified`).**
   - **`client::signer::LocalSigner::decode_verified(&UnsignedSpend) -> WalletResult<HumanReadableSummary>`**
     — the pre-sign CONSENT decode. It is a METHOD on the key-holding signer (a free function cannot be
     key-aware) with NO fallback: it re-derives through `verify::analyze` and, if that fails, returns
