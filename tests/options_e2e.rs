@@ -525,3 +525,180 @@ async fn unbound_settlement_sink_beside_an_option_transfer_is_refused_2249() {
         .expect_err("an unbound settlement sink beside an option transfer must be refused");
     assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
 }
+
+// ---- #2285: dedicated teeth for the untested `analyze` custody refusal branches. ----
+//
+// Each test constructs the MINIMAL spend that reaches one refusal guard and asserts the SPECIFIC
+// error (message substring), so a future edit that removes/weakens the guard turns the test RED. All
+// are additive TEST-ONLY coverage — no production code changes.
+
+/// #2285 (branch 1, ref #2245): an option EXERCISE's locked-underlying leg — a bare `P2OneOfManyLayer`
+/// (1-of-2 exercise/clawback) coin — is refused fail-closed as "not signable", REGARDLESS of whether
+/// the option singleton is present in the bundle (defeating the strip-the-leg attack). Constructs the
+/// `P2OneOfManyLayer` puzzle directly, pins the coin's committed hash to it (so the #1518 puzzle-reveal
+/// bind passes), and spends it alone — reaching the dedicated `P2OneOfManyLayer` refusal in the
+/// dispatch (distinct from the melt/non-re-home refusal the exercise-bundle tests cover).
+#[test]
+fn a_bare_p2_one_of_many_underlying_leg_is_refused_2285() {
+    use chia_wallet_sdk::driver::{Layer, P2OneOfManyLayer};
+    use clvm_utils::tree_hash;
+    use clvmr::serde::node_to_bytes;
+
+    let mut ctx = SpendContext::new();
+    let layer = P2OneOfManyLayer::new(Bytes32::new([0x5a; 32]));
+    let puzzle_ptr = layer.construct_puzzle(&mut ctx).unwrap();
+    let puzzle_reveal = node_to_bytes(&ctx, puzzle_ptr).unwrap();
+    // The coin must commit to exactly the revealed puzzle's hash (the #1518 bind), else `analyze`
+    // refuses on the substituted-puzzle guard instead of the branch under test.
+    let committed = Bytes32::new(tree_hash(&ctx, puzzle_ptr).to_bytes());
+    let coin = Coin::new(Bytes32::new([0x11; 32]), committed, 1);
+    let spend = CoinSpend::new(coin, puzzle_reveal.into(), vec![0x80].into());
+
+    let err = analyze(&[spend]).expect_err("a bare P2OneOfMany underlying leg must be refused");
+    assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    assert!(
+        err.message.contains("option exercise is not signable"),
+        "got: {}",
+        err.message
+    );
+}
+
+/// #2285 (branch 3): an option-singleton spend whose INNER p2 puzzle is not a standard layer is refused
+/// — a transfer is signable only because it touches the inner STANDARD layer to re-home; a foreign
+/// inner puzzle's authorized flow cannot be verified. Spends the singleton via `OptionContract::spend`
+/// with an identity inner puzzle (`1`) that emits an odd re-home `CREATE_COIN` (so it decodes down the
+/// transfer path), reaching the inner-not-standard refusal.
+#[test]
+fn option_singleton_with_a_non_standard_inner_is_refused_2285() {
+    use chia_puzzle_types::Memos;
+    use chia_wallet_sdk::driver::Spend;
+    use clvm_utils::tree_hash;
+
+    let mut sim = Simulator::new();
+    let mut ctx = SpendContext::new();
+    let alice = sim.bls(1_001);
+    let created = create_self_option(&mut ctx, alice.pk, alice.coin, alice.puzzle_hash);
+
+    // Re-home the option's p2 onto an identity puzzle (`1`, which returns its solution) so the coin's
+    // committed puzzle hash wraps the NON-standard inner — the #1518 puzzle-reveal bind then passes and
+    // `analyze` reaches the inner-not-a-standard-layer refusal (not the substituted-puzzle guard).
+    let inner_puzzle = ctx.alloc(&1).unwrap();
+    let inner_hash = Bytes32::new(tree_hash(&ctx, inner_puzzle).to_bytes());
+    let option = created.option.child(inner_hash, 1);
+    let inner_solution = ctx
+        .alloc(&Conditions::new().create_coin(Bytes32::new([0x77; 32]), 1, Memos::None))
+        .unwrap();
+    let _ = option
+        .spend(&mut ctx, Spend::new(inner_puzzle, inner_solution))
+        .unwrap();
+    let spends = ctx.take();
+
+    let err = analyze(&spends).expect_err("a non-standard option inner puzzle must be refused");
+    assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    assert!(
+        err.message
+            .contains("option singleton inner puzzle is not a standard layer"),
+        "got: {}",
+        err.message
+    );
+}
+
+/// #2285 (branch 4): an option TRANSFER whose delegated puzzle emits MORE THAN ONE `CREATE_COIN` — an
+/// undisclosed extra egress riding the re-home — is refused. Builds a clean re-home transfer, then
+/// splices in a SECOND (even-amount, non-sink) `CREATE_COIN` through the extra conditions; the
+/// single-re-home count guard fires.
+#[test]
+fn option_transfer_with_a_second_create_coin_is_refused_2285() {
+    use chia_puzzle_types::Memos;
+    use chia_wallet_sdk::driver::StandardLayer;
+
+    let mut sim = Simulator::new();
+    let mut ctx = SpendContext::new();
+    let alice = sim.bls(1_001);
+    let created = create_self_option(&mut ctx, alice.pk, alice.coin, alice.puzzle_hash);
+
+    let inner = StandardLayer::new(alice.pk);
+    let extra = Conditions::new().create_coin(Bytes32::new([0x88; 32]), 2, Memos::None);
+    let _ = created
+        .option
+        .transfer(&mut ctx, &inner, Bytes32::new([0x77; 32]), extra)
+        .unwrap();
+    let spends = ctx.take();
+
+    let err = analyze(&spends).expect_err("a second CREATE_COIN on a transfer must be refused");
+    assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    assert!(
+        err.message.contains("more than one CREATE_COIN"),
+        "got: {}",
+        err.message
+    );
+}
+
+/// #2285 (branch 5, MR-12): an option TRANSFER that re-homes the singleton to a canonical STRUCTURAL
+/// puzzle hash (here the settlement-payments hash) — an unauthorized re-home laundered as a protocol
+/// sink — is refused. A legitimate transfer re-homes to the new owner's chosen p2 the human reviews,
+/// never to a structural hash.
+#[test]
+fn option_transfer_to_a_structural_sink_hash_is_refused_2285() {
+    use chia_wallet_sdk::driver::StandardLayer;
+    use chia_wallet_sdk::puzzles::SETTLEMENT_PAYMENT_HASH;
+
+    let mut sim = Simulator::new();
+    let mut ctx = SpendContext::new();
+    let alice = sim.bls(1_001);
+    let created = create_self_option(&mut ctx, alice.pk, alice.coin, alice.puzzle_hash);
+
+    let inner = StandardLayer::new(alice.pk);
+    let _ = created
+        .option
+        .transfer(
+            &mut ctx,
+            &inner,
+            Bytes32::new(SETTLEMENT_PAYMENT_HASH),
+            Conditions::new(),
+        )
+        .unwrap();
+    let spends = ctx.take();
+
+    let err = analyze(&spends).expect_err("a re-home to a structural hash must be refused");
+    assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    assert!(
+        err.message.contains("structural puzzle hash"),
+        "got: {}",
+        err.message
+    );
+}
+
+/// #2285 (branch 6): in OPTION mode conservation is `in − out` (the implicit fee); an option spend
+/// whose outputs EXCEED its inputs would mint value, so `checked_sub` returning `None` is refused. The
+/// 1-mojo option singleton is re-homed with an odd `CREATE_COIN` of amount 3 (> the 1-mojo input),
+/// minting 2 mojos — reaching the mint refusal in the `analyze` conservation epilogue.
+#[test]
+fn option_spend_that_mints_value_is_refused_2285() {
+    use chia_puzzle_types::Memos;
+    use chia_wallet_sdk::driver::StandardLayer;
+
+    let mut sim = Simulator::new();
+    let mut ctx = SpendContext::new();
+    let alice = sim.bls(1_001);
+    let created = create_self_option(&mut ctx, alice.pk, alice.coin, alice.puzzle_hash);
+
+    let inner = StandardLayer::new(alice.pk);
+    let _ = created
+        .option
+        .spend_with(
+            &mut ctx,
+            &inner,
+            Conditions::new().create_coin(Bytes32::new([0x77; 32]), 3, Memos::None),
+        )
+        .unwrap();
+    let spends = ctx.take();
+
+    let err = analyze(&spends).expect_err("an option spend minting value must be refused");
+    assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    assert!(
+        err.message.contains("option spend mints value"),
+        "got: {}",
+        err.message
+    );
+}

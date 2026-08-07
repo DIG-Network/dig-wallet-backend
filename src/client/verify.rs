@@ -1877,6 +1877,52 @@ mod tests {
         assert_eq!(effect.outputs[0].amount, 400);
     }
 
+    /// #2285: a CAT coin whose inner p2 puzzle is NEITHER a standard layer NOR a settlement layer is
+    /// refused fail-closed — a foreign inner puzzle is one whose authorized value flow the wallet
+    /// cannot verify, so the sole-AGG_SIG_ME / quote-form commitment could not bind it. This covers the
+    /// `account_cat_spend` else-branch (neither settlement-claim nor standard-send).
+    ///
+    /// The CAT is spent with an identity inner puzzle (`1`, which returns its own solution). Its
+    /// solution conserves the CAT (a single same-value `CREATE_COIN`) so `Cat::spend_all` builds a
+    /// well-formed ring; the refusal is reached on the inner-puzzle class check, BEFORE any conservation
+    /// math runs.
+    #[test]
+    fn a_cat_inner_that_is_neither_standard_nor_settlement_is_refused_2285() {
+        use chia_wallet_sdk::driver::{CatInfo, CatSpend, Spend};
+
+        let mut ctx = SpendContext::new();
+        // Build a CAT whose inner p2 puzzle is the identity puzzle (`1`, which returns its solution).
+        // The CAT's committed coin puzzle hash is derived FROM that inner puzzle's hash, so the #1518
+        // puzzle-reveal bind passes and `analyze` reaches the inner-puzzle-class refusal.
+        let inner_puzzle = ctx.alloc(&1).unwrap();
+        let inner_hash = Bytes32::new(tree_hash(&ctx, inner_puzzle).to_bytes());
+        let base = issued_cat(1_000);
+        let info = CatInfo::new(base.info.asset_id, None, inner_hash);
+        let coin = Coin::new(
+            base.coin.parent_coin_info,
+            Bytes32::new(info.puzzle_hash().to_bytes()),
+            1_000,
+        );
+        let cat = Cat::new(coin, base.lineage_proof, info);
+        let inner_solution = ctx
+            .alloc(&Conditions::new().create_coin(wallet_ph(), 1_000, Memos::None))
+            .unwrap();
+        Cat::spend_all(
+            &mut ctx,
+            &[CatSpend::new(cat, Spend::new(inner_puzzle, inner_solution))],
+        )
+        .unwrap();
+
+        let err = analyze(&ctx.take()).expect_err("a foreign CAT inner puzzle must be refused");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+        assert!(
+            err.message
+                .contains("neither a standard layer nor a settlement layer"),
+            "got: {}",
+            err.message
+        );
+    }
+
     /// The `protocol_sink` recognizer accepts exactly the canonical structural hashes — the settlement
     /// puzzle and the singleton launcher (#1511 PR-C) — and nothing else (never a free/wallet address).
     #[test]
