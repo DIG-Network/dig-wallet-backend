@@ -465,6 +465,17 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
 
     // Bundle-level offer-binding (#2241): every settlement-sink egress must be tied — directly or
     // through the concurrency ring — to an announcement that binds the requested payment.
+    //
+    // This pass is enforced UNCONDITIONALLY — never gated on `option_mode` (#2249). The MR-6 binding
+    // was once disabled for the whole bundle whenever an option-layer coin flipped `option_mode` on,
+    // which let an attacker include any option coin to route a standard coin's value into a settlement
+    // sink with no binding enforced. The gate is per-EGRESS instead: `bindings` holds only the
+    // WALLET-SIGNED coins that can commit value to settlement (standard-XCH + CAT sends) — an option
+    // TRANSFER's singleton re-home never targets a structural sink hash (refused above at #345) and is
+    // not pushed here, so it is inert in this pass. The one leg that legitimately carries no
+    // offer-binding — the consensus-forced option EXERCISE strike — never reaches this pass at all:
+    // exercise is refused fail-closed at the signature source (the non-re-home / `P2OneOfManyLayer`
+    // refusals above), so no strike-leg exemption is needed here and none is granted.
     enforce_bundle_settlement_binding(&bindings)?;
 
     // XCH value conservation. Two modes:

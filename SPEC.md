@@ -426,8 +426,13 @@ Used by dig-app. The subscriber + identity provider + signer.
   Concurrency alone is never a binding on its own — it binds spend concurrency, not the VALUE received —
   but it IS the ring that ties a make's non-announcement offered coins to the announcement-bearing coin,
   so a legitimate multi-offered-coin make (offer XCH + a CAT, or two distinct CATs) is accepted while an
-  unbound sink is refused fail-closed. An option (transfer) bundle emits no settlement egress from a
-  wallet-signed coin, so the pass is inert there. Settlement-layer coins
+  unbound sink is refused fail-closed. The pass is enforced PER-EGRESS and is NEVER disabled by the
+  presence of an option-layer coin (`option_mode`) (#2249): the mere presence of an option coin cannot
+  exempt a standard/CAT coin's settlement egress from the binding. An option TRANSFER bundle emits no
+  settlement egress from a wallet-signed coin (its singleton re-home may never target a structural sink
+  hash), so the pass is inert there; the one leg that legitimately carries no offer-binding — the
+  consensus-forced option EXERCISE strike — is refused fail-closed at the signature source and never
+  reaches this pass, so no strike-leg exemption is granted. Settlement-layer coins
   the wallet CLAIMS (take/cancel) are decoded through
   `SettlementLayer`
   (which gates on `SETTLEMENT_PAYMENT_HASH`); they carry NO signature (claimed by announcement), so

@@ -3,6 +3,23 @@
 High-signal, durable realizations from developing this crate. Concise facts with context — NOT a
 change diary.
 
+## Offer settlement-binding is per-egress, never disabled by `option_mode` (#2249, closed by #2241)
+
+The MR-6 offer settlement-binding was once skipped for the WHOLE bundle whenever an option-layer coin
+flipped `option_mode` on (`if !option_mode { enforce_settlement_binding }`), so including any option
+coin could route a standard coin's value into a settlement sink with no binding enforced. #2241's
+rework already closed this: it moved the check to an UNCONDITIONAL bundle-level pass
+(`enforce_bundle_settlement_binding`) that judges each wallet-signed sink egress independently. The
+`bindings` vector holds only the coins that can commit value to settlement (standard-XCH + CAT sends);
+an option TRANSFER's singleton re-home may never target a structural sink hash and is not pushed, so
+it is inert. Crucially, no strike-leg exemption is needed: the ONE leg that legitimately carries no
+offer-binding — the consensus-forced option EXERCISE strike — is refused fail-closed at the signature
+source (non-re-home / `P2OneOfManyLayer` refusals), so it never reaches the pass. Adding an exemption
+would LOOSEN security for zero benefit. Regression pin: `options_e2e.rs::unbound_settlement_sink_
+beside_an_option_transfer_is_refused_2249` (real option transfer flips `option_mode`, an unbound sink
+beside it stays refused); proven to have teeth (re-introducing the `if !option_mode` skip makes it
+red).
+
 ## `verified = true` means OWNERSHIP-verified, and only the key-aware decode can source it (#2255)
 
 `HumanReadableSummary::verified` is NOT "the lines were re-derived from the coin spends" — it is the
