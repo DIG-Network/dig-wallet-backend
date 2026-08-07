@@ -44,6 +44,17 @@ An engine consumer (dig-node) **MUST** depend with `default-features = false, fe
 so the client `LocalSigner` (and its secret-key code) is never compiled into the engine host. A client
 consumer (dig-app) enables `features = ["client"]`. Each side thereby compiles only its half.
 
+**App-local spend building (topology note).** The key-free spend builder + coin selection
+(`engine::build`/`engine::selection` — they take spendable coins, a synthetic-PUBLIC-key lookup, and a
+change puzzle hash, all public material) are surfaced under the client seam as **`client::build`** for a
+consumer that builds spends LOCALLY. A consumer running under the DEFAULT feature set (engine + client,
+which is how dig-app depends — `features = ["client"]` keeps defaults on) may `use
+dig_wallet_backend::client::build::{SdkSpendBuilder, SpendBuilder, SpendInputs, select_for_spend, …}`
+without being an engine HOST. This does NOT weaken §1.4: the key-isolation invariant forbids client /
+secret code from entering the *engine host* (dig-node); dig-app is NOT an engine host, and `client::build`
+re-exports ONLY the key-free public surface (`pub use`, no logic and no secret-side/signer internals),
+so building a spend locally never brings a secret into the engine.
+
 ### 1.4 The key-isolation invariant (the crate's central security property)
 
 **The private key MUST live only behind the client seam's signer; it MUST NEVER enter the engine.** No
@@ -381,6 +392,13 @@ Used by dig-app. The subscriber + identity provider + signer.
   `coins`, `cats`, `history`, `sync_status`); spend-intent (`request_send_xch`, `request_send_cat`)
   that ask the engine to BUILD and return an `UnsignedSpend` for review + signing. The client MUST
   NOT build or sign locally.
+  - **Unimplemented seam (no consumer, no server).** `client::WalletClient`, its `IpcWalletClient`
+    transport impl, the client `review.rs` uses of it, and the `wallet.*` IPC method names
+    (`src/client/transport.rs:28-43`) have **NO consumer and NO server anywhere in the ecosystem**:
+    dig-app deliberately does NOT use this IPC-proxy path (it builds spends locally via `client::build`
+    instead — ratified in #1024), and dig-node does not depend on this crate's client seam. This seam is
+    RETAINED (not removed) but is currently dead on both ends — a reader MUST NOT build against it
+    expecting a live counterpart. (Removing the seam is a separate call, not decided here.)
 - **`client::subscribe`** — `filter_events(events, filter)` (the pure filter core), `Subscription`
   (a live filtered stream over the engine broadcast), and the `CatchUp::catch_up(since, filter)`
   backfill trait. §5.
@@ -666,6 +684,11 @@ only for catch-up" contract. #979 Subscription adopts this exact pattern.
   or seed. §1.4.
 - Authorization rides the existing paired-token channel; an unauthorized caller MUST be rejected
   before any wallet operation.
+- **Status: this IPC contract has NO live implementation.** No component in the ecosystem serves the
+  `wallet.*` methods and none consumes `IpcWalletClient` — dig-app builds spends locally (§1.3
+  `client::build`, ratified #1024) rather than proxying over this channel, and dig-node does not depend
+  on the client seam. The method-name contract + `IpcWalletClient` are retained as a specified-but-dormant
+  seam; a reader MUST NOT assume a running server on the other end.
 
 ---
 
