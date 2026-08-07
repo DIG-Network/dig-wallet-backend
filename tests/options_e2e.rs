@@ -449,3 +449,79 @@ async fn plain_transfer_still_signs() {
     sim.new_transaction(SpendBundle::new(unsigned.coin_spends, sig))
         .expect("a clean option transfer must settle on the simulator");
 }
+
+/// #2249 (headline): the offer settlement-binding pass is enforced PER-EGRESS regardless of option
+/// mode. A bundle that carries a legitimate option TRANSFER (which flips `option_mode` on merely by
+/// spending an option-layer coin) PLUS an UNRELATED standard coin dumping value into a settlement
+/// sink with NO offer-binding announcement must be REFUSED — the standard coin's un-bound egress is
+/// a give-it-away-for-nothing leg, and the mere presence of an option coin does NOT exempt it.
+///
+/// This pins the property that #2241 established (the whole-bundle `if !option_mode { skip }` was
+/// replaced by an unconditional bundle-level pass): an attacker cannot include any option-layer coin
+/// to disable MR-6 binding on a standard coin. The only leg that legitimately carries no
+/// offer-binding (the consensus-forced option exercise strike) never reaches this pass — exercise is
+/// refused fail-closed at the signature source — so no exemption is needed here.
+#[tokio::test]
+async fn unbound_settlement_sink_beside_an_option_transfer_is_refused_2249() {
+    use chia_puzzle_types::Memos;
+    use chia_wallet_sdk::puzzles::SETTLEMENT_PAYMENT_HASH;
+
+    let mut sim = Simulator::new();
+    let mut ctx = SpendContext::new();
+    let (underlying, strike) = (1_000u64, 250u64);
+    let alice = sim.bls(underlying + 1);
+    let bob = sim.bls(0);
+    let terms = OptionTerms::new(
+        alice.puzzle_hash,
+        underlying,
+        OptionType::Xch { amount: strike },
+        EXPIRY,
+    );
+    let mint = create(&mut ctx, &Owner::Standard(alice.pk), alice.coin, &terms).unwrap();
+    let created = mint.created.clone().unwrap();
+    let mint_sig = sign_transaction(&mint.coin_spends, std::slice::from_ref(&alice.sk)).unwrap();
+    sim.new_transaction(SpendBundle::new(mint.coin_spends.clone(), mint_sig))
+        .unwrap();
+    let (handle, on_chain) = projection_from_create(
+        &mint.coin_spends,
+        &created,
+        alice.puzzle_hash,
+        alice.puzzle_hash,
+        underlying,
+        strike,
+    );
+
+    // A real, clean option transfer — flips `option_mode` on for the whole bundle.
+    let unsigned = engine(vec![], alice.puzzle_hash, alice.pk)
+        .build_transfer_option(TransferOptionRequest {
+            identity: identity(),
+            handle,
+            on_chain,
+            to_puzzle_hash: Puzzlehash(hex::encode(bob.puzzle_hash)),
+            fee: Amount(0),
+        })
+        .await
+        .unwrap();
+    let mut spends = unsigned.coin_spends;
+
+    // Splice in an UNRELATED standard coin that dumps its whole value into the settlement puzzle with
+    // NO announcement — the give-it-away-for-nothing egress an attacker would smuggle beside the
+    // option coin to exploit any `option_mode` binding skip.
+    let sink_coin = sim.new_coin(alice.puzzle_hash, 50_000);
+    StandardLayer::new(alice.pk)
+        .spend(
+            &mut ctx,
+            sink_coin,
+            Conditions::new().create_coin(
+                Bytes32::new(SETTLEMENT_PAYMENT_HASH),
+                50_000,
+                Memos::None,
+            ),
+        )
+        .unwrap();
+    spends.extend(ctx.take());
+
+    let err = analyze(&spends)
+        .expect_err("an unbound settlement sink beside an option transfer must be refused");
+    assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+}
