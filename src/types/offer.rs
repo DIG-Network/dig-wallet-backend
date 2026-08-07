@@ -269,6 +269,7 @@ mod tests {
                 coin_spends: vec![],
                 required_signatures: vec![],
                 summary: crate::types::TransactionSummary {
+                    received: vec![],
                     outputs: vec![],
                     fee: Amount(0),
                 },

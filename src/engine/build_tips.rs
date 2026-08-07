@@ -234,6 +234,7 @@ impl SdkSpendBuilder {
                     amount,
                     asset_id: Some(asset_id),
                 }],
+                received: vec![],
                 fee: Amount(0),
             },
         })

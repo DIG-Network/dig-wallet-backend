@@ -96,8 +96,17 @@ impl Default for Balance {
 /// [`crate::types::UnsignedSpend`] and rendered by the client review surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionSummary {
-    /// The net outputs to non-change recipients.
+    /// The net outputs to non-change recipients — value LEAVING the wallet (a plain send's
+    /// recipients, or an offer make's offered assets committed to the settlement puzzle).
     pub outputs: Vec<SpendOutput>,
+    /// Value the spend causes the wallet to RECEIVE, surfaced so a two-sided action (an offer
+    /// MAKE) shows the trade both ways at the confirm. This is DISTINCT from [`outputs`] (never
+    /// conflated with value leaving): a make's `received` legs are the requested payments the maker
+    /// gets, each to the maker's own receive address. Empty for a plain one-way send.
+    ///
+    /// Additive (`#[serde(default)]`) so older wire payloads without the field still deserialize.
+    #[serde(default)]
+    pub received: Vec<SpendOutput>,
     /// The fee paid to the farmer.
     pub fee: Amount,
 }
@@ -134,6 +143,7 @@ mod tests {
     #[test]
     fn records_round_trip() {
         let summary = TransactionSummary {
+            received: vec![],
             outputs: vec![SpendOutput {
                 address: Address("xch1abc".into()),
                 amount: Amount(10),

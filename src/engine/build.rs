@@ -228,6 +228,7 @@ impl SpendBuilder for SdkSpendBuilder {
                     amount: crate::types::Amount(amount),
                     asset_id: None,
                 }],
+                received: vec![],
                 fee: crate::types::Amount(fee),
             },
         })
@@ -296,6 +297,7 @@ impl SpendBuilder for SdkSpendBuilder {
                     amount,
                     asset_id: Some(asset_id),
                 }],
+                received: vec![],
                 fee: crate::types::Amount(fee),
             },
         })

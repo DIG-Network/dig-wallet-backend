@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.22.0] - 2026-08-07
+
+### Features
+- **client:** Surface the offer-make requested payment as a distinct `received` leg so the maker sees
+  the trade both ways at the confirm (#2241)
+
+### Security
+- **client:** Enforce the offer-binding rule (MR-6) at the BUNDLE level: a settlement sink is accepted
+  iff it carries a requested-payment announcement (`AssertPuzzleAnnouncement` /
+  `AssertCoinAnnouncement`) itself OR is transitively co-spend-tied, through the concurrency ring, to a
+  coin that does — refused otherwise. This still refuses a concurrency-only (announcement-free) bundle
+  and any unbound sink, while correctly accepting a legitimate multi-offered-coin make (offer XCH + a
+  CAT, or two distinct CATs) whose announcement rides only one offered coin (#2241)
+- **client:** Mark the engine-declared `received` leg as unverified in the confirm renderer
+  ("Receive (unverified) …") so a maker never reads egress-grade assurance into the upside claim (#2241)
+
 ## [0.21.0] - 2026-08-06
 
 ### Features

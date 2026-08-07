@@ -99,7 +99,7 @@ impl OfferBuilder {
 
         let unsigned = self.finish_unsigned(
             unsigned_make.coin_spends.clone(),
-            offered_summary(&offered, fee),
+            make_summary(&offered, &requested, fee),
         )?;
         let build_id = self.pending.insert_make(
             ctx,
@@ -194,6 +194,7 @@ impl OfferBuilder {
             unsigned_cancel.coin_spends,
             TransactionSummary {
                 outputs: vec![],
+                received: vec![],
                 fee: crate::types::Amount(fee),
             },
         )
@@ -439,8 +440,24 @@ fn resolve_requested_side(requested: &RequestedAssets) -> WalletResult<Requested
     })
 }
 
-/// The review summary for a make: the assets that LEAVE the maker's wallet, plus the fee.
-fn offered_summary(offered: &OfferedAssets, fee: u64) -> TransactionSummary {
+/// The review summary for a make: the OFFERED assets that LEAVE the maker's wallet (committed to the
+/// settlement puzzle, an empty-address sink), plus the fee, plus — DISTINCTLY — the REQUESTED assets
+/// the maker RECEIVES in return, so the confirm shows the trade both ways (#2241).
+///
+/// The offered legs carry an empty address (their destination is the fixed settlement puzzle, not a
+/// chosen recipient — #1511 PR-B) and are gated by the signer against the coin spends. The received
+/// legs carry the maker's own receive address (the offer's `payee`) and are surfaced INFORMATIONALLY
+/// in [`TransactionSummary::received`]: they are not re-derivable from the coin spends (a make binds
+/// the requested payment as a non-invertible settlement-announcement hash) and so are NOT part of the
+/// signer's egress gate. Their FULFILLMENT is consensus-enforced by the offer mechanism itself — the
+/// maker's offered coins are unspendable unless a settlement coin announces exactly this requested
+/// payment — so the received legs are a faithful "you will receive" hint, and the maker still
+/// independently verifies + consents to the offered legs (what actually leaves) via the signer.
+fn make_summary(
+    offered: &OfferedAssets,
+    requested: &RequestedAssets,
+    fee: u64,
+) -> TransactionSummary {
     let mut outputs = Vec::new();
     if offered.xch.mojos() > 0 {
         outputs.push(SpendOutput {
@@ -456,8 +473,27 @@ fn offered_summary(offered: &OfferedAssets, fee: u64) -> TransactionSummary {
             asset_id: Some(asset_id.clone()),
         });
     }
+
+    // The requested payments the maker receives, each to the maker's own receive address (`payee`).
+    let mut received = Vec::new();
+    if requested.xch.mojos() > 0 {
+        received.push(SpendOutput {
+            address: requested.payee.clone(),
+            amount: requested.xch,
+            asset_id: None,
+        });
+    }
+    for (asset_id, amount) in &requested.cats {
+        received.push(SpendOutput {
+            address: requested.payee.clone(),
+            amount: *amount,
+            asset_id: Some(asset_id.clone()),
+        });
+    }
+
     TransactionSummary {
         outputs,
+        received,
         fee: crate::types::Amount(fee),
     }
 }
@@ -500,6 +536,9 @@ fn taker_summary(
     }
     Ok(TransactionSummary {
         outputs,
+        // A take's received leg (the maker's offered assets returning to the taker's change address)
+        // is out of scope for #2241, which surfaces only the MAKE's received leg.
+        received: vec![],
         fee: crate::types::Amount(fee),
     })
 }
@@ -972,6 +1011,83 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    /// #2241: a MAKE's reviewed summary surfaces the REQUESTED payment as a distinct `received` leg
+    /// (to the maker's receive address), so the maker sees the trade both ways at the confirm — while
+    /// the OFFERED assets remain empty-address egress legs in `outputs`. Anchored to a real make
+    /// bundle built through dig-offers, not a hand-rolled summary.
+    #[test]
+    fn a_make_summary_surfaces_the_requested_payment_as_a_received_leg() {
+        let mut sim = Simulator::new();
+        let maker = sim.bls(0);
+        let (maker_cat, asset) = issue_cat_to(&mut sim, &maker, 1_000);
+        let payee = xch_address(maker.puzzle_hash);
+
+        let pending = builder_for(&maker, vec![], vec![maker_cat])
+            .build_make(MakeOfferRequest {
+                identity: identity(),
+                offered: OfferedAssets {
+                    xch: Amount(0),
+                    cats: vec![(AssetId(hex::encode(asset)), Amount(1_000))],
+                },
+                requested: RequestedAssets {
+                    xch: Amount(50_000),
+                    cats: vec![],
+                    payee: payee.clone(),
+                },
+                fee: Amount(0),
+            })
+            .unwrap();
+
+        let summary = pending.unsigned.summary;
+        // The offered CAT leaves the wallet as an empty-address settlement egress.
+        assert_eq!(summary.outputs.len(), 1);
+        assert!(summary.outputs[0].address.0.is_empty());
+        assert_eq!(
+            summary.outputs[0].asset_id,
+            Some(AssetId(hex::encode(asset)))
+        );
+        // The requested 50_000 XCH is surfaced DISTINCTLY as a received leg to the maker's address.
+        assert_eq!(summary.received.len(), 1);
+        assert_eq!(summary.received[0].amount, Amount(50_000));
+        assert_eq!(summary.received[0].asset_id, None);
+        assert_eq!(summary.received[0].address, payee);
+    }
+
+    /// #2241 (bundle-level binding): a MULTI-asset make — offering BOTH XCH and a CAT — carries the
+    /// requested-payment announcement on exactly ONE offered coin and rings the other offered coins
+    /// together with `AssertConcurrentSpend` (dig-offers' `emit_relation`). The verifier's fail-closed
+    /// re-derivation must ACCEPT it: every settlement sink is transitively tied through the
+    /// concurrency ring to the announcement-bearing coin. The earlier per-coin check wrongly refused
+    /// the concurrency-only leg. Anchored to a real dig-offers make built through
+    /// `resolve_offered_side`, not a hand-rolled bundle.
+    #[test]
+    fn a_multi_asset_make_offering_xch_and_a_cat_is_accepted_by_verify_2241() {
+        let mut sim = Simulator::new();
+        let maker = sim.bls(50_000);
+        let (maker_cat, asset) = issue_cat_to(&mut sim, &maker, 1_000);
+
+        let pending = builder_for(&maker, vec![maker.coin], vec![maker_cat])
+            .build_make(MakeOfferRequest {
+                identity: identity(),
+                offered: OfferedAssets {
+                    xch: Amount(50_000),
+                    cats: vec![(AssetId(hex::encode(asset)), Amount(1_000))],
+                },
+                requested: RequestedAssets {
+                    xch: Amount(25_000),
+                    cats: vec![],
+                    payee: xch_address(maker.puzzle_hash),
+                },
+                fee: Amount(0),
+            })
+            .expect("a multi-asset make (offer XCH + CAT) builds");
+
+        // The multi-offered-coin make re-derives cleanly: one offered coin carries the announcement,
+        // the rest are concurrency-ringed — all bound at the bundle level.
+        crate::client::verify::analyze(&pending.unsigned.coin_spends)
+            .expect("bundle-level binding accepts a legitimate multi-asset make");
     }
 
     /// A make/summarize response carries the offer's stable ecosystem id (#1318 task 4).

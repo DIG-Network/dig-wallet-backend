@@ -466,6 +466,7 @@ mod tests {
                 tx_id: "t".into(),
                 confirmed_height: Some(11),
                 summary: TransactionSummary {
+                    received: vec![],
                     outputs: vec![SpendOutput {
                         address: Address("xch1".into()),
                         amount: Amount(5),
