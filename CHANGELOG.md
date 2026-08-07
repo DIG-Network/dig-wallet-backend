@@ -6,8 +6,8 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ## [0.23.1] - 2026-08-07
 
-### Tests
-- **client:** Pin that offer settlement-binding is enforced per-egress regardless of option mode (#2249)
+### Testing
+- **client:** Pin offer settlement-binding is per-egress regardless of option mode (#2249)
 
 ## [0.23.0] - 2026-08-07
 
