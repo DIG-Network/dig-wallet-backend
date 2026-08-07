@@ -404,7 +404,7 @@ impl LocalSigner {
         let mut reviewed_recipients: Vec<(Vec<u8>, u64, Option<String>)> = claimed
             .outputs
             .iter()
-            .filter(|output| !output.address.0.is_empty())
+            .filter(|output| !output.is_protocol_sink())
             .map(|output| {
                 let puzzle_hash = decode_puzzle_hash(&output.address)?;
                 Ok((
@@ -427,7 +427,7 @@ impl LocalSigner {
         // compared as a sorted multiset of (amount, asset) — the destination is the fixed settlement
         // puzzle, so it is NOT part of the comparison.
         // Zero-value settlement outputs are announcement carriers, not value leaving the wallet, so
-        // they are not part of the reviewed egress (mirrors `verify::summarize`).
+        // they are not part of the reviewed egress (mirrors `verify::summarize_egress`).
         let mut derived_sinks: Vec<(u64, Option<String>)> = split
             .protocol_sink
             .iter()
@@ -437,7 +437,7 @@ impl LocalSigner {
         let mut reviewed_sinks: Vec<(u64, Option<String>)> = claimed
             .outputs
             .iter()
-            .filter(|output| output.address.0.is_empty())
+            .filter(|output| output.is_protocol_sink())
             .map(|output| {
                 (
                     output.amount.mojos(),
@@ -2602,10 +2602,12 @@ mod tests {
 
     /// #2255: the key-free [`review::decode`] must NEVER present `verified = true`, even on the path
     /// where its re-derivation "succeeds". On this exact un-hinted non-owned egress — the spend that
-    /// the key-free `classify` buckets as change and DROPS — a `verified = true` view would be a FALSE
-    /// assurance: it renders no egress yet claims independent verification. `verified = true` must come
-    /// ONLY from the key-aware ownership split ([`LocalSigner::decode_verified`]); a key-free decode is
-    /// inherently ownership-unverified, so it is always `verified = false`.
+    /// the key-free `classify` FORMERLY bucketed as change and DROPPED (that path was removed in #2239;
+    /// the key-free view now surfaces every output undivided) — a `verified = true` view would be a
+    /// FALSE assurance: it claims independent ownership verification the key-free decode cannot make.
+    /// `verified = true` must come ONLY from the key-aware ownership split
+    /// ([`LocalSigner::decode_verified`]); a key-free decode is inherently ownership-unverified, so it
+    /// is always `verified = false`.
     #[cfg(feature = "engine")]
     #[test]
     fn keyfree_decode_never_claims_verified_on_an_unhinted_non_owned_egress() {
