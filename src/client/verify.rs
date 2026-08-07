@@ -140,32 +140,65 @@ pub fn is_protocol_sink_hash(puzzle_hash: Bytes32) -> bool {
         || puzzle_hash == Bytes32::new(SINGLETON_LAUNCHER_HASH)
 }
 
+/// The mutable accumulators [`analyze`] threads through every coin spend as it re-derives a
+/// bundle's value flow. Grouping them lets each per-spend-class helper take one `&mut SpendLedger`
+/// instead of a long list of `&mut` ledgers/buckets — the field set is exactly the locals the
+/// single-loop version mutated, and each helper mutates them in the same order it always did.
+struct SpendLedger {
+    /// The created coins to free addresses, UNDIVIDED (→ [`SpendEffect::outputs`]).
+    outputs: Vec<DecodedOutput>,
+    /// Outputs committed to a canonical structural puzzle (→ [`SpendEffect::protocol_sink`]).
+    protocol_sink: Vec<DecodedOutput>,
+    /// The explicit `RESERVE_FEE` total (the strict-path fee).
+    fee: u64,
+    /// XCH value entering the spend (standard / settlement / option-singleton coin amounts).
+    xch_in: u64,
+    /// XCH value leaving the spend via `CREATE_COIN`.
+    xch_out: u64,
+    /// Per-asset CAT value entering, keyed by tail hash.
+    cat_in: BTreeMap<Bytes32, u64>,
+    /// Per-asset CAT value leaving, keyed by tail hash.
+    cat_out: BTreeMap<Bytes32, u64>,
+    /// Offer-binding facts (#2241) gathered from every WALLET-SIGNED coin, checked at the bundle
+    /// level AFTER the loop. A make emits the requested-payment announcement on ONE offered coin and
+    /// rings the rest with concurrency, so the binding is a property of the whole bundle, never one
+    /// coin.
+    bindings: Vec<CoinBinding>,
+}
+
+impl SpendLedger {
+    fn new() -> Self {
+        Self {
+            outputs: Vec::new(),
+            protocol_sink: Vec::new(),
+            fee: 0,
+            xch_in: 0,
+            xch_out: 0,
+            cat_in: BTreeMap::new(),
+            cat_out: BTreeMap::new(),
+            bindings: Vec::new(),
+        }
+    }
+}
+
 /// Re-derive the value flow of `coin_spends` from the coin spends alone, fail-closed.
 ///
 /// Each coin spend is parsed with the chia-wallet-sdk drivers: a CAT spend via [`Cat::parse`] (its
 /// inner p2 conditions carry the CAT outputs), a standard spend via [`StandardLayer`] (its run
 /// conditions carry the XCH outputs + fee). Value is checked to conserve per asset. Anything the
 /// drivers cannot fully account for is rejected with [`WalletErrorCode::SpendValidationFailed`].
+///
+/// The shape is: ledger setup → per-coin dispatch ([`account_coin`], which classifies each spend and
+/// hands it to the matching `account_*` helper) → the bundle-level offer-binding + conservation
+/// epilogue. The per-spend-class accounting lives in the helpers below; this function owns only the
+/// cross-coin math.
 pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     if coin_spends.is_empty() {
         return Err(reject("no coin spends to verify"));
     }
 
     let mut allocator = Allocator::new();
-    let mut outputs = Vec::new();
-    let mut protocol_sink = Vec::new();
-    let mut fee: u64 = 0;
-
-    // Per-asset value ledgers (None-keyed XCH is tracked separately below).
-    let mut xch_in: u64 = 0;
-    let mut xch_out: u64 = 0;
-    let mut cat_in: BTreeMap<Bytes32, u64> = BTreeMap::new();
-    let mut cat_out: BTreeMap<Bytes32, u64> = BTreeMap::new();
-
-    // Offer-binding facts (#2241) gathered from every WALLET-SIGNED coin, checked at the bundle level
-    // AFTER the loop. A make emits the requested-payment announcement on ONE offered coin and rings
-    // the rest with concurrency, so the binding is a property of the whole bundle, never one coin.
-    let mut bindings: Vec<CoinBinding> = Vec::new();
+    let mut ledger = SpendLedger::new();
 
     // OPTION MODE is gated on the presence of an option-layer coin. For a signable option action that
     // means a TRANSFER's singleton ([`OptionContract`]); an EXERCISE bundle (its [`P2OneOfManyLayer`]
@@ -176,289 +209,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     let option_mode = is_option_bundle(&mut allocator, coin_spends)?;
 
     for spend in coin_spends {
-        let puzzle_ptr = node_from_bytes(&mut allocator, &spend.puzzle_reveal)
-            .map_err(|e| reject(format!("undecodable puzzle reveal: {e:?}")))?;
-        let solution_ptr = node_from_bytes(&mut allocator, &spend.solution)
-            .map_err(|e| reject(format!("undecodable solution: {e:?}")))?;
-
-        // (#1518) Bind the reveal to the coin BEFORE trusting anything it decodes to. A coin commits
-        // on-chain only to its puzzle HASH; the `puzzle_reveal` is caller-supplied bytes. If the
-        // reveal does not hash to `coin.puzzle_hash` it is a substituted puzzle the coin never
-        // authorized — a malicious engine could pair a benign-looking reveal (that `analyze` accounts
-        // for cleanly) with a coin whose real puzzle does something else entirely. Reject fail-closed
-        // so every value flow this module derives is the coin's OWN authorized program.
-        let revealed_hash = Bytes32::new(tree_hash(&allocator, puzzle_ptr).to_bytes());
-        if revealed_hash != spend.coin.puzzle_hash {
-            return Err(reject(format!(
-                "puzzle reveal hashes to {} but the coin commits to {} (substituted puzzle)",
-                hex::encode(revealed_hash),
-                hex::encode(spend.coin.puzzle_hash)
-            )));
-        }
-
-        let puzzle = Puzzle::parse(&allocator, puzzle_ptr);
-
-        // A CAT coin: the value flows through its INNER p2 conditions, denominated in the asset.
-        if let Some(parsed) = Cat::parse(&allocator, spend.coin, puzzle, solution_ptr)
-            .map_err(|e| reject(format!("malformed CAT spend: {e:?}")))?
-        {
-            // 0.34's `Cat::parse` returns a `ParsedCat` struct in place of the old
-            // `(Cat, inner_puzzle, inner_solution)` tuple; `p2_puzzle`/`p2_solution` are the
-            // exact same inner p2 puzzle/solution the tuple carried (non-revocable CAT path).
-            let cat = parsed.cat;
-            let inner_puzzle = parsed.p2_puzzle;
-            let inner_solution = parsed.p2_solution;
-            let asset = cat.info.asset_id;
-
-            // Every CAT coin's own amount is value entering the spend, whoever authorizes it.
-            let cat_in_total = cat_in.entry(asset).or_default();
-            *cat_in_total = accumulate(*cat_in_total, spend.coin.amount, "CAT input total")?;
-
-            // A CAT coin the wallet CLAIMS as part of taking/cancelling an offer wraps the canonical
-            // settlement puzzle: it is spent by announcement, carries NO signature, and its notarized
-            // payments are the outputs. Account those but skip the wallet-signed-coin guards (there is
-            // nothing to sign, and the settlement puzzle is a fixed structure, not a delegated one).
-            if SettlementLayer::parse_puzzle(&allocator, inner_puzzle)
-                .map_err(|e| reject(format!("malformed CAT settlement puzzle: {e:?}")))?
-                .is_some()
-            {
-                let conditions =
-                    run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)?;
-                reject_any_agg_sig(&conditions)?;
-                for create in conditions.iter().filter_map(Condition::as_create_coin) {
-                    let cat_out_total = cat_out.entry(asset).or_default();
-                    *cat_out_total = accumulate(*cat_out_total, create.amount, "CAT output total")?;
-                    route_output(
-                        &mut outputs,
-                        &mut protocol_sink,
-                        DecodedOutput {
-                            puzzle_hash: create.puzzle_hash,
-                            amount: create.amount,
-                            asset_id: Some(asset),
-                        },
-                    );
-                }
-                continue;
-            }
-
-            // Otherwise it is a wallet-signed CAT send: its inner p2 MUST be a standard layer whose
-            // delegated puzzle is quote-form — otherwise the signed message (tree-hash-only) would not
-            // commit to the actual outputs (see `committed_delegated_puzzle_message`).
-            if StandardLayer::parse_puzzle(&allocator, inner_puzzle)
-                .map_err(|e| reject(format!("malformed CAT inner puzzle: {e:?}")))?
-                .is_none()
-            {
-                return Err(reject(
-                    "CAT inner puzzle is neither a standard layer nor a settlement layer; refusing \
-                     to sign",
-                ));
-            }
-            let committed_message = committed_delegated_puzzle_message(&allocator, inner_solution)?;
-            let conditions = run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)?;
-            enforce_sole_agg_sig_me(&conditions, committed_message)?;
-            bindings.push(coin_binding(&spend.coin, &conditions));
-            for condition in &conditions {
-                reject_unexpected_agg_sig(condition)?;
-                if let Some(create) = condition.as_create_coin() {
-                    let cat_out_total = cat_out.entry(asset).or_default();
-                    *cat_out_total = accumulate(*cat_out_total, create.amount, "CAT output total")?;
-                    route_output(
-                        &mut outputs,
-                        &mut protocol_sink,
-                        DecodedOutput {
-                            puzzle_hash: create.puzzle_hash,
-                            amount: create.amount,
-                            asset_id: Some(asset),
-                        },
-                    );
-                }
-            }
-            continue;
-        }
-
-        // An OPTION SINGLETON spend (#1511 PR-C): the option contract is a singleton wrapping the current
-        // owner's inner standard layer (the sole signed coin). Decode via `OptionContract::parse` to reach
-        // that inner p2 and enforce the sole-AGG_SIG_ME commitment exactly as a standard/CAT send. ONLY a
-        // re-homing TRANSFER (an odd-amount `CREATE_COIN` to the new owner) is signable; a spend that does
-        // NOT re-home — a melt/exercise (mode-23 `SEND_MESSAGE` + `MeltSingleton`) or a clawback — is
-        // refused fail-closed below, at the signature source, so the wallet never signs the leg that
-        // unlocks the option underlying (Case-A guard, #1511 PR-C).
-        if let Some((_option, inner_puzzle, inner_solution)) =
-            OptionContract::parse(&allocator, spend.coin, puzzle, solution_ptr)
-                .map_err(|e| reject(format!("malformed option singleton spend: {e:?}")))?
-        {
-            if StandardLayer::parse_puzzle(&allocator, inner_puzzle)
-                .map_err(|e| reject(format!("malformed option inner puzzle: {e:?}")))?
-                .is_none()
-            {
-                return Err(reject(
-                    "option singleton inner puzzle is not a standard layer; refusing to sign",
-                ));
-            }
-            let committed_message = committed_delegated_puzzle_message(&allocator, inner_solution)?;
-            let conditions = run_conditions(&mut allocator, inner_puzzle.ptr(), inner_solution)?;
-            enforce_sole_agg_sig_me(&conditions, committed_message)?;
-
-            let re_homes = conditions
-                .iter()
-                .filter_map(Condition::as_create_coin)
-                .any(|create| create.amount % 2 == 1);
-            if !re_homes {
-                // NOT a re-home: this option-singleton spend melts/exercises the singleton (a
-                // `melt_singleton` — the magic `CREATE_COIN(_, -113)` decoded as `Condition::MeltSingleton`,
-                // never as an odd-amount value `CREATE_COIN`) and/or carries the mode-23 exercise
-                // `SEND_MESSAGE`, or is a clawback. NONE of these is a signable action in PR-C: only a
-                // re-homing TRANSFER is. Refuse fail-closed HERE, at the signature source, REGARDLESS of
-                // whether the P2OneOfMany underlying leg is present in the bundle — so the strip-the-leg
-                // attack (omit the underlying leg to dodge the `P2OneOfManyLayer` refusal below) cannot
-                // obtain the wallet's signature on the melt+message spend that unlocks the underlying.
-                // (A plain transfer decodes an odd-amount `CREATE_COIN(amount = 1)` and takes the
-                // re-home branch above, so it is unaffected.)
-                return Err(reject(
-                    "option singleton spend does not re-home (melt/exercise or clawback); only a \
-                     re-homing TRANSFER is signable; refusing to sign",
-                ));
-            }
-
-            // TRANSFER: the singleton's 1 mojo flows through to the re-homed coin — count both.
-            xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
-            let mut create_coins = 0usize;
-            for condition in &conditions {
-                reject_unexpected_agg_sig(condition)?;
-                // Default-DENY allowlist: a transfer's delegated puzzle may emit ONLY the re-home
-                // `CREATE_COIN`, its sole `AGG_SIG_ME`, and benign assertions. Any other condition — a
-                // mode-23 exercise `SEND_MESSAGE`/`RECEIVE_MESSAGE`, a `MeltSingleton`, an announcement
-                // CREATE, or an unknown opcode — is refused, so a transfer signature can never carry the
-                // exercise message even in a mixed spend.
-                reject_non_transfer_condition(condition)?;
-                if let Some(create) = condition.as_create_coin() {
-                    // Exactly one value-bearing `CREATE_COIN` (the re-home) is permitted; a second is an
-                    // undisclosed extra egress riding the transfer.
-                    create_coins += 1;
-                    if create_coins > 1 {
-                        return Err(reject(
-                            "option transfer emits more than one CREATE_COIN (undisclosed extra \
-                             egress); refusing to sign",
-                        ));
-                    }
-                    // MR-12: the re-homed singleton must go to the new owner's p2 (a chosen address
-                    // the human reviews via the summary), NEVER to a structural launcher/settlement
-                    // hash the option layer did not authorize — that would be an unauthorized re-home
-                    // laundered as a protocol sink. The sole-AGG_SIG_ME commitment already binds the
-                    // destination to the holder's signature; this refuses the structural-hash case.
-                    if is_protocol_sink_hash(create.puzzle_hash) {
-                        return Err(reject(
-                            "option transfer re-homes the singleton to a structural puzzle hash \
-                             (unauthorized re-home); refusing to sign",
-                        ));
-                    }
-                    xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
-                    route_output(
-                        &mut outputs,
-                        &mut protocol_sink,
-                        DecodedOutput {
-                            puzzle_hash: create.puzzle_hash,
-                            amount: create.amount,
-                            asset_id: None,
-                        },
-                    );
-                }
-            }
-            continue;
-        }
-
-        // An option EXERCISE's locked-underlying coin — a `P2OneOfMany` 1-of-2 (exercise/clawback)
-        // puzzle. Its presence UNAMBIGUOUSLY marks the bundle as an exercise (a transfer never spends
-        // it), and exercise is REFUSED fail-closed: the exercise path unlocks the underlying onto a bare
-        // `SETTLEMENT_PAYMENT_HASH` coin, and consensus forces only the STRIKE payment to the creator —
-        // NOT the unlocked underlying back to the holder. That reclaim leg is builder-enforced only, so a
-        // compromised engine could strip it AFTER the wallet signs the strike-funding coin: the wallet
-        // pays the strike while an attacker sweeps the underlying. Exercise cannot be safely
-        // `LocalSigner`-signable until a dig-options puzzle change binds the reclaim to the holder in
-        // consensus (deferred to #2245). Transfer, which only touches the inner standard layer, is
-        // unaffected and still signs.
-        if P2OneOfManyLayer::parse_puzzle(&allocator, puzzle)
-            .map_err(|e| reject(format!("malformed option underlying spend: {e:?}")))?
-            .is_some()
-        {
-            return Err(reject(
-                "option exercise is not signable: the unlocked underlying's reclaim to the holder is \
-                 not consensus-forced, so a compromised engine could strip it after the wallet funds \
-                 the strike (deferred to #2245); refusing to sign",
-            ));
-        }
-
-        // A standard-layer XCH coin: its run conditions carry the XCH outputs + the fee.
-        if StandardLayer::parse_puzzle(&allocator, puzzle)
-            .map_err(|e| reject(format!("malformed standard spend: {e:?}")))?
-            .is_some()
-        {
-            let committed_message = committed_delegated_puzzle_message(&allocator, solution_ptr)?;
-            xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
-            let conditions = run_conditions(&mut allocator, puzzle_ptr, solution_ptr)?;
-            enforce_sole_agg_sig_me(&conditions, committed_message)?;
-            // In an option TRANSFER a standard-layer XCH coin only ever appears as the OPTIONAL farmer-fee
-            // coin the engine links to the singleton via `assert_concurrent_spend` (transfer itself takes
-            // no fee). It legitimately commits no value to the settlement puzzle, so MR-6's
-            // give-it-away-for-nothing binding does not apply — skip it in option mode. Only the strict
-            // offer path requires MR-6. (Exercise never reaches here: its option-singleton melt/message
-            // leg is refused fail-closed above, at the signature source.) The binding is now enforced
-            // at the bundle level after the loop; an option-mode farmer-fee coin commits no value to
-            // settlement (no sink), so it is inert in that pass.
-            bindings.push(coin_binding(&spend.coin, &conditions));
-            for condition in &conditions {
-                reject_unexpected_agg_sig(condition)?;
-                if let Some(reserve) = condition.as_reserve_fee() {
-                    fee = accumulate(fee, reserve.amount, "reserved fee total")?;
-                    continue;
-                }
-                if let Some(create) = condition.as_create_coin() {
-                    xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
-                    route_output(
-                        &mut outputs,
-                        &mut protocol_sink,
-                        DecodedOutput {
-                            puzzle_hash: create.puzzle_hash,
-                            amount: create.amount,
-                            asset_id: None,
-                        },
-                    );
-                }
-            }
-            continue;
-        }
-
-        // A settlement-payments (XCH) coin the wallet CLAIMS while taking/cancelling an offer: the
-        // canonical, immutable settlement puzzle, spent by announcement with NO signature. Account its
-        // notarized-payment outputs into the XCH ledger; there is nothing to sign here.
-        if SettlementLayer::parse_puzzle(&allocator, puzzle)
-            .map_err(|e| reject(format!("malformed settlement spend: {e:?}")))?
-            .is_some()
-        {
-            xch_in = accumulate(xch_in, spend.coin.amount, "XCH input total")?;
-            let conditions = run_conditions(&mut allocator, puzzle_ptr, solution_ptr)?;
-            reject_any_agg_sig(&conditions)?;
-            for condition in &conditions {
-                if let Some(create) = condition.as_create_coin() {
-                    xch_out = accumulate(xch_out, create.amount, "XCH output total")?;
-                    route_output(
-                        &mut outputs,
-                        &mut protocol_sink,
-                        DecodedOutput {
-                            puzzle_hash: create.puzzle_hash,
-                            amount: create.amount,
-                            asset_id: None,
-                        },
-                    );
-                }
-            }
-            continue;
-        }
-
-        return Err(reject(
-            "coin spend is not a standard-layer XCH, a CAT, an option, nor a settlement spend; \
-             refusing to sign",
-        ));
+        account_coin(&mut ledger, &mut allocator, spend)?;
     }
 
     // Bundle-level offer-binding (#2241): every settlement-sink egress must be tied — directly or
@@ -469,12 +220,13 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     // which let an attacker include any option coin to route a standard coin's value into a settlement
     // sink with no binding enforced. The gate is per-EGRESS instead: `bindings` holds only the
     // WALLET-SIGNED coins that can commit value to settlement (standard-XCH + CAT sends) — an option
-    // TRANSFER's singleton re-home never targets a structural sink hash (refused above at #345) and is
-    // not pushed here, so it is inert in this pass. The one leg that legitimately carries no
-    // offer-binding — the consensus-forced option EXERCISE strike — never reaches this pass at all:
-    // exercise is refused fail-closed at the signature source (the non-re-home / `P2OneOfManyLayer`
-    // refusals above), so no strike-leg exemption is needed here and none is granted.
-    enforce_bundle_settlement_binding(&bindings)?;
+    // TRANSFER's singleton re-home never targets a structural sink hash (refused in
+    // `account_option_transfer`) and is not pushed here, so it is inert in this pass. The one leg that
+    // legitimately carries no offer-binding — the consensus-forced option EXERCISE strike — never
+    // reaches this pass at all: exercise is refused fail-closed at the signature source (the
+    // non-re-home / `P2OneOfManyLayer` refusals in the dispatch), so no strike-leg exemption is needed
+    // here and none is granted.
+    enforce_bundle_settlement_binding(&ledger.bindings)?;
 
     // XCH value conservation. Two modes:
     // - STRICT (XCH/CAT/offer, byte-unchanged): `in == out + reserve_fee`, a leak/mint is refused.
@@ -482,26 +234,28 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     //   IS the implicit fee. `out > in` (a mint) is still refused (checked_sub). The implicit fee is
     //   compared to the reviewed `summary.fee` by the signer (an MR-11-style implicit-fee guard).
     let effective_fee = if option_mode {
-        xch_in.checked_sub(xch_out).ok_or_else(|| {
+        ledger.xch_in.checked_sub(ledger.xch_out).ok_or_else(|| {
             reject(format!(
-                "option spend mints value: outputs {xch_out} exceed inputs {xch_in}"
+                "option spend mints value: outputs {} exceed inputs {}",
+                ledger.xch_out, ledger.xch_in
             ))
         })?
     } else {
-        let xch_out_plus_fee = accumulate(xch_out, fee, "XCH output + fee total")?;
-        if xch_in != xch_out_plus_fee {
+        let xch_out_plus_fee = accumulate(ledger.xch_out, ledger.fee, "XCH output + fee total")?;
+        if ledger.xch_in != xch_out_plus_fee {
             return Err(reject(format!(
-                "XCH value not conserved: in {xch_in} != out+fee {xch_out_plus_fee}"
+                "XCH value not conserved: in {} != out+fee {xch_out_plus_fee}",
+                ledger.xch_in
             )));
         }
-        fee
+        ledger.fee
     };
     // Conservation is checked in BOTH directions over the union of assets seen as inputs or outputs:
     // an output whose asset was never an input is a mint from thin air; an input asset with no (or a
     // smaller) matching output is a melt/leak. Iterating only one side would miss the other.
-    for asset in cat_in.keys().chain(cat_out.keys()) {
-        let input = cat_in.get(asset).copied().unwrap_or(0);
-        let output = cat_out.get(asset).copied().unwrap_or(0);
+    for asset in ledger.cat_in.keys().chain(ledger.cat_out.keys()) {
+        let input = ledger.cat_in.get(asset).copied().unwrap_or(0);
+        let output = ledger.cat_out.get(asset).copied().unwrap_or(0);
         if input != output {
             return Err(reject(format!(
                 "CAT {} value not conserved: in {input} != out {output}",
@@ -511,10 +265,399 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     }
 
     Ok(SpendEffect {
-        outputs,
-        protocol_sink,
+        outputs: ledger.outputs,
+        protocol_sink: ledger.protocol_sink,
         fee: effective_fee,
     })
+}
+
+/// Classify ONE coin spend and account it into `ledger`, fail-closed.
+///
+/// Binds the puzzle reveal to the coin, then dispatches to the matching per-spend-class helper in the
+/// SAME order the single-loop version tried them: CAT → option singleton → the `P2OneOfMany` exercise
+/// refusal → standard-layer XCH → settlement-layer XCH claim → an unrecognized-puzzle refusal. Every
+/// branch either accounts the spend (returning `Ok(())`, so the caller moves to the next coin) or
+/// refuses it fail-closed (`Err`), exactly as before.
+fn account_coin(
+    ledger: &mut SpendLedger,
+    allocator: &mut Allocator,
+    spend: &CoinSpend,
+) -> WalletResult<()> {
+    let puzzle_ptr = node_from_bytes(allocator, &spend.puzzle_reveal)
+        .map_err(|e| reject(format!("undecodable puzzle reveal: {e:?}")))?;
+    let solution_ptr = node_from_bytes(allocator, &spend.solution)
+        .map_err(|e| reject(format!("undecodable solution: {e:?}")))?;
+
+    // (#1518) Bind the reveal to the coin BEFORE trusting anything it decodes to. A coin commits
+    // on-chain only to its puzzle HASH; the `puzzle_reveal` is caller-supplied bytes. If the
+    // reveal does not hash to `coin.puzzle_hash` it is a substituted puzzle the coin never
+    // authorized — a malicious engine could pair a benign-looking reveal (that `analyze` accounts
+    // for cleanly) with a coin whose real puzzle does something else entirely. Reject fail-closed
+    // so every value flow this module derives is the coin's OWN authorized program.
+    let revealed_hash = Bytes32::new(tree_hash(allocator, puzzle_ptr).to_bytes());
+    if revealed_hash != spend.coin.puzzle_hash {
+        return Err(reject(format!(
+            "puzzle reveal hashes to {} but the coin commits to {} (substituted puzzle)",
+            hex::encode(revealed_hash),
+            hex::encode(spend.coin.puzzle_hash)
+        )));
+    }
+
+    let puzzle = Puzzle::parse(allocator, puzzle_ptr);
+
+    // A CAT coin: the value flows through its INNER p2 conditions, denominated in the asset.
+    if let Some(parsed) = Cat::parse(allocator, spend.coin, puzzle, solution_ptr)
+        .map_err(|e| reject(format!("malformed CAT spend: {e:?}")))?
+    {
+        // 0.34's `Cat::parse` returns a `ParsedCat` struct in place of the old
+        // `(Cat, inner_puzzle, inner_solution)` tuple; `p2_puzzle`/`p2_solution` are the
+        // exact same inner p2 puzzle/solution the tuple carried (non-revocable CAT path).
+        return account_cat_spend(
+            ledger,
+            allocator,
+            spend,
+            parsed.cat,
+            parsed.p2_puzzle,
+            parsed.p2_solution,
+        );
+    }
+
+    // An OPTION SINGLETON spend (#1511 PR-C): the option contract is a singleton wrapping the current
+    // owner's inner standard layer (the sole signed coin). Decode via `OptionContract::parse` to reach
+    // that inner p2 and enforce the sole-AGG_SIG_ME commitment exactly as a standard/CAT send. ONLY a
+    // re-homing TRANSFER (an odd-amount `CREATE_COIN` to the new owner) is signable; a spend that does
+    // NOT re-home — a melt/exercise (mode-23 `SEND_MESSAGE` + `MeltSingleton`) or a clawback — is
+    // refused fail-closed in the helper, at the signature source, so the wallet never signs the leg
+    // that unlocks the option underlying (Case-A guard, #1511 PR-C).
+    if let Some((_option, inner_puzzle, inner_solution)) =
+        OptionContract::parse(allocator, spend.coin, puzzle, solution_ptr)
+            .map_err(|e| reject(format!("malformed option singleton spend: {e:?}")))?
+    {
+        return account_option_transfer(ledger, allocator, spend, inner_puzzle, inner_solution);
+    }
+
+    // An option EXERCISE's locked-underlying coin — a `P2OneOfMany` 1-of-2 (exercise/clawback)
+    // puzzle. Its presence UNAMBIGUOUSLY marks the bundle as an exercise (a transfer never spends
+    // it), and exercise is REFUSED fail-closed: the exercise path unlocks the underlying onto a bare
+    // `SETTLEMENT_PAYMENT_HASH` coin, and consensus forces only the STRIKE payment to the creator —
+    // NOT the unlocked underlying back to the holder. That reclaim leg is builder-enforced only, so a
+    // compromised engine could strip it AFTER the wallet signs the strike-funding coin: the wallet
+    // pays the strike while an attacker sweeps the underlying. Exercise cannot be safely
+    // `LocalSigner`-signable until a dig-options puzzle change binds the reclaim to the holder in
+    // consensus (deferred to #2245). Transfer, which only touches the inner standard layer, is
+    // unaffected and still signs.
+    if P2OneOfManyLayer::parse_puzzle(allocator, puzzle)
+        .map_err(|e| reject(format!("malformed option underlying spend: {e:?}")))?
+        .is_some()
+    {
+        return Err(reject(
+            "option exercise is not signable: the unlocked underlying's reclaim to the holder is \
+             not consensus-forced, so a compromised engine could strip it after the wallet funds \
+             the strike (deferred to #2245); refusing to sign",
+        ));
+    }
+
+    // A standard-layer XCH coin: its run conditions carry the XCH outputs + the fee.
+    if StandardLayer::parse_puzzle(allocator, puzzle)
+        .map_err(|e| reject(format!("malformed standard spend: {e:?}")))?
+        .is_some()
+    {
+        return account_standard_send(ledger, allocator, spend, puzzle_ptr, solution_ptr);
+    }
+
+    // A settlement-payments (XCH) coin the wallet CLAIMS while taking/cancelling an offer: the
+    // canonical, immutable settlement puzzle, spent by announcement with NO signature. Account its
+    // notarized-payment outputs into the XCH ledger; there is nothing to sign here.
+    if SettlementLayer::parse_puzzle(allocator, puzzle)
+        .map_err(|e| reject(format!("malformed settlement spend: {e:?}")))?
+        .is_some()
+    {
+        return account_settlement_claim(ledger, allocator, spend, puzzle_ptr, solution_ptr);
+    }
+
+    Err(reject(
+        "coin spend is not a standard-layer XCH, a CAT, an option, nor a settlement spend; \
+         refusing to sign",
+    ))
+}
+
+/// Account a CAT coin spend: record its amount as CAT input, then split into the settlement-claim vs
+/// wallet-signed-send path exactly as the single loop did.
+fn account_cat_spend(
+    ledger: &mut SpendLedger,
+    allocator: &mut Allocator,
+    spend: &CoinSpend,
+    cat: Cat,
+    inner_puzzle: Puzzle,
+    inner_solution: clvmr::NodePtr,
+) -> WalletResult<()> {
+    let asset = cat.info.asset_id;
+
+    // Every CAT coin's own amount is value entering the spend, whoever authorizes it.
+    let cat_in_total = ledger.cat_in.entry(asset).or_default();
+    *cat_in_total = accumulate(*cat_in_total, spend.coin.amount, "CAT input total")?;
+
+    // A CAT coin the wallet CLAIMS as part of taking/cancelling an offer wraps the canonical
+    // settlement puzzle: it is spent by announcement, carries NO signature, and its notarized
+    // payments are the outputs. Account those but skip the wallet-signed-coin guards (there is
+    // nothing to sign, and the settlement puzzle is a fixed structure, not a delegated one).
+    if SettlementLayer::parse_puzzle(allocator, inner_puzzle)
+        .map_err(|e| reject(format!("malformed CAT settlement puzzle: {e:?}")))?
+        .is_some()
+    {
+        return account_cat_settlement_claim(
+            ledger,
+            allocator,
+            asset,
+            inner_puzzle,
+            inner_solution,
+        );
+    }
+
+    // Otherwise it is a wallet-signed CAT send: its inner p2 MUST be a standard layer whose
+    // delegated puzzle is quote-form — otherwise the signed message (tree-hash-only) would not
+    // commit to the actual outputs (see `committed_delegated_puzzle_message`).
+    if StandardLayer::parse_puzzle(allocator, inner_puzzle)
+        .map_err(|e| reject(format!("malformed CAT inner puzzle: {e:?}")))?
+        .is_none()
+    {
+        return Err(reject(
+            "CAT inner puzzle is neither a standard layer nor a settlement layer; refusing \
+             to sign",
+        ));
+    }
+    account_cat_send(
+        ledger,
+        allocator,
+        spend,
+        asset,
+        inner_puzzle,
+        inner_solution,
+    )
+}
+
+/// Account a CAT coin the wallet CLAIMS through the settlement layer (offer take/cancel): its
+/// notarized-payment `CREATE_COIN`s become CAT outputs; there is no signature to guard.
+fn account_cat_settlement_claim(
+    ledger: &mut SpendLedger,
+    allocator: &mut Allocator,
+    asset: Bytes32,
+    inner_puzzle: Puzzle,
+    inner_solution: clvmr::NodePtr,
+) -> WalletResult<()> {
+    let conditions = run_conditions(allocator, inner_puzzle.ptr(), inner_solution)?;
+    reject_any_agg_sig(&conditions)?;
+    for create in conditions.iter().filter_map(Condition::as_create_coin) {
+        let cat_out_total = ledger.cat_out.entry(asset).or_default();
+        *cat_out_total = accumulate(*cat_out_total, create.amount, "CAT output total")?;
+        route_output(
+            &mut ledger.outputs,
+            &mut ledger.protocol_sink,
+            DecodedOutput {
+                puzzle_hash: create.puzzle_hash,
+                amount: create.amount,
+                asset_id: Some(asset),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Account a wallet-signed CAT send: enforce the sole-AGG_SIG_ME commitment over the standard-layer
+/// inner puzzle, record its offer binding, and route each `CREATE_COIN` as a CAT output.
+fn account_cat_send(
+    ledger: &mut SpendLedger,
+    allocator: &mut Allocator,
+    spend: &CoinSpend,
+    asset: Bytes32,
+    inner_puzzle: Puzzle,
+    inner_solution: clvmr::NodePtr,
+) -> WalletResult<()> {
+    let committed_message = committed_delegated_puzzle_message(allocator, inner_solution)?;
+    let conditions = run_conditions(allocator, inner_puzzle.ptr(), inner_solution)?;
+    enforce_sole_agg_sig_me(&conditions, committed_message)?;
+    ledger.bindings.push(coin_binding(&spend.coin, &conditions));
+    for condition in &conditions {
+        reject_unexpected_agg_sig(condition)?;
+        if let Some(create) = condition.as_create_coin() {
+            let cat_out_total = ledger.cat_out.entry(asset).or_default();
+            *cat_out_total = accumulate(*cat_out_total, create.amount, "CAT output total")?;
+            route_output(
+                &mut ledger.outputs,
+                &mut ledger.protocol_sink,
+                DecodedOutput {
+                    puzzle_hash: create.puzzle_hash,
+                    amount: create.amount,
+                    asset_id: Some(asset),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Account an OPTION SINGLETON spend (#1511 PR-C). Only a re-homing TRANSFER is signable: a spend that
+/// does NOT re-home (melt/exercise or clawback) is refused fail-closed at the signature source; a
+/// transfer is held to a default-deny condition allowlist and routes its single re-home `CREATE_COIN`.
+fn account_option_transfer(
+    ledger: &mut SpendLedger,
+    allocator: &mut Allocator,
+    spend: &CoinSpend,
+    inner_puzzle: Puzzle,
+    inner_solution: clvmr::NodePtr,
+) -> WalletResult<()> {
+    if StandardLayer::parse_puzzle(allocator, inner_puzzle)
+        .map_err(|e| reject(format!("malformed option inner puzzle: {e:?}")))?
+        .is_none()
+    {
+        return Err(reject(
+            "option singleton inner puzzle is not a standard layer; refusing to sign",
+        ));
+    }
+    let committed_message = committed_delegated_puzzle_message(allocator, inner_solution)?;
+    let conditions = run_conditions(allocator, inner_puzzle.ptr(), inner_solution)?;
+    enforce_sole_agg_sig_me(&conditions, committed_message)?;
+
+    let re_homes = conditions
+        .iter()
+        .filter_map(Condition::as_create_coin)
+        .any(|create| create.amount % 2 == 1);
+    if !re_homes {
+        // NOT a re-home: this option-singleton spend melts/exercises the singleton (a
+        // `melt_singleton` — the magic `CREATE_COIN(_, -113)` decoded as `Condition::MeltSingleton`,
+        // never as an odd-amount value `CREATE_COIN`) and/or carries the mode-23 exercise
+        // `SEND_MESSAGE`, or is a clawback. NONE of these is a signable action in PR-C: only a
+        // re-homing TRANSFER is. Refuse fail-closed HERE, at the signature source, REGARDLESS of
+        // whether the P2OneOfMany underlying leg is present in the bundle — so the strip-the-leg
+        // attack (omit the underlying leg to dodge the `P2OneOfManyLayer` refusal in the dispatch)
+        // cannot obtain the wallet's signature on the melt+message spend that unlocks the underlying.
+        // (A plain transfer decodes an odd-amount `CREATE_COIN(amount = 1)` and takes the
+        // re-home branch, so it is unaffected.)
+        return Err(reject(
+            "option singleton spend does not re-home (melt/exercise or clawback); only a \
+             re-homing TRANSFER is signable; refusing to sign",
+        ));
+    }
+
+    // TRANSFER: the singleton's 1 mojo flows through to the re-homed coin — count both.
+    ledger.xch_in = accumulate(ledger.xch_in, spend.coin.amount, "XCH input total")?;
+    let mut create_coins = 0usize;
+    for condition in &conditions {
+        reject_unexpected_agg_sig(condition)?;
+        // Default-DENY allowlist: a transfer's delegated puzzle may emit ONLY the re-home
+        // `CREATE_COIN`, its sole `AGG_SIG_ME`, and benign assertions. Any other condition — a
+        // mode-23 exercise `SEND_MESSAGE`/`RECEIVE_MESSAGE`, a `MeltSingleton`, an announcement
+        // CREATE, or an unknown opcode — is refused, so a transfer signature can never carry the
+        // exercise message even in a mixed spend.
+        reject_non_transfer_condition(condition)?;
+        if let Some(create) = condition.as_create_coin() {
+            // Exactly one value-bearing `CREATE_COIN` (the re-home) is permitted; a second is an
+            // undisclosed extra egress riding the transfer.
+            create_coins += 1;
+            if create_coins > 1 {
+                return Err(reject(
+                    "option transfer emits more than one CREATE_COIN (undisclosed extra \
+                     egress); refusing to sign",
+                ));
+            }
+            // MR-12: the re-homed singleton must go to the new owner's p2 (a chosen address
+            // the human reviews via the summary), NEVER to a structural launcher/settlement
+            // hash the option layer did not authorize — that would be an unauthorized re-home
+            // laundered as a protocol sink. The sole-AGG_SIG_ME commitment already binds the
+            // destination to the holder's signature; this refuses the structural-hash case.
+            if is_protocol_sink_hash(create.puzzle_hash) {
+                return Err(reject(
+                    "option transfer re-homes the singleton to a structural puzzle hash \
+                     (unauthorized re-home); refusing to sign",
+                ));
+            }
+            ledger.xch_out = accumulate(ledger.xch_out, create.amount, "XCH output total")?;
+            route_output(
+                &mut ledger.outputs,
+                &mut ledger.protocol_sink,
+                DecodedOutput {
+                    puzzle_hash: create.puzzle_hash,
+                    amount: create.amount,
+                    asset_id: None,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Account a standard-layer XCH send: enforce the sole-AGG_SIG_ME commitment, record its offer
+/// binding, sum its `RESERVE_FEE`, and route each `CREATE_COIN` as an XCH output.
+fn account_standard_send(
+    ledger: &mut SpendLedger,
+    allocator: &mut Allocator,
+    spend: &CoinSpend,
+    puzzle_ptr: clvmr::NodePtr,
+    solution_ptr: clvmr::NodePtr,
+) -> WalletResult<()> {
+    let committed_message = committed_delegated_puzzle_message(allocator, solution_ptr)?;
+    ledger.xch_in = accumulate(ledger.xch_in, spend.coin.amount, "XCH input total")?;
+    let conditions = run_conditions(allocator, puzzle_ptr, solution_ptr)?;
+    enforce_sole_agg_sig_me(&conditions, committed_message)?;
+    // In an option TRANSFER a standard-layer XCH coin only ever appears as the OPTIONAL farmer-fee
+    // coin the engine links to the singleton via `assert_concurrent_spend` (transfer itself takes
+    // no fee). It legitimately commits no value to the settlement puzzle, so MR-6's
+    // give-it-away-for-nothing binding does not apply — skip it in option mode. Only the strict
+    // offer path requires MR-6. (Exercise never reaches here: its option-singleton melt/message
+    // leg is refused fail-closed in the dispatch, at the signature source.) The binding is enforced
+    // at the bundle level after the loop; an option-mode farmer-fee coin commits no value to
+    // settlement (no sink), so it is inert in that pass.
+    ledger.bindings.push(coin_binding(&spend.coin, &conditions));
+    for condition in &conditions {
+        reject_unexpected_agg_sig(condition)?;
+        if let Some(reserve) = condition.as_reserve_fee() {
+            ledger.fee = accumulate(ledger.fee, reserve.amount, "reserved fee total")?;
+            continue;
+        }
+        if let Some(create) = condition.as_create_coin() {
+            ledger.xch_out = accumulate(ledger.xch_out, create.amount, "XCH output total")?;
+            route_output(
+                &mut ledger.outputs,
+                &mut ledger.protocol_sink,
+                DecodedOutput {
+                    puzzle_hash: create.puzzle_hash,
+                    amount: create.amount,
+                    asset_id: None,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Account a settlement-payments (XCH) coin the wallet CLAIMS while taking/cancelling an offer: its
+/// notarized-payment `CREATE_COIN`s become XCH outputs; spent by announcement, so there is no
+/// signature to guard.
+fn account_settlement_claim(
+    ledger: &mut SpendLedger,
+    allocator: &mut Allocator,
+    spend: &CoinSpend,
+    puzzle_ptr: clvmr::NodePtr,
+    solution_ptr: clvmr::NodePtr,
+) -> WalletResult<()> {
+    ledger.xch_in = accumulate(ledger.xch_in, spend.coin.amount, "XCH input total")?;
+    let conditions = run_conditions(allocator, puzzle_ptr, solution_ptr)?;
+    reject_any_agg_sig(&conditions)?;
+    for condition in &conditions {
+        if let Some(create) = condition.as_create_coin() {
+            ledger.xch_out = accumulate(ledger.xch_out, create.amount, "XCH output total")?;
+            route_output(
+                &mut ledger.outputs,
+                &mut ledger.protocol_sink,
+                DecodedOutput {
+                    puzzle_hash: create.puzzle_hash,
+                    amount: create.amount,
+                    asset_id: None,
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 /// True when `coin_spends` contain an option-layer coin — an option singleton ([`OptionContract`]) or a
