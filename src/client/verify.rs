@@ -75,7 +75,12 @@ use crate::types::{
 };
 
 /// One coin the spend creates, re-derived from a coin spend's own puzzle + solution.
+///
+/// `#[non_exhaustive]` (#2242): a future decode may need to carry more than
+/// puzzle-hash/amount/asset-id, so downstream matches/literals must not assume this field set is
+/// final.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedOutput {
     /// The puzzle hash the created coin pays.
     pub puzzle_hash: Bytes32,
