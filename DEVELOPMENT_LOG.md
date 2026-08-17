@@ -162,3 +162,5 @@ re-derive the locked-underlying puzzle hash from a mint's coin spends. Combined 
 modelling the underlying as a plain output to `owner_ph` (a structural egress on-chain), the mint has a
 cross-seam summary-reconciliation gap the client verify cannot close alone. Mint therefore stays refused
 at the signer; the reconciliation decision is tracked in #2243.
+
+<!-- lane: NFT custody-gate arm (dig_ecosystem #3077) -->
