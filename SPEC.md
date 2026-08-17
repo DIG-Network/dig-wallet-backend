@@ -449,10 +449,13 @@ Used by dig-app. The subscriber + identity provider + signer.
      signed delegated puzzle (identified by preimage, so no layer knowledge is required). It MUST be
      the canonical QUOTE form `(q . conditions)`; a non-quote delegated puzzle MUST be refused.
   3. Those COMMITTED conditions MUST contain EXACTLY ONE `MELT_SINGLETON` and nothing outside a
-     default-DENY allowlist (the melt marker, the `AGG_SIG_ME`, timelock assertions, announcement and
-     concurrency ASSERTIONS, and self-introspection assertions). EVERY `CREATE_COIN`, every reserved
-     fee, and every opcode this crate does not model is refused. The same allowlist is applied to the
-     outer conditions as defence in depth, never as the admission test.
+     default-DENY allowlist (the melt marker, timelock assertions, announcement and concurrency
+     ASSERTIONS, and self-introspection assertions). EVERY `CREATE_COIN`, every reserved fee, and
+     every opcode this crate does not model is refused. `AGG_SIG_ME` MUST be refused in the COMMITTED
+     list specifically: the standard layer emits it OUTSIDE the delegated puzzle, so a committed one
+     is never honest and would authorize a second delegated puzzle on the same coin. The same
+     allowlist is applied to the outer conditions as defence in depth — never as the admission test,
+     and there `AGG_SIG_ME` IS permitted, because it is the standard layer's own.
 
   A singleton UPDATE or TRANSFER therefore stays refused — those re-home the singleton under a new
   owner puzzle hash, a change of ownership no deletion confirmation covers. The solution search is
