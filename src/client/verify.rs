@@ -3730,6 +3730,14 @@ pub(crate) mod singleton_melt_tests {
     /// `pub(crate)` so the signer's review-gate tests transfer a REAL NFT through the real sdk
     /// builder rather than a second, drifting copy of this fixture.
     pub(crate) fn nft_transfer() -> Vec<CoinSpend> {
+        nft_transfer_to(nft_recipient_ph())
+    }
+
+    /// An NFT TRANSFER whose destination is `destination`, built by the canonical sdk driver.
+    ///
+    /// Parameterized rather than duplicated so the honest and hijacked fixtures differ in EXACTLY
+    /// one value — the destination — which is the property every test below is about.
+    fn nft_transfer_to(destination: Bytes32) -> Vec<CoinSpend> {
         use chia_wallet_sdk::driver::StandardLayer;
 
         let (mut ctx, nft, _mint_spends) = nft_mint_parts();
@@ -3737,10 +3745,86 @@ pub(crate) mod singleton_melt_tests {
             .transfer(
                 &mut ctx,
                 &StandardLayer::new(owner_pk()),
-                nft_recipient_ph(),
+                destination,
                 Conditions::new(),
             )
             .expect("the canonical sdk NFT transfer builder");
+        ctx.take()
+    }
+
+    /// A real NFT MINT whose funding coin does NOT assert the launcher's coin announcement.
+    ///
+    /// Built from the canonical sdk mint and then stripped of exactly that one condition, so the
+    /// fixture differs from an honest mint in the single fact under test. Everything else — the
+    /// funding coin, the launcher, the eve spend, conservation — is byte-identical to the mint the
+    /// gate admits.
+    fn nft_mint_without_the_launcher_announcement() -> Vec<CoinSpend> {
+        use chia_puzzle_types::nft::NftMetadata;
+        use chia_wallet_sdk::driver::{Launcher, NftMint, StandardLayer};
+
+        let mut ctx = SpendContext::new();
+        let funding = nft_funding_coin();
+        let metadata = ctx
+            .alloc_hashed(&NftMetadata::default())
+            .expect("the default NFT metadata allocates");
+        let launcher = Launcher::new(funding.coin_id(), 1);
+        let mint = NftMint::new(metadata, owner_ph(), 300, None);
+        let (mint_conditions, _nft) = launcher
+            .mint_nft(&mut ctx, &mint)
+            .expect("the canonical sdk NFT mint builder");
+        let stripped = Conditions::new().extend(
+            mint_conditions
+                .into_iter()
+                .filter(|condition| !matches!(condition, Condition::AssertCoinAnnouncement(_))),
+        );
+        StandardLayer::new(owner_pk())
+            .spend(&mut ctx, funding, stripped)
+            .expect("the funding coin spends under the standard layer");
+        ctx.take()
+    }
+
+    /// An NFT transfer whose delegated puzzle is the PAIR-form echo `(2 (q . 1) 1)` — the same
+    /// blank-cheque hazard as [`malleable_nft_transfer`], reached through the OTHER branch of the
+    /// quote-form check.
+    ///
+    /// [`malleable_nft_transfer`] uses the bare atom `1`, which is not a pair at all, so it can only
+    /// ever exercise the not-a-pair branch: neutering the quote-OPCODE check leaves that test green.
+    /// This delegated puzzle IS a pair, and its operator is `2` (apply) rather than the quote `1`, so
+    /// only the opcode check can refuse it. It applies the identity program to its own solution, so
+    /// it returns whatever conditions an attacker later supplies while committing to none of them.
+    fn pair_form_malleable_nft_transfer() -> Vec<CoinSpend> {
+        use chia_puzzle_types::standard::StandardSolution;
+        use chia_wallet_sdk::driver::Spend;
+
+        let (mut ctx, nft) = settled_nft();
+
+        let presented =
+            Conditions::new().create_coin(nft_recipient_ph(), 1, chia_puzzle_types::Memos::None);
+        let identity = ctx.alloc(&1).expect("the identity program allocates");
+        let quoted_identity = ctx
+            .alloc(&clvm_traits::clvm_quote!(1))
+            .expect("a quoted identity program allocates");
+        // `(2 (q . 1) 1)` — apply the quoted identity program to the solution.
+        let echo = ctx
+            .alloc(&(2, (quoted_identity, (identity, ()))))
+            .expect("the pair-form echo program allocates");
+        let solution_conditions = ctx
+            .alloc(&presented)
+            .expect("the presented conditions allocate");
+        let standard_solution = ctx
+            .alloc(&StandardSolution {
+                original_public_key: None,
+                delegated_puzzle: echo,
+                solution: solution_conditions,
+            })
+            .expect("a standard-layer solution allocates");
+        let p2_puzzle = ctx
+            .curry(chia_puzzle_types::standard::StandardArgs::new(owner_pk()))
+            .expect("the standard puzzle curries");
+
+        let _ = nft
+            .spend(&mut ctx, Spend::new(p2_puzzle, standard_solution))
+            .expect("an NFT accepts an arbitrary inner spend");
         ctx.take()
     }
 
@@ -3826,6 +3910,141 @@ pub(crate) mod singleton_melt_tests {
         assert_ne!(
             transfer, mint,
             "two different acts on the same NFT must never render identically"
+        );
+    }
+
+    /// An NFT re-homed onto the offer SETTLEMENT puzzle is refused.
+    ///
+    /// The settlement puzzle is spendable by ANYONE who satisfies its announcement, so this is a
+    /// give-the-NFT-away, not a transfer — and it is the exact shape a refusal read from the OUTER
+    /// conditions cannot see, because the singleton layer has already curried the destination into
+    /// an unrecognisable hash by the time those conditions exist.
+    #[test]
+    fn an_nft_re_homed_onto_the_settlement_puzzle_is_refused() {
+        let error = analyze(&nft_transfer_to(Bytes32::new(SETTLEMENT_PAYMENT_HASH)))
+            .expect_err("an NFT re-homed under a puzzle anyone can spend is not a transfer");
+        assert!(
+            error.to_string().contains("structural puzzle hash"),
+            "the refusal must name the structural destination: {error}"
+        );
+    }
+
+    /// An NFT re-homed onto the singleton LAUNCHER hash is refused — the second structural
+    /// destination, tested separately because a fix that recognised only one would still pass the
+    /// other.
+    #[test]
+    fn an_nft_re_homed_onto_the_singleton_launcher_is_refused() {
+        let error = analyze(&nft_transfer_to(Bytes32::new(SINGLETON_LAUNCHER_HASH)))
+            .expect_err("an NFT re-homed onto the launcher hash is not a transfer");
+        assert!(
+            error.to_string().contains("structural puzzle hash"),
+            "the refusal must name the structural destination: {error}"
+        );
+    }
+
+    /// Two transfers of the SAME NFT to DIFFERENT owners must read differently to the human.
+    ///
+    /// This is the disclosure property, and it needs two ACTORS to be visible: with only one
+    /// destination in the fixture, an operation naming just the launcher id looks perfectly correct.
+    /// Naming only the NFT lets a compromised engine substitute its own p2 puzzle hash for the one
+    /// the person chose while every other reviewed fact — the fee, the recipient multiset, the NFT
+    /// sentence — stays identical, so the person approves a transfer to the attacker (NC-14).
+    ///
+    /// Derived through `analyze` rather than constructed, so it also proves the destination survives
+    /// the whole decode into the sentence the signing gate actually compares.
+    #[test]
+    fn two_destinations_for_one_nft_do_not_read_identically() {
+        let honest = analyze(&nft_transfer_to(nft_recipient_ph()))
+            .expect("an honest NFT transfer must be signable");
+        let hijacked = analyze(&nft_transfer_to(Bytes32::new([0x3e; 32])))
+            .expect("a transfer to any other free address is equally well-formed on chain");
+
+        let honest_line = honest.nft_operations[0]
+            .describe()
+            .expect("an NFT operation describes itself");
+        let hijacked_line = hijacked.nft_operations[0]
+            .describe()
+            .expect("an NFT operation describes itself");
+
+        assert_eq!(
+            honest.nft_operations[0].launcher_id(),
+            hijacked.nft_operations[0].launcher_id(),
+            "the fixtures must differ ONLY in destination, or this test proves nothing"
+        );
+        assert_ne!(
+            honest_line, hijacked_line,
+            "an act whose entire effect is a change of owner must NAME the owner: {honest_line}"
+        );
+        assert!(
+            honest_line.contains(
+                &Bech32Address::new(nft_recipient_ph(), "xch".into())
+                    .encode()
+                    .expect("a p2 puzzle hash encodes as an address")
+            ),
+            "the disclosed owner must be the p2 hash the signature commits to: {honest_line}"
+        );
+    }
+
+    /// A mint whose funding coin does not assert the launcher's announcement is refused.
+    ///
+    /// The launcher spend is UNSIGNED and its solution carries the eve puzzle hash, so without a
+    /// signature-committed assertion over that solution's tree hash the launcher can be re-solved
+    /// after signing to produce a DIFFERENT eve — a different owner — while the launcher id, and so
+    /// the `"mint nft1…"` sentence the person approved, is unchanged. A fix that merely DISPLAYED the
+    /// mint's owner would be defeated by this, because the display would be derived from the same
+    /// malleable solution; only the structural binding closes it.
+    #[test]
+    fn a_mint_whose_launcher_announcement_is_unasserted_is_refused() {
+        let error = analyze(&nft_mint_without_the_launcher_announcement())
+            .expect_err("an unpinned launcher leaves the minted NFT's owner malleable");
+        assert!(
+            error.to_string().contains("re-solvable after signing"),
+            "the refusal must name the malleability it closes: {error}"
+        );
+    }
+
+    /// A launcher spent with no eve spend descending from it is refused.
+    ///
+    /// Both existing edges point the other way — they check a launcher's parent and an eve's parent —
+    /// so a bundle carrying a funding coin and a launcher but NO eve satisfied every one of them and
+    /// was admitted with an EMPTY `nft_operations`: a singleton launched into a lineage the bundle
+    /// never accounts for, and the confirm screen names nothing at all.
+    #[test]
+    fn a_launcher_with_no_eve_spend_is_refused() {
+        let mint = nft_mint();
+        let launcher_coin_id = mint
+            .iter()
+            .find(|spend| spend.coin.puzzle_hash == Bytes32::new(SINGLETON_LAUNCHER_HASH))
+            .expect("the mint spends a launcher")
+            .coin
+            .coin_id();
+        // What remains is the funding coin plus the launcher — the shape that was admitted.
+        let without_eve: Vec<CoinSpend> = mint
+            .into_iter()
+            .filter(|spend| spend.coin.parent_coin_info != launcher_coin_id)
+            .collect();
+
+        let error = analyze(&without_eve)
+            .expect_err("a launcher whose eve is unaccounted must not be signable");
+        assert!(
+            error.to_string().contains("no eve singleton spend"),
+            "the refusal must name the unaccounted launch: {error}"
+        );
+    }
+
+    /// The PAIR-form echo delegated puzzle is refused — the other branch of the quote-form check.
+    ///
+    /// [`a_solution_malleable_delegated_puzzle_is_refused_on_an_nft_transfer`] uses the bare atom
+    /// `1`, which is not a pair, so it can only exercise the not-a-pair branch: neutering the quote
+    /// OPCODE check leaves that test green. `(2 (q . 1) 1)` IS a pair whose operator is apply rather
+    /// than quote, so only the opcode check can refuse it, and the two together pin both branches.
+    #[test]
+    fn a_pair_form_echo_delegated_puzzle_is_refused_on_an_nft_transfer() {
+        let error = analyze(&pair_form_malleable_nft_transfer())
+            .expect_err("an apply-form echo commits to no conditions and is a blank cheque");
+        assert!(
+            error.to_string().contains("canonical quote form"),
+            "the refusal must come from the quote-OPCODE branch, not the not-a-pair branch: {error}"
         );
     }
 
