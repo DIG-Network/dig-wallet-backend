@@ -106,12 +106,17 @@ pub struct DecodedOutput {
 /// The NFT is identified by its LAUNCHER ID — the singleton's permanent lineage identifier, stable
 /// across every transfer — never by the coin id, which changes on each spend.
 ///
-/// A TRANSFER additionally names its DESTINATION, because a transfer's entire effect is a change of
-/// owner: naming only the NFT would let an engine substitute its own p2 puzzle hash for the one the
-/// person chose and still produce a byte-identical confirm line (NC-14, dig_ecosystem#3079). The
-/// destination recorded here is read from the SIGNED delegated conditions — the artifact the
-/// signature commits to — never from the outer conditions, where the singleton layer has already
-/// morphed the p2 hash into an unrecognisable curried singleton hash.
+/// BOTH acts additionally name the OWNER the NFT ends up with, because for both the owner is the
+/// entire point and neither is identified by the launcher id alone (NC-14, dig_ecosystem#3079):
+///
+/// - a TRANSFER's whole effect IS the change of owner, so naming only the NFT would let an engine
+///   substitute its own p2 puzzle hash for the one the person chose and still produce a
+///   byte-identical confirm line;
+/// - a MINT's launcher id is a function of the FUNDING COIN alone, so it is byte-identical whoever
+///   ends up owning the NFT — a mint to the user and a mint to an attacker render the same sentence.
+///
+/// The hash recorded here is always read from the spend's INNER condition list, never from the outer
+/// conditions where the singleton layer has already morphed it into an unrecognisable curried hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NftOperation {
     /// The bundle re-homes an existing NFT to a new p2 puzzle hash.
@@ -122,19 +127,34 @@ pub enum NftOperation {
         destination: Bytes32,
     },
     /// The bundle brings a new NFT into existence (its launcher + eve spends).
-    Mint(Bytes32),
+    Mint {
+        /// The new NFT's permanent launcher id.
+        launcher_id: Bytes32,
+        /// The p2 puzzle hash the minted NFT is settled onto — who OWNS the new NFT.
+        owner: Bytes32,
+    },
 }
 
 impl NftOperation {
     /// This NFT's permanent launcher id.
     pub fn launcher_id(self) -> Bytes32 {
         match self {
-            Self::Transfer { launcher_id, .. } | Self::Mint(launcher_id) => launcher_id,
+            Self::Transfer { launcher_id, .. } | Self::Mint { launcher_id, .. } => launcher_id,
+        }
+    }
+
+    /// The p2 puzzle hash that OWNS the NFT once this act completes.
+    pub fn owner(self) -> Bytes32 {
+        match self {
+            Self::Transfer {
+                destination: owner, ..
+            }
+            | Self::Mint { owner, .. } => owner,
         }
     }
 
     /// The canonical one-line description a human reviews and the signing gate compares —
-    /// `"transfer nft1… to xch1…"` / `"mint nft1…"`.
+    /// `"transfer nft1… to xch1…"` / `"mint nft1… owned by xch1…"`.
     ///
     /// Rendering and comparison MUST share this one function: if the confirm screen and the gate
     /// derived the sentence separately they could drift, and a human would then approve a sentence
@@ -143,14 +163,12 @@ impl NftOperation {
         let id = Bech32Address::new(self.launcher_id(), "nft".into())
             .encode()
             .map_err(|e| reject(format!("cannot encode NFT id: {e:?}")))?;
+        let owner = Bech32Address::new(self.owner(), "xch".into())
+            .encode()
+            .map_err(|e| reject(format!("cannot encode NFT owner: {e:?}")))?;
         match self {
-            Self::Transfer { destination, .. } => {
-                let owner = Bech32Address::new(destination, "xch".into())
-                    .encode()
-                    .map_err(|e| reject(format!("cannot encode NFT destination: {e:?}")))?;
-                Ok(format!("transfer {id} to {owner}"))
-            }
-            Self::Mint(_) => Ok(format!("mint {id}")),
+            Self::Transfer { .. } => Ok(format!("transfer {id} to {owner}")),
+            Self::Mint { .. } => Ok(format!("mint {id} owned by {owner}")),
         }
     }
 }
@@ -814,9 +832,16 @@ fn account_nft_spend(
     solution_ptr: clvmr::NodePtr,
 ) -> WalletResult<()> {
     match nft.proof {
-        Proof::Eve(_) => {
-            account_nft_eve_mint(ledger, allocator, spend, nft, puzzle_ptr, solution_ptr)
-        }
+        Proof::Eve(_) => account_nft_eve_mint(
+            ledger,
+            allocator,
+            spend,
+            nft,
+            p2_puzzle,
+            p2_solution,
+            puzzle_ptr,
+            solution_ptr,
+        ),
         Proof::Lineage(_) => account_nft_transfer(
             ledger,
             allocator,
@@ -849,7 +874,7 @@ fn account_nft_spend(
 ///    outside a re-home — including the owner-assignment and metadata-update conditions that would
 ///    otherwise turn a reviewed "transfer" into a different act;
 /// 5. exactly ONE odd-amount `CREATE_COIN` re-homes the singleton, and the DESTINATION is taken from
-///    the signed list ([`signed_rehome_destination`]) — refused when structural, and NAMED in
+///    the signed list ([`inner_rehome_destination`]) — refused when structural, and NAMED in
 ///    [`NftOperation::Transfer`] so the person approves the owner the signature commits to.
 #[allow(clippy::too_many_arguments)]
 fn account_nft_transfer(
@@ -873,17 +898,23 @@ fn account_nft_transfer(
     let committed = committed_standard_spend(allocator, p2_solution)?;
 
     // The SIGNED conditions decide WHICH ACT is admitted, and they must, because the NFT state
-    // layer CONSUMES an `UPDATE_NFT_METADATA` and the ownership layer consumes a `TRANSFER_NFT`
-    // while re-emitting the rest — so a metadata update and an owner assignment are INVISIBLE in
-    // the outer conditions below, where only their re-home survives. Judging the outer list alone
-    // would have admitted both as a plain "transfer" and named them as one on the confirm screen.
+    // layer CONSUMES an `UPDATE_NFT_METADATA` while re-emitting the rest — so a METADATA UPDATE is
+    // INVISIBLE in the outer conditions below, where only its re-home survives, and judging the
+    // outer list alone would have admitted it as a plain "transfer" and named it as one on the
+    // confirm screen.
+    //
+    // An OWNER ASSIGNMENT is a weaker case than it once read here, and the difference matters to
+    // anyone tempted to delete the outer pass: mutation testing (M5) shows the outer allowlist
+    // refuses a `TRANSFER_NFT` unaided, so that act is caught on BOTH lists rather than only this
+    // one. The code is safer than the older comment described; neither pass is redundant.
+    //
     // This list is also the artifact the signature commits to, so it is the right one on both
     // counts.
     for condition in &committed.conditions {
         reject_unexpected_agg_sig(condition)?;
         reject_non_rehome_condition(condition, RehomeClass::NftSigned)?;
     }
-    let destination = signed_rehome_destination(&committed.conditions)?;
+    let destination = inner_rehome_destination(&committed.conditions, "an NFT transfer")?;
 
     // The OUTER conditions are what consensus acts on, so the VALUE FLOW is accounted from them.
     let conditions = run_conditions(allocator, puzzle_ptr, solution_ptr)?;
@@ -934,53 +965,59 @@ fn account_nft_transfer(
     Ok(())
 }
 
-/// The p2 puzzle hash a signed NFT re-home sends the singleton to — the NEW OWNER — read from the
-/// SIGNED delegated conditions, and refused when it is a structural puzzle hash (#3077).
+/// The p2 puzzle hash an NFT spend hands the singleton to — the NEW OWNER — read from the arm's
+/// INNER condition list, and refused when it is a structural puzzle hash (#3077).
 ///
-/// # Why the signed list, and only the signed list
+/// # Why the inner list, and never the outer one
 ///
-/// The NFT layer stack MORPHS its inner puzzle's output: the odd-amount `CREATE_COIN` the delegated
+/// The NFT layer stack MORPHS its inner puzzle's output: the odd-amount `CREATE_COIN` the inner
 /// puzzle emits leaves the outer conditions as `CREATE_COIN(singleton_puzzle_hash(struct,
-/// new_inner), amount)`. That curried hash is a different value on every transfer and can never
-/// equal a structural constant, so a structural-destination test applied to the OUTER list is
-/// VACUOUS by construction — it would refuse nothing, while an NFT re-homed to the settlement puzzle
-/// (spendable by anyone) sailed through named as an ordinary "transfer". It is equally
+/// new_inner), amount)`. That curried hash is a different value on every spend and can never equal a
+/// structural constant, so a structural-destination test applied to the OUTER list is VACUOUS by
+/// construction — it refuses nothing, while an NFT handed to the settlement puzzle (spendable by
+/// anyone) sails through named as an ordinary transfer or mint. The morphed hash is equally
 /// unrecognisable to a human, which is the disclosure half of the same defect.
 ///
-/// The signed list carries the destination in the clear, and it is the artifact the signature
-/// commits to — so the owner the person approves and the owner the signature authorizes are the same
-/// value, by construction rather than by coincidence.
-fn signed_rehome_destination(signed: &[Condition]) -> WalletResult<Bytes32> {
-    let mut re_home = None;
-    for create in signed.iter().filter_map(Condition::as_create_coin) {
-        if re_home.is_some() {
-            return Err(reject(
-                "an NFT transfer's SIGNED delegated puzzle emits more than one CREATE_COIN \
-                 (undisclosed extra egress); refusing to sign",
-            ));
+/// # Why ONE helper serves both arms
+///
+/// A transfer and a mint ask the identical question of different lists — the transfer's SIGNED
+/// delegated conditions, the eve's inner quoted conditions — and this gate has now twice had a rule
+/// applied to one arm and not its neighbour. Sharing the implementation is what makes the two arms
+/// unable to drift: a property added here cannot reach one arm without reaching the other
+/// (dig_ecosystem#3103 removes the remaining possibility at the type level).
+///
+/// `what` names the arm so a refusal reads as the act the person attempted, never as a generic one.
+fn inner_rehome_destination(inner: &[Condition], what: &str) -> WalletResult<Bytes32> {
+    let mut destination = None;
+    for create in inner.iter().filter_map(Condition::as_create_coin) {
+        if destination.is_some() {
+            return Err(reject(format!(
+                "{what}'s inner puzzle emits more than one CREATE_COIN (undisclosed extra \
+                 egress); refusing to sign"
+            )));
         }
         if create.amount % 2 == 0 {
-            return Err(reject(
-                "an NFT transfer's SIGNED CREATE_COIN is not the odd-amount singleton re-home; \
-                 refusing to sign",
-            ));
+            return Err(reject(format!(
+                "{what}'s inner CREATE_COIN is not the odd-amount singleton output; refusing to \
+                 sign"
+            )));
         }
-        // A settlement lock or a fresh launcher is a DIFFERENT act than a transfer: the settlement
-        // puzzle is spendable by anyone who satisfies its announcement, so re-homing there hands the
-        // NFT away while the confirm screen still reads "transfer".
+        // A settlement lock or a fresh launcher is a DIFFERENT act: the settlement puzzle is
+        // spendable by anyone who satisfies its announcement, so landing the NFT there hands it away
+        // while the confirm screen still reads as an ordinary transfer or mint.
         if is_protocol_sink_hash(create.puzzle_hash) {
-            return Err(reject(
-                "NFT transfer re-homes the singleton to a structural puzzle hash \
-                 (unauthorized re-home); refusing to sign",
-            ));
+            return Err(reject(format!(
+                "{what} sends the singleton to a structural puzzle hash (unauthorized \
+                 destination); refusing to sign"
+            )));
         }
-        re_home = Some(create.puzzle_hash);
+        destination = Some(create.puzzle_hash);
     }
-    re_home.ok_or_else(|| {
-        reject(
-            "an NFT transfer's SIGNED delegated puzzle emits no CREATE_COIN, so the signature \
-             authorizes no re-home; refusing to sign",
-        )
+    destination.ok_or_else(|| {
+        reject(format!(
+            "{what}'s inner puzzle emits no CREATE_COIN, so nothing hands the singleton to an \
+             owner; refusing to sign"
+        ))
     })
 }
 
@@ -995,19 +1032,40 @@ fn signed_rehome_destination(signed: &[Condition]) -> WalletResult<Bytes32> {
 /// launcher/eve pair could ride along inside a bundle the human approved for something else, and
 /// nothing would pin WHICH eve — that is, which OWNER — the approved launcher id resolves to.
 ///
-/// No structural-destination test is applied to this arm's `CREATE_COIN`, and deliberately so: the
-/// singleton layer has already morphed it into a curried singleton hash, so such a test could never
-/// fire (the same vacuity [`signed_rehome_destination`] exists to avoid). The mint's owner is pinned
-/// instead by the launcher's announcement, which a SIGNED coin must assert — see
-/// [`enforce_bundle_nft_mint_binding`].
+/// # The OWNER is read from the eve's INNER conditions, and disclosed
+///
+/// The launcher id is a function of the FUNDING COIN alone, so it is byte-identical whoever ends up
+/// owning the NFT: a mint to the user and a mint to an attacker produce the same `"mint nft1…"`. An
+/// engine that builds `NftMint::new(metadata, ATTACKER_PH, …)` is honest in every other reviewed
+/// fact — the fee, the recipient multiset, the announcement binding below — and the user pays to mint
+/// an NFT that belongs to someone else.
+///
+/// [`enforce_bundle_nft_mint_binding`] does not close this and was never able to: it stops the eve
+/// being re-solved AFTER signing, and says nothing about the engine choosing the wrong eve BEFORE.
+/// **Pinning makes disclosure trustworthy; it does not replace it.** So the owner is read here, from
+/// the eve's own inner quoted conditions — the same list-behind-the-morph the transfer arm reads —
+/// held to the same allowlist, refused when structural, and NAMED in [`NftOperation::Mint`].
+#[allow(clippy::too_many_arguments)]
 fn account_nft_eve_mint(
     ledger: &mut SpendLedger,
     allocator: &mut Allocator,
     spend: &CoinSpend,
     nft: Nft,
+    p2_puzzle: Puzzle,
+    p2_solution: clvmr::NodePtr,
     puzzle_ptr: clvmr::NodePtr,
     solution_ptr: clvmr::NodePtr,
 ) -> WalletResult<()> {
+    // The eve's INNER list, where the owner is still in the clear. Judged in full rather than only
+    // read from: the ownership layer CONSUMES a `TransferNft` while re-emitting the rest, so a
+    // condition the outer allowlist cannot see would otherwise ride along here.
+    let inner = run_conditions(allocator, p2_puzzle.ptr(), p2_solution)?;
+    reject_any_agg_sig_in(&inner, "an NFT mint's eve spend")?;
+    for condition in &inner {
+        reject_non_rehome_condition(condition, RehomeClass::NftEve)?;
+    }
+    let owner = inner_rehome_destination(&inner, "an NFT mint")?;
+
     let conditions = run_conditions(allocator, puzzle_ptr, solution_ptr)?;
     reject_any_agg_sig_in(&conditions, "an NFT mint's eve spend")?;
 
@@ -1048,9 +1106,10 @@ fn account_nft_eve_mint(
     }
 
     ledger.eve_parents.push(spend.coin.parent_coin_info);
-    ledger
-        .nft_operations
-        .push(NftOperation::Mint(nft.info.launcher_id));
+    ledger.nft_operations.push(NftOperation::Mint {
+        launcher_id: nft.info.launcher_id,
+        owner,
+    });
     Ok(())
 }
 
@@ -3523,6 +3582,17 @@ pub(crate) mod singleton_melt_tests {
     /// the same ones dig-nft itself wraps and the same ones this module parses with, so nothing is
     /// hand-rolled.
     fn nft_mint_parts() -> (SpendContext, chia_wallet_sdk::driver::Nft, Vec<CoinSpend>) {
+        nft_mint_parts_owned_by(owner_ph())
+    }
+
+    /// The same canonical sdk mint, parameterized by WHO ends up owning the new NFT.
+    ///
+    /// The funding coin is deliberately held constant across owners, because the launcher id is a
+    /// function of the funding coin alone: every mint this builds has the SAME launcher id and so the
+    /// same `nft1…`, which is precisely the fact that makes an owner-blind mint sentence dangerous.
+    fn nft_mint_parts_owned_by(
+        owner: Bytes32,
+    ) -> (SpendContext, chia_wallet_sdk::driver::Nft, Vec<CoinSpend>) {
         use chia_puzzle_types::nft::NftMetadata;
         use chia_wallet_sdk::driver::{Launcher, NftMint, StandardLayer};
 
@@ -3532,7 +3602,7 @@ pub(crate) mod singleton_melt_tests {
             .alloc_hashed(&NftMetadata::default())
             .expect("the default NFT metadata allocates");
         let launcher = Launcher::new(funding.coin_id(), 1);
-        let mint = NftMint::new(metadata, owner_ph(), 300, None);
+        let mint = NftMint::new(metadata, owner, 300, None);
         let (mint_conditions, nft) = launcher
             .mint_nft(&mut ctx, &mint)
             .expect("the canonical sdk NFT mint builder");
@@ -3755,14 +3825,20 @@ pub(crate) mod singleton_melt_tests {
     /// A real NFT MINT whose funding coin asserts the WRONG coin announcement.
     ///
     /// Built from the canonical sdk mint, with the launcher's announcement assertion REPLACED — not
-    /// deleted — by an assertion over a different announcement id. Deleting it would have proved
-    /// nothing about this edge: the MR-6 offer-binding pass counts ANY `AssertCoinAnnouncement` on a
-    /// coin that commits value to a protocol sink, and the funding coin commits its mojo to the
-    /// launcher, so a stripped bundle is refused by MR-6 before the launcher edge is ever consulted.
-    /// Replacing it keeps that control TRUE — the bundle still carries an assertion, MR-6 is still
-    /// satisfied, conservation is untouched, the funding coin, launcher and eve spends are otherwise
-    /// byte-identical — so the ONLY thing that can refuse this bundle is the launcher-specific
-    /// binding under test.
+    /// deleted — by an assertion over a different announcement id.
+    ///
+    /// Deleting it would have made the test pass for the wrong reason ON REVERT, which is the only
+    /// moment a revert-proof is actually measuring anything. With the binding PRESENT a stripped
+    /// bundle is refused by the launcher edge, since `analyze` runs the mint binding before the MR-6
+    /// offer binding — so the test looks fine. Remove the binding to prove it load-bearing and the
+    /// stripped bundle is STILL refused, now by MR-6, which counts ANY `AssertCoinAnnouncement` on a
+    /// coin that commits value to a protocol sink and so notices that the funding coin's assertion
+    /// has gone. The test would stay red without the edge it claims to test.
+    ///
+    /// Replacing the assertion keeps MR-6 satisfied as a TRUE control — the bundle still carries an
+    /// assertion, conservation is untouched, and the funding coin, launcher and eve spends are
+    /// otherwise byte-identical — so the launcher-specific binding is the only guard that can refuse
+    /// it, on revert as well as before.
     fn nft_mint_asserting_the_wrong_launcher_announcement() -> Vec<CoinSpend> {
         use chia_puzzle_types::nft::NftMetadata;
         use chia_wallet_sdk::driver::{Launcher, NftMint, StandardLayer};
@@ -3885,8 +3961,11 @@ pub(crate) mod singleton_melt_tests {
 
         assert_eq!(
             effect.nft_operations,
-            vec![NftOperation::Mint(nft_launcher_id())],
-            "the mint must be named against the NFT's permanent launcher id"
+            vec![NftOperation::Mint {
+                launcher_id: nft_launcher_id(),
+                owner: owner_ph(),
+            }],
+            "the mint must be named against the NFT's permanent launcher id AND the owner the new              NFT is settled onto"
         );
         assert!(
             effect
@@ -3911,9 +3990,12 @@ pub(crate) mod singleton_melt_tests {
             "a transfer must read as an NFT action: {transfer}"
         );
 
-        let mint = NftOperation::Mint(nft_launcher_id())
-            .describe()
-            .expect("a launcher id encodes as an nft1 address");
+        let mint = NftOperation::Mint {
+            launcher_id: nft_launcher_id(),
+            owner: nft_recipient_ph(),
+        }
+        .describe()
+        .expect("a launcher id encodes as an nft1 address");
         assert!(
             mint.starts_with("mint nft1"),
             "a mint must read as an NFT action: {mint}"
@@ -3993,6 +4075,70 @@ pub(crate) mod singleton_melt_tests {
                     .expect("a p2 puzzle hash encodes as an address")
             ),
             "the disclosed owner must be the p2 hash the signature commits to: {honest_line}"
+        );
+    }
+
+    /// Three mints differing ONLY in owner must read as three different sentences.
+    ///
+    /// The launcher id is a function of the funding coin alone, so all three fixtures share it — a
+    /// mint to the user and a mint to an attacker are the SAME `nft1…`. An engine that builds
+    /// `NftMint::new(metadata, ATTACKER_PH, …)` is honest in every other reviewed fact: the fee, the
+    /// recipient multiset, and even the launcher-announcement binding. Only naming the owner can
+    /// distinguish them, so this test asserts the identical launcher id as its control and then
+    /// requires all three sentences to differ.
+    ///
+    /// The binding checked elsewhere does NOT subsume this: it stops the eve being re-solved AFTER
+    /// signing, and says nothing about the engine choosing the wrong eve BEFORE. Pinning makes
+    /// disclosure trustworthy; it does not replace it.
+    #[test]
+    fn three_mints_differing_only_in_owner_do_not_read_identically() {
+        let describe = |owner: Bytes32| {
+            let effect = analyze(&nft_mint_parts_owned_by(owner).2)
+                .expect("a mint to any free address is equally well-formed on chain");
+            let operation = effect.nft_operations[0];
+            (
+                operation.launcher_id(),
+                operation.describe().expect("a mint describes itself"),
+            )
+        };
+
+        let (mine_id, mine) = describe(owner_ph());
+        let (theirs_id, theirs) = describe(Bytes32::new([0xbb; 32]));
+        let (other_id, other) = describe(Bytes32::new([0x3e; 32]));
+
+        assert_eq!(
+            (mine_id, theirs_id),
+            (theirs_id, other_id),
+            "the fixtures must share a launcher id, or this test proves nothing about the owner"
+        );
+        assert!(
+            mine != theirs && theirs != other && mine != other,
+            "a mint must name WHO owns the new NFT: {mine} / {theirs} / {other}"
+        );
+        assert!(
+            mine.contains(
+                &Bech32Address::new(owner_ph(), "xch".into())
+                    .encode()
+                    .expect("a p2 puzzle hash encodes as an address")
+            ),
+            "the disclosed owner must be the p2 hash the eve settles onto: {mine}"
+        );
+    }
+
+    /// A mint that settles the new NFT onto the offer SETTLEMENT puzzle is refused.
+    ///
+    /// The mint arm's counterpart to
+    /// [`an_nft_re_homed_onto_the_settlement_puzzle_is_refused`] — the same act, the same structural
+    /// destination, the neighbouring arm. It was admitted while the transfer arm refused it.
+    #[test]
+    fn a_mint_settled_onto_the_settlement_puzzle_is_refused() {
+        let error = analyze(&nft_mint_parts_owned_by(Bytes32::new(SETTLEMENT_PAYMENT_HASH)).2)
+            .expect_err(
+                "minting an NFT under a puzzle anyone can spend is not a mint the user made",
+            );
+        assert!(
+            error.to_string().contains("structural puzzle hash"),
+            "the refusal must name the structural destination: {error}"
         );
     }
 
