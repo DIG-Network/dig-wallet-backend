@@ -727,7 +727,7 @@ fn account_singleton_melt(
     let conditions = run_conditions(allocator, puzzle_ptr, solution_ptr)?;
     for condition in &conditions {
         reject_unexpected_agg_sig(condition)?;
-        reject_non_melt_condition(condition)?;
+        reject_non_melt_condition(condition, MeltConditionList::Presented)?;
     }
 
     // THE admission test, over the artifact the signature commits to rather than the one solution a
@@ -738,7 +738,7 @@ fn account_singleton_melt(
     let mut melt_markers = 0usize;
     for condition in &committed {
         reject_unexpected_agg_sig(condition)?;
-        reject_non_melt_condition(condition)?;
+        reject_non_melt_condition(condition, MeltConditionList::Signed)?;
         if matches!(condition, Condition::MeltSingleton(_)) {
             melt_markers += 1;
         }
@@ -1325,9 +1325,32 @@ fn find_subtree_by_tree_hash(
         .or_else(|| find_subtree_by_tree_hash(allocator, rest, target, depth + 1))
 }
 
+/// Which of a melt's two condition lists is being judged.
+///
+/// The lists differ in exactly one opcode, and the difference is structural rather than a matter of
+/// taste: the `p2_delegated_puzzle_or_hidden_puzzle` layer emits the coin's `AGG_SIG_ME` ITSELF,
+/// outside the delegated puzzle. So it is expected in the PRESENTED list and is never honest in the
+/// SIGNED one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeltConditionList {
+    /// What the coin emits under the solution the caller presented — defence in depth.
+    Presented,
+    /// What the quoted delegated puzzle commits to — the admission test.
+    Signed,
+}
+
 /// Default-DENY allowlist for a TERMINAL singleton melt's conditions (dig_ecosystem#3068), applied
 /// both to the outer run conditions (defence in depth) and to the SIGNED quoted ones (the admission
 /// test).
+///
+/// `AGG_SIG_ME` is admitted only in the [`MeltConditionList::Presented`] list, where the p2 layer
+/// puts it. Inside the SIGNED quoted list it is a blank cheque for a second delegated puzzle on the
+/// same coin — the committed pass counts only `MELT_SINGLETON`, so `[MELT_SINGLETON, AGG_SIG_ME]`
+/// would otherwise satisfy the admission test while authorizing arbitrary other conditions one layer
+/// in. Today that case happens to make the OUTER `AGG_SIG_ME` count 2 and trip
+/// [`sole_agg_sig_me_message`] — but that rests on the exact layer behaviour this arm declares it
+/// does not model, which is the dependency the whole fix exists to remove. Refusing it directly
+/// costs an honest melt nothing.
 ///
 /// A melt ends a lineage: it destroys the singleton and creates nothing. So EVERY `CREATE_COIN` is
 /// refused here — not merely the odd-amount re-home — which makes the guard immune to a
@@ -1337,12 +1360,22 @@ fn find_subtree_by_tree_hash(
 /// Fail-CLOSED by construction: an unrecognized opcode (including anything the SDK maps to its
 /// catch-all) is REFUSED, so a condition this crate cannot model can never ride a deletion the human
 /// approved.
-fn reject_non_melt_condition(condition: &Condition) -> WalletResult<()> {
+fn reject_non_melt_condition(condition: &Condition, list: MeltConditionList) -> WalletResult<()> {
+    if matches!(condition, Condition::AggSigMe(_)) {
+        return match list {
+            MeltConditionList::Presented => Ok(()),
+            MeltConditionList::Signed => Err(reject(
+                "the singleton melt's SIGNED delegated puzzle carries its own AGG_SIG_ME, which no \
+                 honest melt does (the standard layer emits that condition outside the delegated \
+                 puzzle); it would authorize a second delegated puzzle on this coin; refusing to \
+                 sign",
+            )),
+        };
+    }
     let permitted = matches!(
         condition,
-        // The melt marker itself, and the signature authorizing the destruction.
+        // The melt marker itself.
         Condition::MeltSingleton(_)
-            | Condition::AggSigMe(_)
             // Benign timelock assertions.
             | Condition::AssertSecondsAbsolute(_)
             | Condition::AssertSecondsRelative(_)
@@ -2690,9 +2723,43 @@ pub(crate) mod singleton_melt_tests {
     /// melt does not need — is refused rather than waved through carrying the user's signature.
     #[test]
     fn a_melt_condition_outside_the_allowlist_is_refused() {
-        reject_non_melt_condition(&Condition::create_coin_announcement(vec![1, 2, 3].into()))
+        for list in [MeltConditionList::Presented, MeltConditionList::Signed] {
+            reject_non_melt_condition(
+                &Condition::create_coin_announcement(vec![1, 2, 3].into()),
+                list,
+            )
             .expect_err("an unallowlisted condition must be refused, not tolerated");
-        reject_non_melt_condition(&Condition::melt_singleton())
-            .expect("the melt marker itself is allowlisted");
+            reject_non_melt_condition(&Condition::melt_singleton(), list)
+                .expect("the melt marker itself is allowlisted");
+        }
+    }
+
+    /// An `AGG_SIG_ME` inside the SIGNED quoted condition list is a blank cheque for a second
+    /// delegated puzzle on the same coin, so it must be refused THERE — while the identical
+    /// condition in the PRESENTED list is the p2 layer's own signature requirement and every honest
+    /// melt carries it.
+    ///
+    /// Both halves are asserted together deliberately: a guard that refused `AGG_SIG_ME` in both
+    /// lists would pass the abuse half and break every honest melt, and a guard that admitted it in
+    /// both is the state before this change. Only the split is correct, and only asserting both
+    /// sides can see the difference.
+    #[test]
+    fn an_agg_sig_me_is_refused_in_the_signed_list_and_admitted_in_the_presented_one() {
+        let agg_sig_me = Condition::agg_sig_me(owner_pk(), vec![0x5a; 32].into());
+
+        let err = reject_non_melt_condition(&agg_sig_me, MeltConditionList::Signed).expect_err(
+            "a signed delegated puzzle that carries its own AGG_SIG_ME authorizes a second \
+             delegated puzzle and must be refused",
+        );
+        assert!(
+            err.message
+                .contains("SIGNED delegated puzzle carries its own AGG_SIG_ME"),
+            "the refusal must name the smuggled signature requirement, not an incidental parse \
+             failure: {}",
+            err.message
+        );
+
+        reject_non_melt_condition(&agg_sig_me, MeltConditionList::Presented)
+            .expect("the p2 layer's own AGG_SIG_ME is what every honest melt presents");
     }
 }
