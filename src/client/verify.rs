@@ -2762,4 +2762,128 @@ pub(crate) mod singleton_melt_tests {
         reject_non_melt_condition(&agg_sig_me, MeltConditionList::Presented)
             .expect("the p2 layer's own AGG_SIG_ME is what every honest melt presents");
     }
+
+    // ---------------------------------------------------------------------------------------
+    // NFT fixtures + the STEP-1 measurement of what the gate does with them today (#3077).
+    // ---------------------------------------------------------------------------------------
+
+    /// The p2 puzzle hash an NFT is transferred TO — a second free address, distinct from
+    /// [`owner_ph`] so a re-home is observable as a change of destination.
+    fn nft_recipient_ph() -> Bytes32 {
+        Bytes32::new([0x7c; 32])
+    }
+
+    /// The coin that funds an NFT mint: an ordinary standard-layer wallet coin.
+    fn nft_funding_coin() -> Coin {
+        Coin::new(Bytes32::new([0x44; 32]), owner_ph(), 1)
+    }
+
+    /// Mint an NFT through the CANONICAL chia-wallet-sdk drivers (`Launcher::mint_nft`), returning
+    /// the settled NFT plus the coin spends the mint consists of.
+    ///
+    /// dig-nft is deliberately NOT used: it is published at 0.1.0 against chia-protocol 0.26 /
+    /// chia-wallet-sdk 0.30, so its `CoinSpend` is a DIFFERENT type from the 0.36.1 one this gate
+    /// parses — the fixture could not be handed to `analyze` at all. The sdk drivers used here are
+    /// the same ones dig-nft itself wraps and the same ones this module parses with, so nothing is
+    /// hand-rolled.
+    fn nft_mint_parts() -> (SpendContext, chia_wallet_sdk::driver::Nft, Vec<CoinSpend>) {
+        use chia_puzzle_types::nft::NftMetadata;
+        use chia_wallet_sdk::driver::{Launcher, NftMint, StandardLayer};
+
+        let mut ctx = SpendContext::new();
+        let funding = nft_funding_coin();
+        let metadata = ctx
+            .alloc_hashed(&NftMetadata::default())
+            .expect("the default NFT metadata allocates");
+        let launcher = Launcher::new(funding.coin_id(), 1);
+        let mint = NftMint::new(metadata, owner_ph(), 300, None);
+        let (mint_conditions, nft) = launcher
+            .mint_nft(&mut ctx, &mint)
+            .expect("the canonical sdk NFT mint builder");
+        StandardLayer::new(owner_pk())
+            .spend(&mut ctx, funding, mint_conditions)
+            .expect("the funding coin spends under the standard layer");
+        let spends = ctx.take();
+        (ctx, nft, spends)
+    }
+
+    /// The coin spends of a real NFT MINT: the standard-layer funding coin, the singleton launcher,
+    /// and the eve NFT spend.
+    fn nft_mint() -> Vec<CoinSpend> {
+        nft_mint_parts().2
+    }
+
+    /// The coin spends of a real NFT TRANSFER: one NFT singleton spend re-homing the NFT to
+    /// [`nft_recipient_ph`] under the owner's standard layer.
+    fn nft_transfer() -> Vec<CoinSpend> {
+        use chia_wallet_sdk::driver::StandardLayer;
+
+        let (mut ctx, nft, _mint_spends) = nft_mint_parts();
+        let _child = nft
+            .transfer(
+                &mut ctx,
+                &StandardLayer::new(owner_pk()),
+                nft_recipient_ph(),
+                Conditions::new(),
+            )
+            .expect("the canonical sdk NFT transfer builder");
+        ctx.take()
+    }
+
+    /// STEP 1 (#3077), MEASURED: an NFT transfer is refused by the **melt arm**.
+    ///
+    /// An NFT is `SINGLETON_TOP_LAYER_V1_1`-wrapped, so it reaches [`is_singleton_puzzle`] and
+    /// enters [`account_singleton_melt`] — which admits only a signed melt marker — long before the
+    /// dispatch's closing refusal. Recorded as a test so the arm a remedy must be built at is a
+    /// measurement, not an assumption.
+    #[test]
+    fn step1_an_nft_transfer_is_refused_by_the_melt_arm() {
+        let err = analyze(&nft_transfer()).expect_err("STEP 1: transfer cannot be signed today");
+        assert!(
+            err.message.contains("outside the melt allowlist"),
+            "an NFT transfer must be refused by the MELT arm, not another one: {}",
+            err.message
+        );
+    }
+
+    /// STEP 1 (#3077), MEASURED: an NFT mint is refused at the dispatch's **closing arm**, by the
+    /// LAUNCHER coin — and its eve NFT spend is separately refused by the melt arm.
+    ///
+    /// So a mint needs TWO admissions, not one: the singleton launcher spend and the eve NFT spend.
+    /// The standard-layer funding coin already accounts cleanly (its mojo routes to the launcher
+    /// hash, an established [`is_protocol_sink_hash`]).
+    #[test]
+    fn step1_an_nft_mint_is_refused_at_the_launcher_and_the_eve_spend() {
+        let spends = nft_mint();
+        let refusal = |spend: &CoinSpend| {
+            analyze(std::slice::from_ref(spend))
+                .err()
+                .map_or_else(|| "ACCEPTED".to_string(), |e| e.message)
+        };
+
+        let launcher = spends
+            .iter()
+            .find(|spend| spend.coin.puzzle_hash == Bytes32::new(SINGLETON_LAUNCHER_HASH))
+            .expect("a mint spends the singleton launcher");
+        assert!(
+            refusal(launcher).contains("nor a settlement spend"),
+            "the launcher spend must fall through to the dispatch's CLOSING refusal: {}",
+            refusal(launcher)
+        );
+
+        let eve = spends
+            .iter()
+            .find(|spend| spend.coin.parent_coin_info == launcher.coin.coin_id())
+            .expect("a mint spends the eve NFT the launcher created");
+        assert!(
+            refusal(eve).contains("outside the melt allowlist"),
+            "the eve NFT spend must be refused by the MELT arm: {}",
+            refusal(eve)
+        );
+
+        assert!(
+            analyze(&spends).is_err(),
+            "STEP 1: mint cannot be signed today"
+        );
+    }
 }
