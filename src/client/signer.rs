@@ -2555,10 +2555,22 @@ mod tests {
             },
         };
 
-        let err = signer.sign_unsigned(&unsigned(Vec::new())).expect_err(
-            "a spend that destroys a singleton the summary never named must be refused",
-        );
+        // Asserted at the REVIEW gate, so a failure here is unambiguously "the gate admitted an
+        // unreviewed destruction" rather than an incidental signing error further down.
+        let err = signer
+            .verify_before_signing(&unsigned(Vec::new()))
+            .expect_err(
+                "a spend that destroys a singleton the summary never named must be refused",
+            );
         assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+        assert_eq!(
+            signer
+                .sign_unsigned(&unsigned(Vec::new()))
+                .unwrap_err()
+                .code,
+            WalletErrorCode::SpendValidationFailed,
+            "and the refusal must hold end to end, not only at the gate helper"
+        );
         assert!(
             err.message.contains("destroyed singletons"),
             "the refusal must name the unreviewed destruction, not an incidental mismatch: {}",
