@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.28.0] - 2026-08-17
+
+### Features
+- **verify:** Admit a terminal singleton melt through the spend-verification gate (#38)
+
 ## [0.27.0] - 2026-08-07
 
 ### Features
