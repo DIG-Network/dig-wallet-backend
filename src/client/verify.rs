@@ -2253,6 +2253,9 @@ mod singleton_melt_tests {
     use chia_protocol::Coin;
     use chia_puzzle_types::standard::StandardArgs;
     use chia_wallet_sdk::driver::SpendContext;
+    use chia_wallet_sdk::types::Conditions;
+    use clvm_traits::ToClvm;
+    use clvmr::serde::node_to_bytes;
 
     /// A non-infinity public key with no secret behind it — enough to curry a standard puzzle and to
     /// own a singleton, and never a key this crate could sign with.
@@ -2438,5 +2441,228 @@ mod singleton_melt_tests {
         let err = analyze(&updated.coin_spends)
             .expect_err("only a TERMINAL singleton spend is admissible; an update is not");
         assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    /// Rewrite a spend's p2 delegated puzzle from the canonical quote form `(q . conditions)` into
+    /// the non-quote IDENTITY puzzle `1`, which returns whatever solution it is handed — moving
+    /// `conditions` (or `replacement`, when given) into the delegated SOLUTION beside it.
+    ///
+    /// This is the attacker's construction from dig_ecosystem#3068, expressed as a fixture: the
+    /// standard layer signs `sha256tree(delegated_puzzle)`, so both variants produced here are
+    /// covered by ONE signature while doing entirely different things — which is exactly what an
+    /// outer-conditions check cannot see, and what the admission test must.
+    fn with_malleable_delegated_puzzle(
+        spend: &CoinSpend,
+        replacement: Option<Conditions>,
+    ) -> CoinSpend {
+        let mut allocator = Allocator::new();
+        let solution = node_from_bytes(&mut allocator, &spend.solution).expect("a valid solution");
+        let rewritten = rewrite_delegated_puzzle(&mut allocator, solution, &replacement)
+            .expect("the melt solution carries a quoted delegated puzzle to rewrite");
+        CoinSpend {
+            solution: node_to_bytes(&allocator, rewritten)
+                .expect("a serializable solution")
+                .into(),
+            ..spend.clone()
+        }
+    }
+
+    /// The recursive half of [`with_malleable_delegated_puzzle`]: find the
+    /// `((q . melt_conditions) delegated_solution . rest)` shape anywhere in the solution tree and
+    /// rebuild it as `(1 conditions . rest)`. Identifying the target by its QUOTED MELT CONDITIONS
+    /// (not merely by being a quote pair) keeps the rewrite from landing on unrelated quoted data.
+    fn rewrite_delegated_puzzle(
+        allocator: &mut Allocator,
+        node: clvmr::NodePtr,
+        replacement: &Option<Conditions>,
+    ) -> Option<clvmr::NodePtr> {
+        let clvmr::SExp::Pair(first, rest) = allocator.sexp(node) else {
+            return None;
+        };
+
+        if let clvmr::SExp::Pair(quote_op, quoted) = allocator.sexp(first) {
+            let quotes_a_melt = allocator.small_number(quote_op) == Some(1)
+                && Vec::<Condition>::from_clvm(allocator, quoted).is_ok_and(|conditions| {
+                    conditions
+                        .iter()
+                        .any(|c| matches!(c, Condition::MeltSingleton(_)))
+                });
+            if quotes_a_melt {
+                if let clvmr::SExp::Pair(_delegated_solution, tail) = allocator.sexp(rest) {
+                    let conditions = match replacement {
+                        Some(replacement) => replacement
+                            .clone()
+                            .to_clvm(allocator)
+                            .expect("encodable replacement conditions"),
+                        None => quoted,
+                    };
+                    let identity = allocator.new_small_number(1).ok()?;
+                    let solution_and_rest = allocator.new_pair(conditions, tail).ok()?;
+                    return allocator.new_pair(identity, solution_and_rest).ok();
+                }
+            }
+        }
+
+        if let Some(rewritten) = rewrite_delegated_puzzle(allocator, first, replacement) {
+            return allocator.new_pair(rewritten, rest).ok();
+        }
+        let rewritten = rewrite_delegated_puzzle(allocator, rest, replacement)?;
+        allocator.new_pair(first, rewritten).ok()
+    }
+
+    /// The AGG_SIG_ME message a spend's outer conditions carry — the delegated-puzzle tree hash the
+    /// user's key would actually sign over.
+    fn signed_message(spend: &CoinSpend) -> [u8; 32] {
+        let mut allocator = Allocator::new();
+        let puzzle = node_from_bytes(&mut allocator, &spend.puzzle_reveal).expect("a valid puzzle");
+        let solution = node_from_bytes(&mut allocator, &spend.solution).expect("a valid solution");
+        let conditions = run_conditions(&mut allocator, puzzle, solution).expect("a running spend");
+        sole_agg_sig_me_message(&conditions).expect("a lone AGG_SIG_ME")
+    }
+
+    /// **THE malleability test (#3068 CRITICAL#3).** A melt whose signed delegated puzzle is the
+    /// non-quote identity atom `1` emits the honest melt conditions under the solution PRESENTED —
+    /// so every outer-condition check passes — while the signature it releases is a blank cheque
+    /// over the coin, reusable with any other solution. It must be REFUSED on the ground that the
+    /// signed puzzle does not pin its conditions.
+    #[test]
+    fn a_melt_whose_signed_delegated_puzzle_is_solution_malleable_is_refused() {
+        let honest = store_melt();
+        let malleable: Vec<CoinSpend> = honest
+            .iter()
+            .map(|spend| with_malleable_delegated_puzzle(spend, None))
+            .collect();
+
+        let err = analyze(&malleable)
+            .expect_err("a signature that does not pin its conditions must never be released");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+        assert!(
+            err.message.contains("quote-form") || err.message.contains("canonical quote form"),
+            "the refusal must name the unpinned delegated puzzle, not an incidental failure: {}",
+            err.message
+        );
+    }
+
+    /// The control that makes the test above load-bearing rather than a coincidence: the malleable
+    /// spend and the honest one emit the SAME outer conditions, differing only in the 32 opaque
+    /// bytes of the `AGG_SIG_ME` message — a delegated-puzzle tree hash the outer layer has no
+    /// independent expectation for, because the melt arm cannot derive it (the DID/DataLayer stacks
+    /// between the singleton and its p2 layer are deliberately unmodelled, which is why
+    /// [`committed_melt_conditions`] recovers it by preimage instead).
+    ///
+    /// So no outer-conditions check can separate these two spends. The refusal must come from
+    /// descending into the signed delegated puzzle, and relocating that inspection outwards would
+    /// make it disappear.
+    #[test]
+    fn the_malleable_melt_differs_from_the_honest_one_only_in_bytes_the_outer_layer_cannot_judge() {
+        let honest = store_melt();
+        let honest_spend = honest
+            .iter()
+            .find(|spend| {
+                let mut allocator = Allocator::new();
+                node_from_bytes(&mut allocator, &spend.puzzle_reveal)
+                    .ok()
+                    .and_then(|ptr| Puzzle::parse(&allocator, ptr).into())
+                    .is_some_and(is_singleton_puzzle)
+            })
+            .expect("the melt bundle contains the singleton spend");
+        let malleable = with_malleable_delegated_puzzle(honest_spend, None);
+
+        // Everything the outer layer can actually JUDGE: the conditions, with the one opaque
+        // delegated-puzzle hash replaced by the signer's public key (which is judgeable, and equal).
+        let judgeable = |spend: &CoinSpend| {
+            let mut allocator = Allocator::new();
+            let puzzle =
+                node_from_bytes(&mut allocator, &spend.puzzle_reveal).expect("a valid puzzle");
+            let solution =
+                node_from_bytes(&mut allocator, &spend.solution).expect("a valid solution");
+            run_conditions(&mut allocator, puzzle, solution)
+                .expect("a running spend")
+                .iter()
+                .map(|condition| match condition {
+                    Condition::AggSigMe(sig) => format!("AggSigMe({:?})", sig.public_key),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            judgeable(honest_spend),
+            judgeable(&malleable),
+            "the malleable variant must be outwardly identical everywhere the outer layer can form \
+             an expectation, or this fixture proves nothing about where the check has to live"
+        );
+        assert_ne!(
+            signed_message(honest_spend),
+            signed_message(&malleable),
+            "the two DO differ in the signed hash — but only there, and the melt arm has no \
+             independently derived value to compare it against"
+        );
+        assert_ne!(
+            honest_spend.solution, malleable.solution,
+            "the variants must actually differ, in the solution rather than in what it emits"
+        );
+        assert!(
+            analyze(&honest).is_ok(),
+            "the honest melt must remain signable — a guard that refuses everything is not a guard"
+        );
+    }
+
+    /// The exploit's second leg, and the answer to "are transfers still refused under a CRAFTED
+    /// solution rather than a presented one": the SAME malleable delegated puzzle, replayed with an
+    /// attacker's solution, re-homes the singleton under an odd-amount `CREATE_COIN` — and the
+    /// signature covering it is byte-identical to the one the honest-looking variant would release.
+    #[test]
+    fn a_crafted_malleable_solution_that_re_homes_the_singleton_is_refused() {
+        use chia_puzzle_types::Memos;
+
+        let attacker_ph = Bytes32::new([0xaa; 32]);
+        let honest = store_melt();
+        let re_homing: Vec<CoinSpend> = honest
+            .iter()
+            .map(|spend| {
+                with_malleable_delegated_puzzle(
+                    spend,
+                    Some(Conditions::new().create_coin(attacker_ph, 1, Memos::None)),
+                )
+            })
+            .collect();
+        let benign: Vec<CoinSpend> = honest
+            .iter()
+            .map(|spend| with_malleable_delegated_puzzle(spend, None))
+            .collect();
+
+        for (crafted, benign) in re_homing.iter().zip(benign.iter()) {
+            assert_eq!(
+                signed_message(crafted),
+                signed_message(benign),
+                "ONE signature must cover both solutions, or the replay this guard exists for is \
+                 not what the fixture builds"
+            );
+        }
+
+        let err = analyze(&re_homing)
+            .expect_err("a spend that re-homes the singleton to an attacker must be refused");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    /// A melt whose outer conditions carry NO `AGG_SIG_ME` binds no signature to this coin, so it
+    /// can be appended to any bundle and have its destroyed mojos land in someone else's displayed
+    /// fee. The shared reader refuses it, which is what the melt arm relies on.
+    #[test]
+    fn a_melt_with_no_agg_sig_me_is_refused() {
+        let err = sole_agg_sig_me_message(&[Condition::melt_singleton()])
+            .expect_err("zero AGG_SIG_ME authorizes nothing and must never be admitted");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    /// The condition allowlist is default-DENY: an opcode outside it — here a coin announcement the
+    /// melt does not need — is refused rather than waved through carrying the user's signature.
+    #[test]
+    fn a_melt_condition_outside_the_allowlist_is_refused() {
+        reject_non_melt_condition(&Condition::create_coin_announcement(vec![1, 2, 3].into()))
+            .expect_err("an unallowlisted condition must be refused, not tolerated");
+        reject_non_melt_condition(&Condition::melt_singleton())
+            .expect("the melt marker itself is allowlisted");
     }
 }
