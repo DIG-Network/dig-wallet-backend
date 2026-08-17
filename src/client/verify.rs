@@ -3418,9 +3418,10 @@ pub(crate) mod singleton_melt_tests {
         nft_mint_parts().1.info.launcher_id
     }
 
-    /// A SECOND mint's eve spend, descending from a launcher that is NOT spent in the bundle under
-    /// test — the foreign-descent fixture for the eve half of the mint binding.
-    fn foreign_eve_spend() -> CoinSpend {
+    /// A SECOND, unrelated mint's coin spends — the source of every foreign-descent fixture, so
+    /// both halves of the mint binding are tested against ONE builder rather than two that could
+    /// drift.
+    fn foreign_mint_spends() -> Vec<CoinSpend> {
         use chia_puzzle_types::nft::NftMetadata;
         use chia_wallet_sdk::driver::{Launcher, NftMint, StandardLayer};
 
@@ -3438,8 +3439,12 @@ pub(crate) mod singleton_melt_tests {
         StandardLayer::new(owner_pk())
             .spend(&mut ctx, funding, mint_conditions)
             .expect("the funding coin spends under the standard layer");
-        let spends = ctx.take();
+        ctx.take()
+    }
 
+    /// The SECOND mint's eve spend — foreign descent for the eve half of the mint binding.
+    fn foreign_eve_spend() -> CoinSpend {
+        let spends = foreign_mint_spends();
         let launcher_id = spends
             .iter()
             .find(|spend| spend.coin.puzzle_hash == Bytes32::new(SINGLETON_LAUNCHER_HASH))
@@ -3788,9 +3793,52 @@ pub(crate) mod singleton_melt_tests {
         let err = analyze(&spends)
             .expect_err("a launcher this bundle did not create must not ride along");
         assert!(
-            err.message.contains("did not create the launcher")
-                || err.message.contains("creates no launcher output"),
-            "the refusal must name the missing launcher provenance: {}",
+            err.message.contains("creates no launcher output"),
+            "the refusal must name the unfunded mint: {}",
+            err.message
+        );
+    }
+
+    /// The SECOND launcher edge, isolated: a bundle that DOES create a launcher output, but whose
+    /// launcher SPEND descends from a coin outside the bundle.
+    ///
+    /// Two hops are what make this test see anything. With a single mint the two launcher guards
+    /// are indistinguishable — remove the funding coin and both "no launcher output was created"
+    /// and "the launcher's parent is not spent here" become true at once, so the test above pins
+    /// only the first and a relocation of the second would keep it green. Here one mint's funding
+    /// coin supplies a REAL launcher output while a DIFFERENT mint's launcher and eve spends ride
+    /// along, so the first guard is satisfied and only the parent check can refuse.
+    #[test]
+    fn a_launcher_whose_parent_is_outside_the_bundle_is_refused() {
+        let launcher_hash = Bytes32::new(SINGLETON_LAUNCHER_HASH);
+
+        // Mint A contributes ONLY its funding coin — which creates a launcher output, satisfying
+        // the "this bundle funds a mint" guard.
+        let funding = nft_mint()
+            .into_iter()
+            .find(|spend| spend.coin == nft_funding_coin())
+            .expect("the mint bundle funds itself from an ordinary wallet coin");
+
+        // Mint B contributes its launcher + eve, whose parent chain leads outside this bundle.
+        let foreign_mint = foreign_mint_spends();
+        let foreign_launcher = foreign_mint
+            .iter()
+            .find(|spend| spend.coin.puzzle_hash == launcher_hash)
+            .expect("the second mint spends a launcher")
+            .clone();
+        assert!(
+            foreign_launcher.coin.parent_coin_info != funding.coin.coin_id(),
+            "the fixture is only two-hop if the foreign launcher descends from a DIFFERENT coin"
+        );
+
+        let spends = vec![funding, foreign_launcher];
+        let err = analyze(&spends).expect_err(
+            "a launcher whose parent this bundle never spends must be refused even when the \
+             bundle does create a launcher output of its own",
+        );
+        assert!(
+            err.message.contains("did not create the launcher"),
+            "the refusal must name the launcher's foreign parent, not the funding guard: {}",
             err.message
         );
     }
@@ -3840,9 +3888,8 @@ pub(crate) mod singleton_melt_tests {
         let err =
             analyze(&nft_melt()).expect_err("melting an NFT is not one of the two signable acts");
         assert!(
-            err.message.contains("outside the re-home allowlist")
-                || err.message.contains("does not re-home the singleton"),
-            "the refusal must come from the NFT arm, not the melt arm: {}",
+            err.message.contains("outside the re-home allowlist"),
+            "the refusal must come from the NFT arm's allowlist, not the melt arm: {}",
             err.message
         );
     }
