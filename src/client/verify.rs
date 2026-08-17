@@ -125,6 +125,13 @@ pub struct SpendEffect {
     /// conditions; for an OPTION (transfer) bundle, the IMPLICIT fee `inputs − outputs` (the option
     /// builders emit no `RESERVE_FEE`).
     pub fee: u64,
+    /// The coin id of every singleton this bundle permanently DESTROYS (dig_ecosystem#3068).
+    ///
+    /// A melt creates no coin, so it is invisible in [`outputs`](Self::outputs) and shows up in
+    /// [`fee`](Self::fee) only as the singleton's lone mojo — which is why it must be named here.
+    /// Without it, a melt of the user's DID appended to an ordinary send is reviewable only as a fee
+    /// one mojo larger, and the person would confirm a send while destroying an identity.
+    pub melted_singletons: Vec<Bytes32>,
 }
 
 /// True when `puzzle_hash` is a recognized canonical STRUCTURAL puzzle hash the wallet may commit
@@ -162,6 +169,12 @@ struct SpendLedger {
     /// coin in the bundle: the melted total is an explicitly accounted sink, never a relaxation of
     /// the equality.
     melted: u64,
+    /// The coin id of every singleton this bundle DESTROYS (→ [`SpendEffect::melted_singletons`]).
+    ///
+    /// Kept beside [`melted`](Self::melted) rather than folded into it because the mojo total and the
+    /// identity destroyed are different facts to a human: one melt of one mojo can end a DID, and the
+    /// person confirming needs to see WHICH lineage ends, not a fee a mojo larger.
+    melted_singletons: Vec<Bytes32>,
     /// XCH value entering the spend (standard / settlement / option-singleton coin amounts).
     xch_in: u64,
     /// XCH value leaving the spend via `CREATE_COIN`.
@@ -184,6 +197,7 @@ impl SpendLedger {
             protocol_sink: Vec::new(),
             fee: 0,
             melted: 0,
+            melted_singletons: Vec::new(),
             xch_in: 0,
             xch_out: 0,
             cat_in: BTreeMap::new(),
@@ -305,6 +319,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
         outputs: ledger.outputs,
         protocol_sink: ledger.protocol_sink,
         fee: effective_fee,
+        melted_singletons: ledger.melted_singletons,
     })
 }
 
@@ -741,6 +756,9 @@ fn account_singleton_melt(
     // keeps the bundle's conservation equality exact rather than merely tolerant.
     ledger.xch_in = accumulate(ledger.xch_in, spend.coin.amount, "XCH input total")?;
     ledger.melted = accumulate(ledger.melted, spend.coin.amount, "melted total")?;
+    // Name the destroyed lineage, not just its mojos: the review surface has no other way to show
+    // that this bundle ends a DID or a dig-store (#3068).
+    ledger.melted_singletons.push(spend.coin.coin_id());
     Ok(())
 }
 
@@ -857,7 +875,12 @@ fn is_option_bundle(allocator: &mut Allocator, coin_spends: &[CoinSpend]) -> Wal
 /// wallet-owned change. Never use `derive_summary` ahead of signing — it is display-only.
 pub fn derive_summary(coin_spends: &[CoinSpend]) -> WalletResult<TransactionSummary> {
     let effect = analyze(coin_spends)?;
-    summarize_egress(&effect.outputs, &effect.protocol_sink, effect.fee)
+    summarize_egress(
+        &effect.outputs,
+        &effect.protocol_sink,
+        effect.fee,
+        &effect.melted_singletons,
+    )
 }
 
 /// Render the outputs LEAVING the wallet — `egress` (to real addresses) plus `protocol_sink` (to a
@@ -874,6 +897,7 @@ pub fn summarize_egress(
     egress: &[DecodedOutput],
     protocol_sink: &[DecodedOutput],
     fee: u64,
+    melted_singletons: &[Bytes32],
 ) -> WalletResult<TransactionSummary> {
     let mut outputs = egress
         .iter()
@@ -909,6 +933,9 @@ pub fn summarize_egress(
         // review renderer from the reviewed spend's own summary (#2241).
         received: Vec::new(),
         fee: Amount(fee),
+        // Destruction is egress of a kind no address can express, so it travels as its own field
+        // rather than as an output line the recipient gate would then have to except.
+        melted_singletons: melted_singletons.iter().map(hex::encode).collect(),
     })
 }
 
@@ -2248,7 +2275,7 @@ mod tests {
 /// Two singleton kinds, deliberately: their inner layer stacks differ (a `DidLayer` versus the
 /// DataLayer metadata layers), so a fixture of only one would prove the arm accepts that one stack.
 #[cfg(test)]
-mod singleton_melt_tests {
+pub(crate) mod singleton_melt_tests {
     use super::*;
     use chia_protocol::Coin;
     use chia_puzzle_types::standard::StandardArgs;
@@ -2280,7 +2307,10 @@ mod singleton_melt_tests {
     }
 
     /// A real DIG store singleton melt, built by `dig_merkle::melt`.
-    fn store_melt() -> Vec<CoinSpend> {
+    ///
+    /// `pub(crate)` so the signer's review-gate tests melt a REAL singleton through the real builder
+    /// rather than a second, drifting copy of this fixture.
+    pub(crate) fn store_melt() -> Vec<CoinSpend> {
         let store = dig_merkle::mint_datastore(
             Coin::new(Bytes32::new([0x11; 32]), owner_ph(), 1),
             dig_merkle::Owner::Standard(owner_pk()),

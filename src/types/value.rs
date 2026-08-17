@@ -113,6 +113,18 @@ pub struct TransactionSummary {
     pub received: Vec<SpendOutput>,
     /// The fee paid to the farmer.
     pub fee: Amount,
+    /// The lowercase-hex coin id of every singleton the spend permanently DESTROYS — a profile's DID
+    /// or dig-store ended by a terminal melt (dig_ecosystem#3068).
+    ///
+    /// Destruction is the one effect no [`outputs`](Self::outputs) line can express: a melt creates
+    /// no coin and moves the fee by the singleton's lone mojo. Naming it here is what lets the
+    /// confirm screen show it and the signing gate compare it, so a melt cannot ride an ordinary
+    /// send disguised as a fee one mojo larger.
+    ///
+    /// Additive (`#[serde(default)]`) so older wire payloads without the field still deserialize —
+    /// an absent field means "this spend destroys nothing", which the gate then holds it to.
+    #[serde(default)]
+    pub melted_singletons: Vec<String>,
 }
 
 impl TransactionSummary {
@@ -125,6 +137,7 @@ impl TransactionSummary {
             outputs,
             received: Vec::new(),
             fee,
+            melted_singletons: Vec::new(),
         }
     }
 }
@@ -181,6 +194,7 @@ mod tests {
     #[test]
     fn records_round_trip() {
         let summary = TransactionSummary {
+            melted_singletons: Vec::new(),
             received: vec![],
             outputs: vec![SpendOutput {
                 address: Address("xch1abc".into()),

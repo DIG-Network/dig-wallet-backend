@@ -154,6 +154,7 @@ impl OptionBuilder for SdkSpendBuilder {
             coin_spends,
             required_signatures,
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 outputs: vec![SpendOutput {
                     address: encode_address(owner_ph)?,
                     amount: underlying_amount,
@@ -215,6 +216,7 @@ impl OptionBuilder for SdkSpendBuilder {
             coin_spends,
             required_signatures,
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 outputs: vec![SpendOutput {
                     address: encode_address(destination)?,
                     amount: Amount(created.option.coin.amount),
@@ -282,6 +284,7 @@ impl OptionBuilder for SdkSpendBuilder {
             coin_spends,
             required_signatures,
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 outputs: vec![SpendOutput {
                     address: encode_address(creator_ph)?,
                     amount: Amount(strike_amount),

@@ -229,6 +229,7 @@ impl SdkSpendBuilder {
             coin_spends,
             required_signatures,
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 outputs: vec![SpendOutput {
                     address: encode_address(recipient_ph)?,
                     amount,

@@ -59,6 +59,10 @@ struct OwnedSplit {
     protocol_sink: Vec<DecodedOutput>,
     /// The farmer fee (XCH mojos).
     fee: u64,
+    /// The coin id of every singleton the spend permanently DESTROYS. Ownership-independent: a melt
+    /// has no destination to own, and destroying a singleton this wallet does NOT control is if
+    /// anything more alarming, so every melt is carried through to the review gate.
+    melted_singletons: Vec<Bytes32>,
 }
 
 /// The Chia mainnet genesis challenge — the AGG_SIG_ME additional data every mainnet spend
@@ -317,6 +321,7 @@ impl LocalSigner {
             recipients,
             protocol_sink: effect.protocol_sink,
             fee: effect.fee,
+            melted_singletons: effect.melted_singletons,
         }
     }
 
@@ -329,7 +334,12 @@ impl LocalSigner {
         coin_spends: &[chia_protocol::CoinSpend],
     ) -> WalletResult<TransactionSummary> {
         let split = self.reclassify_by_ownership(verify::analyze(coin_spends)?);
-        verify::summarize_egress(&split.recipients, &split.protocol_sink, split.fee)
+        verify::summarize_egress(
+            &split.recipients,
+            &split.protocol_sink,
+            split.fee,
+            &split.melted_singletons,
+        )
     }
 
     /// Decode an unsigned spend for the pre-sign CONSENT prompt — the human-readable screen the user
@@ -386,6 +396,28 @@ impl LocalSigner {
 
         if claimed.fee.mojos() != split.fee {
             return Err(mismatch("fee"));
+        }
+
+        // Destruction is the effect no output line can express, and the one a fee comparison cannot
+        // catch: a melt of the user's DID appended to an ordinary send moves the fee by the
+        // singleton's lone mojo and nothing else (#3068). So the destroyed lineages are compared as
+        // their own sorted multiset, and a spend that melts a singleton the human's summary never
+        // named is refused — which is exactly the bundle this crate could not build before the melt
+        // arm existed.
+        let mut derived_melts: Vec<String> = split
+            .melted_singletons
+            .iter()
+            .map(|coin_id| hex::encode(coin_id.as_ref()))
+            .collect();
+        let mut reviewed_melts: Vec<String> = claimed
+            .melted_singletons
+            .iter()
+            .map(|coin_id| coin_id.trim_start_matches("0x").to_ascii_lowercase())
+            .collect();
+        derived_melts.sort();
+        reviewed_melts.sort();
+        if derived_melts != reviewed_melts {
+            return Err(mismatch("destroyed singletons"));
         }
 
         // The recipient set: derived recipients (real puzzle hashes) vs the claimed outputs carrying a
@@ -716,6 +748,7 @@ mod tests {
 
     fn empty_summary() -> TransactionSummary {
         TransactionSummary {
+            melted_singletons: Vec::new(),
             received: vec![],
             outputs: vec![],
             fee: Amount(0),
@@ -1401,6 +1434,7 @@ mod tests {
                 message: bound_message("settlement"),
             }],
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 received: vec![],
                 outputs: vec![SpendOutput {
                     address: crate::types::Address("xch1whatever".into()),
@@ -1454,6 +1488,7 @@ mod tests {
             coin_spends,
             required_signatures: vec![],
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 received: vec![],
                 outputs: vec![],
                 fee: Amount(0),
@@ -1562,6 +1597,7 @@ mod tests {
             coin_spends,
             required_signatures: vec![],
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 received: vec![],
                 outputs: vec![],
                 fee: Amount(0),
@@ -2109,6 +2145,7 @@ mod tests {
             coin_spends: coin_spends.clone(),
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 received: vec![],
                 outputs: vec![SpendOutput {
                     address: xch_addr(honest),
@@ -2130,6 +2167,7 @@ mod tests {
             coin_spends: coin_spends.clone(),
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 received: vec![],
                 outputs: vec![
                     SpendOutput {
@@ -2473,6 +2511,95 @@ mod tests {
             .expect("the maker's cancel reclaim must settle on the simulator");
     }
 
+    /// **The melt-visibility gate (#3068).** Admitting terminal singleton melts created a spend
+    /// class the human review surface could not express: a melt has no recipient and no output, and
+    /// its whole footprint in the reviewed figures is a fee ONE MOJO larger. So a melt of the user's
+    /// DID or dig-store, appended to an ordinary send, would be confirmed as that send.
+    ///
+    /// The dishonest bundle here is exactly that. Its control is byte-identical — same coin spends,
+    /// same recipients, same fee of 1 — and differs ONLY in naming the destroyed singleton, so this
+    /// fixture cannot pass on the strength of the fee comparison that already existed.
+    #[cfg(feature = "engine")]
+    #[test]
+    fn a_singleton_melt_hidden_in_an_ordinary_send_is_refused() {
+        use crate::types::{Amount, SpendOutput, TransactionSummary};
+
+        let recipient = Bytes32::new([0x6b; 32]);
+        let (signer, mut coin_spends) =
+            wallet_xch_spend("melt-hidden", 50_000, &[(recipient, 50_000, false)], false);
+
+        let melt = crate::client::verify::singleton_melt_tests::store_melt();
+        let destroyed = melt
+            .iter()
+            .find(|spend| spend.coin.amount == 1)
+            .expect("the melt bundle spends the singleton's lone odd mojo")
+            .coin
+            .coin_id();
+        coin_spends.extend(melt);
+
+        let send_line = SpendOutput {
+            address: xch_addr(recipient),
+            amount: Amount(50_000),
+            asset_id: None,
+        };
+        let unsigned = |melted_singletons: Vec<String>| UnsignedSpend {
+            coin_spends: coin_spends.clone(),
+            required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
+            summary: TransactionSummary {
+                outputs: vec![send_line.clone()],
+                received: vec![],
+                // The destroyed mojo IS reported as a fee, so a fee-only comparison is satisfied by
+                // the dishonest claim too — which is the whole reason destruction needs a field.
+                fee: Amount(1),
+                melted_singletons,
+            },
+        };
+
+        let err = signer.sign_unsigned(&unsigned(Vec::new())).expect_err(
+            "a spend that destroys a singleton the summary never named must be refused",
+        );
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+        assert!(
+            err.message.contains("destroyed singletons"),
+            "the refusal must name the unreviewed destruction, not an incidental mismatch: {}",
+            err.message
+        );
+
+        // The control is asserted at the REVIEW gate rather than through `sign_unsigned`, because the
+        // melted singleton is owned by the fixture's foreign key: signing it would fail for want of a
+        // key, which says nothing about whether the review surface accepts a named destruction.
+        signer
+            .verify_before_signing(&unsigned(vec![hex::encode(destroyed.as_ref())]))
+            .expect("the SAME bundle, with the destruction named, must pass the review gate");
+    }
+
+    /// The confirm screen must SHOW the destruction, not merely refuse an unnamed one: a gate whose
+    /// only remedy is a line the renderer never draws moves the lie from the signer to the screen.
+    #[test]
+    fn the_confirm_screen_names_every_destroyed_singleton() {
+        use crate::types::{Amount, TransactionSummary};
+
+        let unsigned = UnsignedSpend {
+            coin_spends: vec![],
+            required_signatures: vec![],
+            summary: TransactionSummary {
+                outputs: vec![],
+                received: vec![],
+                fee: Amount(1),
+                melted_singletons: vec!["ab".repeat(32)],
+            },
+        };
+
+        let rendered = review::render(&unsigned, &unsigned.summary, true);
+        assert_eq!(rendered.melt_lines.len(), 1, "one destruction, one line");
+        assert!(
+            rendered.melt_lines[0].contains(&"ab".repeat(32))
+                && rendered.melt_lines[0].contains("DESTROY"),
+            "the line must name WHAT is destroyed and say so plainly: {}",
+            rendered.melt_lines[0]
+        );
+    }
+
     /// Hand-build a standard-layer XCH spend of `label`'s wallet coin emitting `outputs` (each
     /// `(puzzle_hash, amount, hinted)`), returning the canonical signer + coin spends. When `bind` is
     /// set a benign `ASSERT_CONCURRENT_SPEND` is appended so a settlement egress satisfies the MR-6
@@ -2669,6 +2796,7 @@ mod tests {
             coin_spends: vec![bad_spend],
             required_signatures: vec![],
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 received: vec![],
                 outputs: vec![SpendOutput {
                     address: Address("xch1attacker".into()),
@@ -2731,6 +2859,7 @@ mod tests {
             coin_spends: coin_spends.clone(),
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 received: vec![],
                 outputs: vec![SpendOutput {
                     address: crate::types::Address(String::new()),
@@ -2755,6 +2884,7 @@ mod tests {
             coin_spends: real_spends.clone(),
             required_signatures: signer2.required_signatures_from(&real_spends).unwrap(),
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 received: vec![],
                 outputs: vec![SpendOutput {
                     address: crate::types::Address(String::new()),
@@ -2801,6 +2931,7 @@ mod tests {
             coin_spends: coin_spends.clone(),
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 received: vec![],
                 outputs: vec![SpendOutput {
                     address: crate::types::Address(String::new()),
@@ -2821,6 +2952,7 @@ mod tests {
             coin_spends: coin_spends.clone(),
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 received: vec![],
                 outputs: vec![
                     SpendOutput {
@@ -2853,6 +2985,7 @@ mod tests {
         use crate::types::{Amount, SpendOutput, TransactionSummary};
 
         let sink_summary = || TransactionSummary {
+            melted_singletons: Vec::new(),
             received: vec![],
             outputs: vec![SpendOutput {
                 address: crate::types::Address(String::new()),
@@ -2927,6 +3060,7 @@ mod tests {
         let attacker = Bytes32::new([0x6e; 32]);
         let signer = canonical_mainnet_signer("mr8");
         let empty = TransactionSummary {
+            melted_singletons: Vec::new(),
             received: vec![],
             outputs: vec![],
             fee: Amount(0),
