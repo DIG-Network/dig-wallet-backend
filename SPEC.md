@@ -431,6 +431,43 @@ Used by dig-app. The subscriber + identity provider + signer.
   #2243) and **exercise** — `analyze` detects an exercise bundle by its `P2OneOfManyLayer` underlying
   leg and refuses it, because the unlocked underlying's reclaim to the holder is not consensus-forced
   (deferred to #2245; see below).
+- **NFT TRANSFER and NFT MINT (dig_ecosystem#3077).** An NFT is `SINGLETON_TOP_LAYER_V1_1`-wrapped, so
+  its arms are placed AFTER the option-singleton arms — option semantics are unchanged — and BEFORE the
+  terminal-melt arm, which would otherwise swallow every NFT spend. Exactly two acts are signable.
+
+  **TRANSFER (signed).** A coin spend that `Nft::parse` decodes with a `Proof::Lineage`. Its inner p2
+  MUST be a standard layer; anything else is refused before its conditions are trusted. Admission is
+  decided over the artifact the signature commits to, exactly as for a melt: the delegated puzzle MUST
+  be the canonical QUOTE form, and the coin's SOLE `AGG_SIG_ME` MUST commit to that puzzle's tree hash.
+  BOTH the SIGNED (quoted) conditions and the OUTER run conditions are held to a default-DENY re-home
+  allowlist. Judging the outer list alone is INSUFFICIENT and MUST NOT be relied on: the NFT state layer
+  CONSUMES an `UPDATE_NFT_METADATA` and the ownership layer consumes a `TRANSFER_NFT` while re-emitting
+  the rest, so a metadata update and an owner assignment are invisible there and only their re-home
+  survives. The spend MUST emit EXACTLY ONE odd-amount `CREATE_COIN`, and its destination MUST NOT be a
+  structural (settlement / launcher) puzzle hash. `AGG_SIG_ME` is permitted in the OUTER list (the
+  standard layer's own) and MUST be refused in the SIGNED one.
+
+  **MINT (unsigned legs).** A mint additionally spends the singleton LAUNCHER coin and the EVE NFT
+  coin. Neither carries a signature — consensus authorizes them through the singleton lineage — so both
+  MUST be refused outright if any `AGG_SIG_*` condition appears, and both are held to the same
+  default-DENY allowlist (the launcher alone may CREATE its coin announcement). Each MUST emit exactly
+  one odd-amount `CREATE_COIN`. Because no key binds these legs to the wallet, the binding is
+  structural and is enforced at the BUNDLE level: the bundle MUST create a launcher-destined
+  `protocol_sink` output, every launcher coin's parent MUST be a coin the bundle spends, and every eve
+  coin's parent MUST be a launcher coin the bundle spends. Without those edges an unrelated
+  launcher/eve pair could ride along inside a bundle approved for something else.
+
+  Every OTHER NFT spend stays refused — a metadata update, an owner assignment / DID link, an offer
+  settlement lock, and a melt.
+
+  **Naming (normative).** An NFT transfer re-homes the singleton's lone mojo to itself and nets ~0 XCH,
+  so it is expressible in neither the output set nor the fee. Every NFT action MUST therefore be named
+  in `SpendEffect::nft_operations` and in `TransactionSummary::nft_operations` as a canonical
+  `"transfer nft1…"` / `"mint nft1…"` string keyed on the NFT's permanent LAUNCHER id, rendered by the
+  single function the confirm screen also uses so the reviewed sentence and the compared sentence
+  cannot drift. The signer MUST compare that set as a sorted multiset and refuse a bundle whose NFT
+  actions the reviewed summary does not name, exactly as it does for destroyed singletons.
+
 - **Terminal singleton MELT (profile deletion, dig_ecosystem#3068).** A coin spend whose puzzle is the
   singleton top layer (`SINGLETON_TOP_LAYER_V1_1_HASH`), reached only AFTER the option-singleton and
   `P2OneOfManyLayer` arms so option semantics are unchanged, is accounted when and only when it is
