@@ -193,6 +193,7 @@ impl OfferBuilder {
         self.finish_unsigned(
             unsigned_cancel.coin_spends,
             TransactionSummary {
+                melted_singletons: Vec::new(),
                 outputs: vec![],
                 received: vec![],
                 fee: crate::types::Amount(fee),
@@ -496,6 +497,7 @@ fn make_summary(
     }
 
     TransactionSummary {
+        melted_singletons: Vec::new(),
         outputs,
         received,
         fee: crate::types::Amount(fee),
@@ -539,6 +541,7 @@ fn taker_summary(
         }
     }
     Ok(TransactionSummary {
+        melted_singletons: Vec::new(),
         outputs,
         // A take's received leg (the maker's offered assets returning to the taker's change address)
         // is out of scope for #2241, which surfaces only the MAKE's received leg.

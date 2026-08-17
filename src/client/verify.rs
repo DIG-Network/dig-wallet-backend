@@ -63,7 +63,9 @@ use chia_protocol::{Bytes32, CoinSpend};
 use chia_wallet_sdk::driver::{
     Cat, Layer, OptionContract, P2OneOfManyLayer, Puzzle, SettlementLayer, StandardLayer,
 };
-use chia_wallet_sdk::puzzles::{SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH};
+use chia_wallet_sdk::puzzles::{
+    SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH, SINGLETON_TOP_LAYER_V1_1_HASH,
+};
 use chia_wallet_sdk::types::{run_puzzle, Condition};
 use chia_wallet_sdk::utils::Address as Bech32Address;
 use clvm_traits::FromClvm;
@@ -123,6 +125,13 @@ pub struct SpendEffect {
     /// conditions; for an OPTION (transfer) bundle, the IMPLICIT fee `inputs − outputs` (the option
     /// builders emit no `RESERVE_FEE`).
     pub fee: u64,
+    /// The coin id of every singleton this bundle permanently DESTROYS (dig_ecosystem#3068).
+    ///
+    /// A melt creates no coin, so it is invisible in [`outputs`](Self::outputs) and shows up in
+    /// [`fee`](Self::fee) only as the singleton's lone mojo — which is why it must be named here.
+    /// Without it, a melt of the user's DID appended to an ordinary send is reviewable only as a fee
+    /// one mojo larger, and the person would confirm a send while destroying an identity.
+    pub melted_singletons: Vec<Bytes32>,
 }
 
 /// True when `puzzle_hash` is a recognized canonical STRUCTURAL puzzle hash the wallet may commit
@@ -151,6 +160,21 @@ struct SpendLedger {
     protocol_sink: Vec<DecodedOutput>,
     /// The explicit `RESERVE_FEE` total (the strict-path fee).
     fee: u64,
+    /// Mojos DESTROYED by a terminal singleton melt (dig_ecosystem#3068).
+    ///
+    /// A melted singleton's amount enters the spend and leaves it via no `CREATE_COIN` at all — the
+    /// `MELT_SINGLETON` magic condition occupies the one odd-amount output slot the puzzle permits,
+    /// so the mojo is unrecoverable by construction and consensus absorbs it as an implicit fee.
+    /// Tracked separately from [`fee`](Self::fee) so strict conservation still holds over every OTHER
+    /// coin in the bundle: the melted total is an explicitly accounted sink, never a relaxation of
+    /// the equality.
+    melted: u64,
+    /// The coin id of every singleton this bundle DESTROYS (→ [`SpendEffect::melted_singletons`]).
+    ///
+    /// Kept beside [`melted`](Self::melted) rather than folded into it because the mojo total and the
+    /// identity destroyed are different facts to a human: one melt of one mojo can end a DID, and the
+    /// person confirming needs to see WHICH lineage ends, not a fee a mojo larger.
+    melted_singletons: Vec<Bytes32>,
     /// XCH value entering the spend (standard / settlement / option-singleton coin amounts).
     xch_in: u64,
     /// XCH value leaving the spend via `CREATE_COIN`.
@@ -172,6 +196,8 @@ impl SpendLedger {
             outputs: Vec::new(),
             protocol_sink: Vec::new(),
             fee: 0,
+            melted: 0,
+            melted_singletons: Vec::new(),
             xch_in: 0,
             xch_out: 0,
             cat_in: BTreeMap::new(),
@@ -234,6 +260,18 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
     //   IS the implicit fee. `out > in` (a mint) is still refused (checked_sub). The implicit fee is
     //   compared to the reviewed `summary.fee` by the signer (an MR-11-style implicit-fee guard).
     let effective_fee = if option_mode {
+        // A melt is accounted by the STRICT equality below, which names `melted` explicitly; the
+        // implicit-fee mode does not reference it at all, so a melt riding an option bundle would
+        // get only implicit-fee treatment and its destroyed mojos would never be held to the
+        // equality. Rather than widen a second conservation mode, refuse the combination: no DIG
+        // flow melts a profile singleton inside an option bundle, and an attacker appending one is
+        // exactly what this closes.
+        if ledger.melted > 0 {
+            return Err(reject(
+                "a singleton melt appears in an option bundle, whose implicit-fee conservation \
+                 cannot account for destroyed value; refusing to sign",
+            ));
+        }
         ledger.xch_in.checked_sub(ledger.xch_out).ok_or_else(|| {
             reject(format!(
                 "option spend mints value: outputs {} exceed inputs {}",
@@ -242,13 +280,26 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
         })?
     } else {
         let xch_out_plus_fee = accumulate(ledger.xch_out, ledger.fee, "XCH output + fee total")?;
-        if ledger.xch_in != xch_out_plus_fee {
+        // A melted singleton's mojo is a THIRD accounted destination beside outputs and the explicit
+        // fee: it is destroyed rather than paid to a puzzle hash, so the equality must name it or a
+        // legitimate melt reads as a value leak. Naming it here — instead of switching the bundle to
+        // implicit-fee mode — keeps the strict equality binding on every other coin in the same
+        // bundle, so the coin paying a melt's network fee is still held to full conservation.
+        let accounted = accumulate(
+            xch_out_plus_fee,
+            ledger.melted,
+            "XCH output + fee + melted total",
+        )?;
+        if ledger.xch_in != accounted {
             return Err(reject(format!(
-                "XCH value not conserved: in {} != out+fee {xch_out_plus_fee}",
+                "XCH value not conserved: in {} != out+fee+melted {accounted}",
                 ledger.xch_in
             )));
         }
-        ledger.fee
+        // The destroyed mojos ARE a fee — consensus hands them to the farmer exactly as a
+        // `RESERVE_FEE` does — so the reviewed figure must include them rather than silently
+        // omitting value the human is spending.
+        accumulate(ledger.fee, ledger.melted, "reported fee")?
     };
     // Conservation is checked in BOTH directions over the union of assets seen as inputs or outputs:
     // an output whose asset was never an input is a mint from thin air; an input asset with no (or a
@@ -268,6 +319,7 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
         outputs: ledger.outputs,
         protocol_sink: ledger.protocol_sink,
         fee: effective_fee,
+        melted_singletons: ledger.melted_singletons,
     })
 }
 
@@ -355,6 +407,14 @@ fn account_coin(
              not consensus-forced, so a compromised engine could strip it after the wallet funds \
              the strike (deferred to #2245); refusing to sign",
         ));
+    }
+
+    // A TERMINAL singleton spend — the profile-deletion path (dig_ecosystem#3068). Reached only
+    // AFTER the option arms above, so an option singleton is still judged by its own, stricter rules
+    // and this arm can never be used to launder an option exercise. Any singleton spend that is not
+    // a melt is refused inside the helper.
+    if is_singleton_puzzle(puzzle) {
+        return account_singleton_melt(ledger, allocator, spend, puzzle_ptr, solution_ptr);
     }
 
     // A standard-layer XCH coin: its run conditions carry the XCH outputs + the fee.
@@ -586,6 +646,122 @@ fn account_option_transfer(
     Ok(())
 }
 
+/// True when `puzzle` is the singleton top layer, whatever inner puzzle it wraps.
+///
+/// Deliberately shallow: the DID layer and the DataLayer metadata layers are DIG types this crate
+/// does not and must not know, and a melt's admissibility does not depend on which of them is
+/// inside. What is checked instead is the CLVM the coin actually commits to — see
+/// [`account_singleton_melt`].
+fn is_singleton_puzzle(puzzle: Puzzle) -> bool {
+    puzzle
+        .as_curried()
+        .is_some_and(|curried| curried.mod_hash == SINGLETON_TOP_LAYER_V1_1_HASH.into())
+}
+
+/// Account a TERMINAL singleton spend — a melt — and refuse every other singleton spend fail-closed
+/// (dig_ecosystem#3068).
+///
+/// # Why this arm exists
+///
+/// Deleting a DIG profile ends both of its singletons: the DID and the dig-store. Until this arm,
+/// [`analyze`] refused every singleton spend at the dispatch's closing arm, so no melt could ever be
+/// authorized and a profile could not be deleted at all.
+///
+/// # The admission test is the SIGNED melt marker, never the absence of outputs
+///
+/// Running the coin's own puzzle tells you what consensus does for THE SOLUTION PRESENTED. It does
+/// not tell you what the signature authorizes, and those are different questions: the standard layer
+/// signs `sha256tree(delegated_puzzle) || coin_id || genesis`, which commits to the delegated
+/// puzzle's TREE HASH but NOT to its solution (see [`committed_delegated_puzzle_message`]). A
+/// solution-malleable delegated puzzle therefore turns one signature into a reusable blank cheque
+/// over the coin: it can emit nothing under the solution presented for review and an odd-amount
+/// `CREATE_COIN` re-homing the user's DID or store to an attacker under another (#1058 CRITICAL#3).
+/// An outputs-are-absent test cannot see that, because absence is a property of the presented
+/// solution alone.
+///
+/// So the admission test is made POSITIVE and is applied to the artifact the signature actually
+/// commits to:
+///
+/// 1. The outer conditions must carry EXACTLY ONE `AGG_SIG_ME` ([`sole_agg_sig_me_message`]) — zero
+///    binds no signature to this coin, more than one launders a blank cheque.
+/// 2. That signature's message must be the tree hash of a QUOTED, solution-independent condition
+///    list found inside the coin's own solution ([`committed_melt_conditions`]). This is what closes
+///    the malleability break: a non-quote delegated puzzle is refused before its conditions are
+///    trusted.
+/// 3. Those COMMITTED conditions must contain exactly one `MELT_SINGLETON` and nothing outside the
+///    melt allowlist ([`reject_non_melt_condition`], which denies every `CREATE_COIN`).
+///
+/// The melt marker is unobservable in the OUTER conditions — the singleton top layer consumes
+/// `(51 () -113)` while morphing its inner puzzle's output — but it is plainly observable one layer
+/// down, in the quoted delegated puzzle, which is precisely the artifact the signature commits to.
+/// The outer-condition checks are kept as defence in depth, never as the admission test.
+///
+/// # Failing towards refusal
+///
+/// [`run_conditions`] decodes through `Vec::<Condition>::from_clvm`, which maps anything the SDK does
+/// not model onto a catch-all rather than erroring — so any predicate phrased as "I saw no bad
+/// condition" is broken by a lossy parser, and a `CREATE_COIN` encoding the SDK models more narrowly
+/// than consensus does would read as a melt. Both condition passes here are default-DENY allowlists
+/// and the melt marker must be positively COUNTED, so a condition this crate fails to model causes a
+/// refusal, never an admission.
+///
+/// Every other singleton spend stays refused, and that distinction is the whole guard: an ordinary
+/// store UPDATE or a DID TRANSFER recreates the singleton under a new owner puzzle hash, which is a
+/// transfer of the profile's identity. Admitting the singleton CLASS would have made those signable
+/// as a side effect. `a_singleton_spend_that_recreates_the_singleton_is_still_refused` holds that
+/// line.
+///
+/// # The destroyed mojo is not recoverable, and that is not a defect
+///
+/// `(51 () -113)` occupies the one odd-amount `CREATE_COIN` a singleton may emit, so a melt that also
+/// returned the mojo is unexpressible under the puzzle. It is accounted as an implicit fee, which is
+/// what consensus does with it.
+fn account_singleton_melt(
+    ledger: &mut SpendLedger,
+    allocator: &mut Allocator,
+    spend: &CoinSpend,
+    puzzle_ptr: clvmr::NodePtr,
+    solution_ptr: clvmr::NodePtr,
+) -> WalletResult<()> {
+    // Defence in depth, never the admission test: what consensus does for the solution PRESENTED.
+    let conditions = run_conditions(allocator, puzzle_ptr, solution_ptr)?;
+    for condition in &conditions {
+        reject_unexpected_agg_sig(condition)?;
+        reject_non_melt_condition(condition, MeltConditionList::Presented)?;
+    }
+
+    // THE admission test, over the artifact the signature commits to rather than the one solution a
+    // caller chose to present.
+    let committed_message = sole_agg_sig_me_message(&conditions)?;
+    let committed = committed_melt_conditions(allocator, solution_ptr, committed_message)?;
+
+    let mut melt_markers = 0usize;
+    for condition in &committed {
+        reject_unexpected_agg_sig(condition)?;
+        reject_non_melt_condition(condition, MeltConditionList::Signed)?;
+        if matches!(condition, Condition::MeltSingleton(_)) {
+            melt_markers += 1;
+        }
+    }
+    if melt_markers != 1 {
+        return Err(reject(format!(
+            "the signed delegated puzzle carries {melt_markers} MELT_SINGLETON conditions, not \
+             exactly one, so this signature does not authorize a terminal singleton spend; only a \
+             melt is signable (an update or transfer re-homes the singleton, which is a change of \
+             ownership no melt confirmation covers); refusing to sign"
+        )));
+    }
+
+    // The melted coin's amount both enters the spend and is destroyed by it. Recording both sides
+    // keeps the bundle's conservation equality exact rather than merely tolerant.
+    ledger.xch_in = accumulate(ledger.xch_in, spend.coin.amount, "XCH input total")?;
+    ledger.melted = accumulate(ledger.melted, spend.coin.amount, "melted total")?;
+    // Name the destroyed lineage, not just its mojos: the review surface has no other way to show
+    // that this bundle ends a DID or a dig-store (#3068).
+    ledger.melted_singletons.push(spend.coin.coin_id());
+    Ok(())
+}
+
 /// Account a standard-layer XCH send: enforce the sole-AGG_SIG_ME commitment, record its offer
 /// binding, sum its `RESERVE_FEE`, and route each `CREATE_COIN` as an XCH output.
 fn account_standard_send(
@@ -699,7 +875,12 @@ fn is_option_bundle(allocator: &mut Allocator, coin_spends: &[CoinSpend]) -> Wal
 /// wallet-owned change. Never use `derive_summary` ahead of signing — it is display-only.
 pub fn derive_summary(coin_spends: &[CoinSpend]) -> WalletResult<TransactionSummary> {
     let effect = analyze(coin_spends)?;
-    summarize_egress(&effect.outputs, &effect.protocol_sink, effect.fee)
+    summarize_egress(
+        &effect.outputs,
+        &effect.protocol_sink,
+        effect.fee,
+        &effect.melted_singletons,
+    )
 }
 
 /// Render the outputs LEAVING the wallet — `egress` (to real addresses) plus `protocol_sink` (to a
@@ -716,6 +897,7 @@ pub fn summarize_egress(
     egress: &[DecodedOutput],
     protocol_sink: &[DecodedOutput],
     fee: u64,
+    melted_singletons: &[Bytes32],
 ) -> WalletResult<TransactionSummary> {
     let mut outputs = egress
         .iter()
@@ -751,6 +933,9 @@ pub fn summarize_egress(
         // review renderer from the reviewed spend's own summary (#2241).
         received: Vec::new(),
         fee: Amount(fee),
+        // Destruction is egress of a kind no address can express, so it travels as its own field
+        // rather than as an output line the recipient gate would then have to except.
+        melted_singletons: melted_singletons.iter().map(hex::encode).collect(),
     })
 }
 
@@ -1027,6 +1212,24 @@ fn enforce_sole_agg_sig_me(
     conditions: &[Condition],
     expected_message: [u8; 32],
 ) -> WalletResult<()> {
+    if sole_agg_sig_me_message(conditions)? != expected_message {
+        return Err(reject(
+            "AGG_SIG_ME does not commit to the delegated-puzzle hash the outputs derive from \
+             (refusing to sign)",
+        ));
+    }
+    Ok(())
+}
+
+/// The 32-byte message of a spend's ONE `AGG_SIG_ME`, refusing zero, several, or a malformed one.
+///
+/// The zero and several cases are the first two anomalies [`enforce_sole_agg_sig_me`] documents,
+/// factored out for the arms that must READ the committed message rather than compare it to a
+/// message they derived structurally. A melt is such an arm: its delegated puzzle sits under layer
+/// stacks (a `DidLayer`, the DataLayer metadata layers) this crate deliberately does not model, so
+/// the committed hash is recovered from the signature itself and then proven against the solution
+/// (see [`committed_melt_conditions`]).
+fn sole_agg_sig_me_message(conditions: &[Condition]) -> WalletResult<[u8; 32]> {
     let mut agg_sig_me = conditions.iter().filter_map(Condition::as_agg_sig_me);
     let Some(sole) = agg_sig_me.next() else {
         return Err(reject(
@@ -1038,10 +1241,170 @@ fn enforce_sole_agg_sig_me(
             "more than one AGG_SIG_ME condition in a send spend (possible blank-check laundering)",
         ));
     }
-    if sole.message.as_ref() != expected_message.as_slice() {
+    sole.message.as_ref().try_into().map_err(|_| {
+        reject(
+            "AGG_SIG_ME message is not a 32-byte delegated-puzzle hash, so it cannot commit to any \
+             condition list (refusing to sign)",
+        )
+    })
+}
+
+/// The conditions a singleton melt's signature ACTUALLY authorizes: the quoted, solution-independent
+/// condition list whose tree hash is `committed_message` (dig_ecosystem#3068).
+///
+/// The melt arm cannot reach its delegated puzzle the way [`account_option_transfer`] does — that
+/// walks a known layer stack down to a [`StandardLayer`] solution, and a DIG singleton's inner stack
+/// (a `DidLayer`, the DataLayer metadata layers) is deliberately outside this crate's knowledge. So
+/// the delegated puzzle is identified by PREIMAGE instead: the sole `AGG_SIG_ME` names the tree hash
+/// the signature commits to, and the subtree of the coin's own solution that hashes to it IS that
+/// delegated puzzle, by collision resistance — no layer knowledge required, and nothing to keep in
+/// sync as new DIG layers appear.
+///
+/// Finding it is not enough; it must be the canonical QUOTE form `(q . conditions)`, exactly as
+/// [`committed_delegated_puzzle_message`] requires of every other signed arm and for the same reason:
+/// only then does the signed tree hash pin the conditions, making "what this spend does" identical to
+/// "what this signature authorizes" for every solution, not just the one presented.
+fn committed_melt_conditions(
+    allocator: &Allocator,
+    solution: clvmr::NodePtr,
+    committed_message: [u8; 32],
+) -> WalletResult<Vec<Condition>> {
+    let Some(delegated_puzzle) =
+        find_subtree_by_tree_hash(allocator, solution, committed_message, 0)
+    else {
         return Err(reject(
-            "AGG_SIG_ME does not commit to the delegated-puzzle hash the outputs derive from \
-             (refusing to sign)",
+            "the singleton melt's AGG_SIG_ME commits to a hash that appears nowhere in the coin's \
+             solution, so the conditions it authorizes cannot be recovered or checked; refusing \
+             to sign",
+        ));
+    };
+    let clvmr::SExp::Pair(quote_op, quoted_conditions) = allocator.sexp(delegated_puzzle) else {
+        return Err(reject(
+            "the singleton melt's signed delegated puzzle is not quote-form (not a pair), so the \
+             signature would authorize different outputs under a different solution; refusing to \
+             sign",
+        ));
+    };
+    if allocator.small_number(quote_op) != Some(1) {
+        return Err(reject(
+            "the singleton melt's signed delegated puzzle is not the canonical quote form, so the \
+             signature would authorize different outputs under a different solution; refusing to \
+             sign",
+        ));
+    }
+    Vec::<Condition>::from_clvm(allocator, quoted_conditions)
+        .map_err(|e| reject(format!("undecodable signed melt conditions: {e:?}")))
+}
+
+/// The deepest solution nesting [`find_subtree_by_tree_hash`] will search before refusing.
+///
+/// The search recurses, so an unbounded depth would let a caller-supplied solution overflow the
+/// stack — a caller-triggerable abort in a custody path. Exceeding the bound yields no match and
+/// therefore a REFUSAL, and no honest melt comes close: a real DIG store or DID melt solution nests
+/// a little over a dozen deep.
+const MAX_SOLUTION_SEARCH_DEPTH: usize = 256;
+
+/// The subtree of `node` whose `sha256tree` is `target`, or `None` if there is none within
+/// [`MAX_SOLUTION_SEARCH_DEPTH`].
+fn find_subtree_by_tree_hash(
+    allocator: &Allocator,
+    node: clvmr::NodePtr,
+    target: [u8; 32],
+    depth: usize,
+) -> Option<clvmr::NodePtr> {
+    if tree_hash(allocator, node).to_bytes() == target {
+        return Some(node);
+    }
+    if depth >= MAX_SOLUTION_SEARCH_DEPTH {
+        return None;
+    }
+    let clvmr::SExp::Pair(first, rest) = allocator.sexp(node) else {
+        return None;
+    };
+    find_subtree_by_tree_hash(allocator, first, target, depth + 1)
+        .or_else(|| find_subtree_by_tree_hash(allocator, rest, target, depth + 1))
+}
+
+/// Which of a melt's two condition lists is being judged.
+///
+/// The lists differ in exactly one opcode, and the difference is structural rather than a matter of
+/// taste: the `p2_delegated_puzzle_or_hidden_puzzle` layer emits the coin's `AGG_SIG_ME` ITSELF,
+/// outside the delegated puzzle. So it is expected in the PRESENTED list and is never honest in the
+/// SIGNED one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeltConditionList {
+    /// What the coin emits under the solution the caller presented — defence in depth.
+    Presented,
+    /// What the quoted delegated puzzle commits to — the admission test.
+    Signed,
+}
+
+/// Default-DENY allowlist for a TERMINAL singleton melt's conditions (dig_ecosystem#3068), applied
+/// both to the outer run conditions (defence in depth) and to the SIGNED quoted ones (the admission
+/// test).
+///
+/// `AGG_SIG_ME` is admitted only in the [`MeltConditionList::Presented`] list, where the p2 layer
+/// puts it. Inside the SIGNED quoted list it is a blank cheque for a second delegated puzzle on the
+/// same coin — the committed pass counts only `MELT_SINGLETON`, so `[MELT_SINGLETON, AGG_SIG_ME]`
+/// would otherwise satisfy the admission test while authorizing arbitrary other conditions one layer
+/// in. Today that case happens to make the OUTER `AGG_SIG_ME` count 2 and trip
+/// [`sole_agg_sig_me_message`] — but that rests on the exact layer behaviour this arm declares it
+/// does not model, which is the dependency the whole fix exists to remove. Refusing it directly
+/// costs an honest melt nothing.
+///
+/// A melt ends a lineage: it destroys the singleton and creates nothing. So EVERY `CREATE_COIN` is
+/// refused here — not merely the odd-amount re-home — which makes the guard immune to a
+/// `CREATE_COIN` encoding this crate's decoder models more narrowly than consensus does. The melt
+/// marker itself is a `MELT_SINGLETON`, positively counted by the caller, never a `CREATE_COIN`.
+///
+/// Fail-CLOSED by construction: an unrecognized opcode (including anything the SDK maps to its
+/// catch-all) is REFUSED, so a condition this crate cannot model can never ride a deletion the human
+/// approved.
+fn reject_non_melt_condition(condition: &Condition, list: MeltConditionList) -> WalletResult<()> {
+    if matches!(condition, Condition::AggSigMe(_)) {
+        return match list {
+            MeltConditionList::Presented => Ok(()),
+            MeltConditionList::Signed => Err(reject(
+                "the singleton melt's SIGNED delegated puzzle carries its own AGG_SIG_ME, which no \
+                 honest melt does (the standard layer emits that condition outside the delegated \
+                 puzzle); it would authorize a second delegated puzzle on this coin; refusing to \
+                 sign",
+            )),
+        };
+    }
+    let permitted = matches!(
+        condition,
+        // The melt marker itself.
+        Condition::MeltSingleton(_)
+            // Benign timelock assertions.
+            | Condition::AssertSecondsAbsolute(_)
+            | Condition::AssertSecondsRelative(_)
+            | Condition::AssertHeightAbsolute(_)
+            | Condition::AssertHeightRelative(_)
+            | Condition::AssertBeforeSecondsAbsolute(_)
+            | Condition::AssertBeforeSecondsRelative(_)
+            | Condition::AssertBeforeHeightAbsolute(_)
+            | Condition::AssertBeforeHeightRelative(_)
+            // Benign announcement/concurrency ASSERTIONS (never the CREATE side): dig-account rings
+            // a melt to the coin paying its network fee.
+            | Condition::AssertCoinAnnouncement(_)
+            | Condition::AssertPuzzleAnnouncement(_)
+            | Condition::AssertConcurrentSpend(_)
+            | Condition::AssertConcurrentPuzzle(_)
+            // Benign self-introspection assertions — a real melt emits two of these.
+            | Condition::AssertMyCoinId(_)
+            | Condition::AssertMyParentId(_)
+            | Condition::AssertMyPuzzleHash(_)
+            | Condition::AssertMyAmount(_)
+            | Condition::AssertMyBirthSeconds(_)
+            | Condition::AssertMyBirthHeight(_)
+            | Condition::AssertEphemeral(_)
+    );
+    if !permitted {
+        return Err(reject(
+            "singleton melt emits a condition outside the melt allowlist (an output, a reserved \
+             fee, an announcement, or an unknown opcode); only a TERMINAL singleton spend is \
+             signable; refusing to sign",
         ));
     }
     Ok(())
@@ -1933,5 +2296,470 @@ mod tests {
         )));
         assert!(!is_protocol_sink_hash(Bytes32::new([0x00; 32])));
         assert!(!is_protocol_sink_hash(wallet_ph()));
+    }
+}
+
+/// **Singleton melt admission** (dig_ecosystem#3068) — the profile-deletion path.
+///
+/// Deleting a DIG profile terminally spends its two singletons, the DID and the dig-store. Both melt
+/// spends are built here by the CANONICAL crates, so what these tests put in front of [`analyze`] is
+/// byte-for-byte what dig-account will ask it to verify.
+///
+/// Two singleton kinds, deliberately: their inner layer stacks differ (a `DidLayer` versus the
+/// DataLayer metadata layers), so a fixture of only one would prove the arm accepts that one stack.
+#[cfg(test)]
+pub(crate) mod singleton_melt_tests {
+    use super::*;
+    use chia_protocol::Coin;
+    use chia_puzzle_types::standard::StandardArgs;
+    use chia_wallet_sdk::driver::SpendContext;
+    use chia_wallet_sdk::types::Conditions;
+    use clvm_traits::ToClvm;
+    use clvmr::serde::node_to_bytes;
+
+    /// A non-infinity public key with no secret behind it — enough to curry a standard puzzle and to
+    /// own a singleton, and never a key this crate could sign with.
+    fn owner_pk() -> chia_bls::PublicKey {
+        let mut g = [0u8; 48];
+        for (i, b) in [
+            0x97u8, 0xf1, 0xd3, 0xa7, 0x31, 0x97, 0xd7, 0x94, 0x26, 0x95, 0x63, 0x8c, 0x4f, 0xa9,
+            0xac, 0x0f, 0xc3, 0x68, 0x8c, 0x4f, 0x97, 0x74, 0xb9, 0x05, 0xa1, 0x4e, 0x3a, 0x3f,
+            0x17, 0x1b, 0xac, 0x58, 0x6c, 0x55, 0xe8, 0x3f, 0xf9, 0x7a, 0x1a, 0xef, 0xfb, 0x3a,
+            0xf0, 0x0a, 0xdb, 0x22, 0xc6, 0xbb,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            g[i] = b;
+        }
+        chia_bls::PublicKey::from_bytes(&g).expect("valid G1 generator")
+    }
+
+    fn owner_ph() -> Bytes32 {
+        Bytes32::from(StandardArgs::curry_tree_hash(owner_pk()).to_bytes())
+    }
+
+    /// A real DIG store singleton melt, built by `dig_merkle::melt`.
+    ///
+    /// `pub(crate)` so the signer's review-gate tests melt a REAL singleton through the real builder
+    /// rather than a second, drifting copy of this fixture.
+    pub(crate) fn store_melt() -> Vec<CoinSpend> {
+        let store = dig_merkle::mint_datastore(
+            Coin::new(Bytes32::new([0x11; 32]), owner_ph(), 1),
+            dig_merkle::Owner::Standard(owner_pk()),
+            Bytes32::new([0x5a; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph(),
+            vec![],
+            0,
+        )
+        .expect("the canonical store mint builder")
+        .child
+        .expect("a mint yields the eve store");
+
+        dig_merkle::melt(&store, dig_merkle::Owner::Standard(owner_pk()))
+            .expect("the canonical store melt builder")
+            .coin_spends
+    }
+
+    /// A real DID singleton melt, built by `dig_did::melt`.
+    fn did_melt() -> Vec<CoinSpend> {
+        let mut ctx = SpendContext::new();
+        let did = dig_did::create_simple_did(
+            &mut ctx,
+            Coin::new(Bytes32::new([0x22; 32]), owner_ph(), 1),
+            dig_did::Owner::Standard(owner_pk()),
+        )
+        .expect("the canonical DID launch builder")
+        .child
+        .expect("a launch yields the settled DID");
+
+        dig_did::melt(&mut ctx, did, dig_did::Owner::Standard(owner_pk()))
+            .expect("the canonical DID melt builder")
+            .coin_spends
+    }
+
+    /// A store melt is ACCOUNTED, not refused: the singleton's mojo enters, nothing leaves, and the
+    /// destroyed amount is reported as the implicit fee.
+    #[test]
+    fn a_store_singleton_melt_is_accounted_with_its_mojo_as_the_implicit_fee() {
+        let effect = analyze(&store_melt()).expect("a terminal store melt must be verifiable");
+        assert!(
+            effect.outputs.is_empty() && effect.protocol_sink.is_empty(),
+            "a melt creates no coin, so nothing may be reported as leaving"
+        );
+        assert_eq!(
+            effect.fee, 1,
+            "the singleton's mojo is destroyed, and the only honest place to report it is the fee"
+        );
+    }
+
+    /// The same, for a DID singleton — a different inner layer stack through the same arm.
+    #[test]
+    fn a_did_singleton_melt_is_accounted_with_its_mojo_as_the_implicit_fee() {
+        let effect = analyze(&did_melt()).expect("a terminal DID melt must be verifiable");
+        assert!(effect.outputs.is_empty() && effect.protocol_sink.is_empty());
+        assert_eq!(effect.fee, 1);
+    }
+
+    /// A melt does not travel alone: dig-account pays its network fee from an ordinary wallet coin in
+    /// the SAME bundle. Both legs must account together, and the reported fee must name every mojo
+    /// the person is spending — the explicit reserve AND the destroyed singleton.
+    #[test]
+    fn a_melt_bundled_with_its_fee_paying_coin_accounts_both_legs() {
+        let mut spends = store_melt();
+        spends.extend(fee_paying_coin(1_000, 900, 100));
+
+        let effect = analyze(&spends).expect("a melt beside its fee payer must be verifiable");
+        assert_eq!(
+            effect.fee, 101,
+            "100 reserved plus the 1 destroyed mojo — a fee that omitted the melt would understate \
+             what the person spends"
+        );
+    }
+
+    /// **The abuse test for the widened conservation.** Admitting a melt added a third accounted
+    /// destination to the value equality; this proves it did not become a hole.
+    ///
+    /// The fee-paying coin in this bundle leaks 500 mojos — it neither creates them as an output nor
+    /// reserves them as a fee. Were the melt switched to the implicit-fee mode the option path uses
+    /// (`fee = in - out`), the whole bundle would stop being held to the equality and this leak would
+    /// be silently reported as a fee. It is refused instead, and the ONLY difference between this
+    /// test and the one above is the leak.
+    #[test]
+    fn a_melt_does_not_excuse_a_value_leak_elsewhere_in_the_bundle() {
+        let mut spends = store_melt();
+        spends.extend(fee_paying_coin(1_000, 400, 100));
+
+        let err = analyze(&spends)
+            .expect_err("a melt in the bundle must not relax conservation for any other coin");
+        assert!(
+            err.message.contains("not conserved"),
+            "the refusal must be the conservation one, not an incidental parse failure: {}",
+            err.message
+        );
+    }
+
+    /// An ordinary standard-layer coin of `amount` that returns `change` to the wallet and reserves
+    /// `fee`. When `amount != change + fee` the coin LEAKS the difference, which is how the abuse
+    /// test above is built from the same helper as its control.
+    fn fee_paying_coin(amount: u64, change: u64, fee: u64) -> Vec<CoinSpend> {
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::driver::StandardLayer;
+        use chia_wallet_sdk::types::Conditions;
+
+        let mut ctx = SpendContext::new();
+        StandardLayer::new(owner_pk())
+            .spend(
+                &mut ctx,
+                Coin::new(Bytes32::new([0x44; 32]), owner_ph(), amount),
+                Conditions::new()
+                    .create_coin(owner_ph(), change, Memos::None)
+                    .reserve_fee(fee),
+            )
+            .expect("a standard fee-paying spend");
+        ctx.take()
+    }
+
+    /// **The control that makes the two tests above load-bearing.** A singleton spend that does NOT
+    /// melt — the store's ordinary root UPDATE, which recreates the singleton — is still refused.
+    ///
+    /// Without this, admitting "a singleton spend" and admitting "a TERMINAL singleton spend" are
+    /// indistinguishable, and the arm could have opened the whole singleton class to signing: an
+    /// update re-homes the store to a new owner, so waving it through is a transfer of the profile's
+    /// identity that no human reviewed.
+    #[test]
+    fn a_singleton_spend_that_recreates_the_singleton_is_still_refused() {
+        let store = dig_merkle::mint_datastore(
+            Coin::new(Bytes32::new([0x33; 32]), owner_ph(), 1),
+            dig_merkle::Owner::Standard(owner_pk()),
+            Bytes32::new([0x5a; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph(),
+            vec![],
+            0,
+        )
+        .expect("the canonical store mint builder")
+        .child
+        .expect("a mint yields the eve store");
+
+        let updated = dig_merkle::update_root(
+            &store,
+            dig_merkle::Owner::Standard(owner_pk()),
+            dig_merkle::DigDataStoreMetadata {
+                root_hash: Bytes32::new([0x77; 32]),
+                ..Default::default()
+            },
+        )
+        .expect("the canonical store update builder");
+
+        let err = analyze(&updated.coin_spends)
+            .expect_err("only a TERMINAL singleton spend is admissible; an update is not");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    /// Rewrite a spend's p2 delegated puzzle from the canonical quote form `(q . conditions)` into
+    /// the non-quote IDENTITY puzzle `1`, which returns whatever solution it is handed — moving
+    /// `conditions` (or `replacement`, when given) into the delegated SOLUTION beside it.
+    ///
+    /// This is the attacker's construction from dig_ecosystem#3068, expressed as a fixture: the
+    /// standard layer signs `sha256tree(delegated_puzzle)`, so both variants produced here are
+    /// covered by ONE signature while doing entirely different things — which is exactly what an
+    /// outer-conditions check cannot see, and what the admission test must.
+    fn with_malleable_delegated_puzzle(
+        spend: &CoinSpend,
+        replacement: Option<Conditions>,
+    ) -> CoinSpend {
+        let mut allocator = Allocator::new();
+        let solution = node_from_bytes(&mut allocator, &spend.solution).expect("a valid solution");
+        let rewritten = rewrite_delegated_puzzle(&mut allocator, solution, &replacement)
+            .expect("the melt solution carries a quoted delegated puzzle to rewrite");
+        CoinSpend {
+            solution: node_to_bytes(&allocator, rewritten)
+                .expect("a serializable solution")
+                .into(),
+            ..spend.clone()
+        }
+    }
+
+    /// The recursive half of [`with_malleable_delegated_puzzle`]: find the
+    /// `((q . melt_conditions) delegated_solution . rest)` shape anywhere in the solution tree and
+    /// rebuild it as `(1 conditions . rest)`. Identifying the target by its QUOTED MELT CONDITIONS
+    /// (not merely by being a quote pair) keeps the rewrite from landing on unrelated quoted data.
+    fn rewrite_delegated_puzzle(
+        allocator: &mut Allocator,
+        node: clvmr::NodePtr,
+        replacement: &Option<Conditions>,
+    ) -> Option<clvmr::NodePtr> {
+        let clvmr::SExp::Pair(first, rest) = allocator.sexp(node) else {
+            return None;
+        };
+
+        if let clvmr::SExp::Pair(quote_op, quoted) = allocator.sexp(first) {
+            let quotes_a_melt = allocator.small_number(quote_op) == Some(1)
+                && Vec::<Condition>::from_clvm(allocator, quoted).is_ok_and(|conditions| {
+                    conditions
+                        .iter()
+                        .any(|c| matches!(c, Condition::MeltSingleton(_)))
+                });
+            if quotes_a_melt {
+                if let clvmr::SExp::Pair(_delegated_solution, tail) = allocator.sexp(rest) {
+                    let conditions = match replacement {
+                        Some(replacement) => replacement
+                            .clone()
+                            .to_clvm(allocator)
+                            .expect("encodable replacement conditions"),
+                        None => quoted,
+                    };
+                    let identity = allocator.new_small_number(1).ok()?;
+                    let solution_and_rest = allocator.new_pair(conditions, tail).ok()?;
+                    return allocator.new_pair(identity, solution_and_rest).ok();
+                }
+            }
+        }
+
+        if let Some(rewritten) = rewrite_delegated_puzzle(allocator, first, replacement) {
+            return allocator.new_pair(rewritten, rest).ok();
+        }
+        let rewritten = rewrite_delegated_puzzle(allocator, rest, replacement)?;
+        allocator.new_pair(first, rewritten).ok()
+    }
+
+    /// The AGG_SIG_ME message a spend's outer conditions carry — the delegated-puzzle tree hash the
+    /// user's key would actually sign over.
+    fn signed_message(spend: &CoinSpend) -> [u8; 32] {
+        let mut allocator = Allocator::new();
+        let puzzle = node_from_bytes(&mut allocator, &spend.puzzle_reveal).expect("a valid puzzle");
+        let solution = node_from_bytes(&mut allocator, &spend.solution).expect("a valid solution");
+        let conditions = run_conditions(&mut allocator, puzzle, solution).expect("a running spend");
+        sole_agg_sig_me_message(&conditions).expect("a lone AGG_SIG_ME")
+    }
+
+    /// **THE malleability test (#3068 CRITICAL#3).** A melt whose signed delegated puzzle is the
+    /// non-quote identity atom `1` emits the honest melt conditions under the solution PRESENTED —
+    /// so every outer-condition check passes — while the signature it releases is a blank cheque
+    /// over the coin, reusable with any other solution. It must be REFUSED on the ground that the
+    /// signed puzzle does not pin its conditions.
+    #[test]
+    fn a_melt_whose_signed_delegated_puzzle_is_solution_malleable_is_refused() {
+        let honest = store_melt();
+        let malleable: Vec<CoinSpend> = honest
+            .iter()
+            .map(|spend| with_malleable_delegated_puzzle(spend, None))
+            .collect();
+
+        let err = analyze(&malleable)
+            .expect_err("a signature that does not pin its conditions must never be released");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+        assert!(
+            err.message.contains("quote-form") || err.message.contains("canonical quote form"),
+            "the refusal must name the unpinned delegated puzzle, not an incidental failure: {}",
+            err.message
+        );
+    }
+
+    /// The control that makes the test above load-bearing rather than a coincidence: the malleable
+    /// spend and the honest one emit the SAME outer conditions, differing only in the 32 opaque
+    /// bytes of the `AGG_SIG_ME` message — a delegated-puzzle tree hash the outer layer has no
+    /// independent expectation for, because the melt arm cannot derive it (the DID/DataLayer stacks
+    /// between the singleton and its p2 layer are deliberately unmodelled, which is why
+    /// [`committed_melt_conditions`] recovers it by preimage instead).
+    ///
+    /// So no outer-conditions check can separate these two spends. The refusal must come from
+    /// descending into the signed delegated puzzle, and relocating that inspection outwards would
+    /// make it disappear.
+    #[test]
+    fn the_malleable_melt_differs_from_the_honest_one_only_in_bytes_the_outer_layer_cannot_judge() {
+        let honest = store_melt();
+        let honest_spend = honest
+            .iter()
+            .find(|spend| {
+                let mut allocator = Allocator::new();
+                node_from_bytes(&mut allocator, &spend.puzzle_reveal)
+                    .ok()
+                    .and_then(|ptr| Puzzle::parse(&allocator, ptr).into())
+                    .is_some_and(is_singleton_puzzle)
+            })
+            .expect("the melt bundle contains the singleton spend");
+        let malleable = with_malleable_delegated_puzzle(honest_spend, None);
+
+        // Everything the outer layer can actually JUDGE: the conditions, with the one opaque
+        // delegated-puzzle hash replaced by the signer's public key (which is judgeable, and equal).
+        let judgeable = |spend: &CoinSpend| {
+            let mut allocator = Allocator::new();
+            let puzzle =
+                node_from_bytes(&mut allocator, &spend.puzzle_reveal).expect("a valid puzzle");
+            let solution =
+                node_from_bytes(&mut allocator, &spend.solution).expect("a valid solution");
+            run_conditions(&mut allocator, puzzle, solution)
+                .expect("a running spend")
+                .iter()
+                .map(|condition| match condition {
+                    Condition::AggSigMe(sig) => format!("AggSigMe({:?})", sig.public_key),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            judgeable(honest_spend),
+            judgeable(&malleable),
+            "the malleable variant must be outwardly identical everywhere the outer layer can form \
+             an expectation, or this fixture proves nothing about where the check has to live"
+        );
+        assert_ne!(
+            signed_message(honest_spend),
+            signed_message(&malleable),
+            "the two DO differ in the signed hash — but only there, and the melt arm has no \
+             independently derived value to compare it against"
+        );
+        assert_ne!(
+            honest_spend.solution, malleable.solution,
+            "the variants must actually differ, in the solution rather than in what it emits"
+        );
+        assert!(
+            analyze(&honest).is_ok(),
+            "the honest melt must remain signable — a guard that refuses everything is not a guard"
+        );
+    }
+
+    /// The exploit's second leg, and the answer to "are transfers still refused under a CRAFTED
+    /// solution rather than a presented one": the SAME malleable delegated puzzle, replayed with an
+    /// attacker's solution, re-homes the singleton under an odd-amount `CREATE_COIN` — and the
+    /// signature covering it is byte-identical to the one the honest-looking variant would release.
+    #[test]
+    fn a_crafted_malleable_solution_that_re_homes_the_singleton_is_refused() {
+        use chia_puzzle_types::Memos;
+
+        let attacker_ph = Bytes32::new([0xaa; 32]);
+        let honest = store_melt();
+        let re_homing: Vec<CoinSpend> = honest
+            .iter()
+            .map(|spend| {
+                with_malleable_delegated_puzzle(
+                    spend,
+                    Some(Conditions::new().create_coin(attacker_ph, 1, Memos::None)),
+                )
+            })
+            .collect();
+        let benign: Vec<CoinSpend> = honest
+            .iter()
+            .map(|spend| with_malleable_delegated_puzzle(spend, None))
+            .collect();
+
+        for (crafted, benign) in re_homing.iter().zip(benign.iter()) {
+            assert_eq!(
+                signed_message(crafted),
+                signed_message(benign),
+                "ONE signature must cover both solutions, or the replay this guard exists for is \
+                 not what the fixture builds"
+            );
+        }
+
+        let err = analyze(&re_homing)
+            .expect_err("a spend that re-homes the singleton to an attacker must be refused");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    /// A melt whose outer conditions carry NO `AGG_SIG_ME` binds no signature to this coin, so it
+    /// can be appended to any bundle and have its destroyed mojos land in someone else's displayed
+    /// fee. The shared reader refuses it, which is what the melt arm relies on.
+    #[test]
+    fn a_melt_with_no_agg_sig_me_is_refused() {
+        let err = sole_agg_sig_me_message(&[Condition::melt_singleton()])
+            .expect_err("zero AGG_SIG_ME authorizes nothing and must never be admitted");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    /// The condition allowlist is default-DENY: an opcode outside it — here a coin announcement the
+    /// melt does not need — is refused rather than waved through carrying the user's signature.
+    #[test]
+    fn a_melt_condition_outside_the_allowlist_is_refused() {
+        for list in [MeltConditionList::Presented, MeltConditionList::Signed] {
+            reject_non_melt_condition(
+                &Condition::create_coin_announcement(vec![1, 2, 3].into()),
+                list,
+            )
+            .expect_err("an unallowlisted condition must be refused, not tolerated");
+            reject_non_melt_condition(&Condition::melt_singleton(), list)
+                .expect("the melt marker itself is allowlisted");
+        }
+    }
+
+    /// An `AGG_SIG_ME` inside the SIGNED quoted condition list is a blank cheque for a second
+    /// delegated puzzle on the same coin, so it must be refused THERE — while the identical
+    /// condition in the PRESENTED list is the p2 layer's own signature requirement and every honest
+    /// melt carries it.
+    ///
+    /// Both halves are asserted together deliberately: a guard that refused `AGG_SIG_ME` in both
+    /// lists would pass the abuse half and break every honest melt, and a guard that admitted it in
+    /// both is the state before this change. Only the split is correct, and only asserting both
+    /// sides can see the difference.
+    #[test]
+    fn an_agg_sig_me_is_refused_in_the_signed_list_and_admitted_in_the_presented_one() {
+        let agg_sig_me = Condition::agg_sig_me(owner_pk(), vec![0x5a; 32].into());
+
+        let err = reject_non_melt_condition(&agg_sig_me, MeltConditionList::Signed).expect_err(
+            "a signed delegated puzzle that carries its own AGG_SIG_ME authorizes a second \
+             delegated puzzle and must be refused",
+        );
+        assert!(
+            err.message
+                .contains("SIGNED delegated puzzle carries its own AGG_SIG_ME"),
+            "the refusal must name the smuggled signature requirement, not an incidental parse \
+             failure: {}",
+            err.message
+        );
+
+        reject_non_melt_condition(&agg_sig_me, MeltConditionList::Presented)
+            .expect("the p2 layer's own AGG_SIG_ME is what every honest melt presents");
     }
 }

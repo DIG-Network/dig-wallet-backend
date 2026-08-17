@@ -431,6 +431,52 @@ Used by dig-app. The subscriber + identity provider + signer.
   #2243) and **exercise** — `analyze` detects an exercise bundle by its `P2OneOfManyLayer` underlying
   leg and refuses it, because the unlocked underlying's reclaim to the holder is not consensus-forced
   (deferred to #2245; see below).
+- **Terminal singleton MELT (profile deletion, dig_ecosystem#3068).** A coin spend whose puzzle is the
+  singleton top layer (`SINGLETON_TOP_LAYER_V1_1_HASH`), reached only AFTER the option-singleton and
+  `P2OneOfManyLayer` arms so option semantics are unchanged, is accounted when and only when it is
+  TERMINAL, and terminality MUST be decided over the artifact the SIGNATURE commits to.
+
+  The standard layer signs `sha256tree(delegated_puzzle) || coin_id || genesis`, which pins the
+  delegated puzzle's TREE HASH and NOT its solution. Conditions produced by the solution PRESENTED
+  therefore do not describe what the released signature authorizes: a solution-malleable delegated
+  puzzle emits nothing under one solution and an odd-amount `CREATE_COIN` re-homing the singleton
+  under another, both covered by the same signature. The admission test is consequently POSITIVE and
+  is applied one layer down:
+
+  1. The outer conditions MUST carry EXACTLY ONE `AGG_SIG_ME` — zero binds no signature to this coin,
+     more than one launders a blank cheque — and no non-`ME` agg-sig family.
+  2. The subtree of the coin's own solution whose tree hash equals that signature's message IS the
+     signed delegated puzzle (identified by preimage, so no layer knowledge is required). It MUST be
+     the canonical QUOTE form `(q . conditions)`; a non-quote delegated puzzle MUST be refused.
+  3. Those COMMITTED conditions MUST contain EXACTLY ONE `MELT_SINGLETON` and nothing outside a
+     default-DENY allowlist (the melt marker, timelock assertions, announcement and concurrency
+     ASSERTIONS, and self-introspection assertions). EVERY `CREATE_COIN`, every reserved fee, and
+     every opcode this crate does not model is refused. `AGG_SIG_ME` MUST be refused in the COMMITTED
+     list specifically: the standard layer emits it OUTSIDE the delegated puzzle, so a committed one
+     is never honest and would authorize a second delegated puzzle on the same coin. The same
+     allowlist is applied to the outer conditions as defence in depth — never as the admission test,
+     and there `AGG_SIG_ME` IS permitted, because it is the standard layer's own.
+
+  A singleton UPDATE or TRANSFER therefore stays refused — those re-home the singleton under a new
+  owner puzzle hash, a change of ownership no deletion confirmation covers. The solution search is
+  depth-bounded (256), and exceeding the bound yields a refusal.
+
+  The melted coin's amount is accounted into a dedicated `melted` total, so conservation is
+  `in == outputs + protocol_sink + fee + melted` and the STRICT equality continues to bind every other
+  coin in the bundle, including the wallet coin paying the melt's network fee. A melt inside an OPTION
+  bundle is refused outright, because the implicit-fee mode does not account destroyed value. The
+  melted mojos are reported as part of `SpendEffect::fee`, because consensus hands them to the farmer
+  exactly as a `RESERVE_FEE` does. They are NOT recoverable and MUST NOT be presented as such:
+  `(51 () -113)` occupies the one odd-amount `CREATE_COIN` a singleton may emit, so a melt that also
+  returned the mojo is unexpressible under the puzzle.
+
+  **Destruction MUST be reviewable.** A melt has no recipient and no output, and its whole footprint
+  in the reviewed figures is a fee one mojo larger — so a melt appended to an ordinary send would
+  otherwise be confirmed as that send. `SpendEffect::melted_singletons` names the coin id of every
+  destroyed singleton, `TransactionSummary::melted_singletons` carries the same set as lowercase hex
+  (`#[serde(default)]`, an absent field meaning "destroys nothing"),
+  `HumanReadableSummary::melt_lines` renders one line per destruction, and the signing gate MUST
+  refuse any spend whose derived destroyed set differs from the reviewed one.
 - **Settlement / `protocol_sink` (offers #1511 PR-B, option transfer #1511 PR-C).** `SpendEffect` carries a THIRD
   output bucket `protocol_sink`: value the wallet intentionally commits to a consensus-enforced canonical
   STRUCTURAL puzzle — the offer settlement-payments puzzle (`SETTLEMENT_PAYMENT_HASH`) or the singleton

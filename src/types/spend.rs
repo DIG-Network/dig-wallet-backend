@@ -85,6 +85,7 @@ mod tests {
             coin_spends: vec![],
             required_signatures: vec![],
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 received: vec![],
                 outputs: vec![],
                 fee: Amount(0),

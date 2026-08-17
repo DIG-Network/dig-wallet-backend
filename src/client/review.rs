@@ -31,6 +31,15 @@ pub struct HumanReadableSummary {
     /// marker so a maker never attributes egress-grade assurance to the receive side. Full
     /// crypto-verification of the requested payment is a separate follow-up.
     pub receive_lines: Vec<String>,
+    /// One line per singleton the spend permanently DESTROYS — a profile's DID or dig-store ended
+    /// forever (dig_ecosystem#3068). Empty for every spend that destroys nothing.
+    ///
+    /// Destruction has no recipient and moves the fee by a single mojo, so without its own lines it
+    /// is invisible on the confirm screen: a melt slipped into an ordinary send would render as that
+    /// send plus a fee one mojo larger. These lines are re-derived from the coin spends like
+    /// [`lines`](Self::lines), never taken from an engine claim, and the signing gate refuses any
+    /// spend whose destroyed set differs from the reviewed one.
+    pub melt_lines: Vec<String>,
     /// The fee, rendered.
     pub fee_line: String,
     /// The number of coin spends the transaction contains.
@@ -144,9 +153,18 @@ pub(crate) fn render(
         .map(|out| render_output_line("Receive (unverified)", out))
         .collect();
 
+    // Rendered from `summary` (the re-derived view), NOT from the engine's claim: destruction is
+    // fully re-derivable from the coin spends, so there is no reason to show a claimed one.
+    let melt_lines = summary
+        .melted_singletons
+        .iter()
+        .map(|coin_id| format!("Permanently DESTROY singleton {coin_id} — this cannot be undone"))
+        .collect();
+
     HumanReadableSummary {
         lines,
         receive_lines,
+        melt_lines,
         fee_line: format!("Fee {} XCH", render_amount(summary.fee, true)),
         coin_spend_count: unsigned.coin_spends.len(),
         required_signature_count: unsigned.required_signatures.len(),
@@ -180,6 +198,7 @@ mod tests {
             coin_spends: vec![],
             required_signatures: vec![],
             summary: TransactionSummary {
+                melted_singletons: Vec::new(),
                 outputs,
                 received: vec![],
                 fee,
