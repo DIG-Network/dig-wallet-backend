@@ -443,9 +443,16 @@ Used by dig-app. The subscriber + identity provider + signer.
   allowlist. Judging the outer list alone is INSUFFICIENT and MUST NOT be relied on: the NFT state layer
   CONSUMES an `UPDATE_NFT_METADATA` and the ownership layer consumes a `TRANSFER_NFT` while re-emitting
   the rest, so a metadata update and an owner assignment are invisible there and only their re-home
-  survives. The spend MUST emit EXACTLY ONE odd-amount `CREATE_COIN`, and its destination MUST NOT be a
-  structural (settlement / launcher) puzzle hash. `AGG_SIG_ME` is permitted in the OUTER list (the
-  standard layer's own) and MUST be refused in the SIGNED one.
+  survives. `AGG_SIG_ME` is permitted in the OUTER list (the standard layer's own) and MUST be refused
+  in the SIGNED one.
+
+  The spend MUST emit EXACTLY ONE odd-amount `CREATE_COIN` in each list. Its DESTINATION MUST be read
+  from the SIGNED list, and MUST NOT be a structural (settlement / launcher) puzzle hash. Reading the
+  destination from the OUTER list is INSUFFICIENT and MUST NOT be relied on: the singleton layer morphs
+  the inner `CREATE_COIN` into `CREATE_COIN(singleton_puzzle_hash(struct, new_inner), amount)`, a
+  curried hash that can never equal a structural constant — so a structural-destination test applied
+  there refuses nothing, and an NFT re-homed under the settlement puzzle (spendable by anyone) is
+  admitted and named as an ordinary transfer.
 
   **MINT (unsigned legs).** A mint additionally spends the singleton LAUNCHER coin and the EVE NFT
   coin. Neither carries a signature — consensus authorizes them through the singleton lineage — so both
@@ -453,9 +460,19 @@ Used by dig-app. The subscriber + identity provider + signer.
   default-DENY allowlist (the launcher alone may CREATE its coin announcement). Each MUST emit exactly
   one odd-amount `CREATE_COIN`. Because no key binds these legs to the wallet, the binding is
   structural and is enforced at the BUNDLE level: the bundle MUST create a launcher-destined
-  `protocol_sink` output, every launcher coin's parent MUST be a coin the bundle spends, and every eve
-  coin's parent MUST be a launcher coin the bundle spends. Without those edges an unrelated
-  launcher/eve pair could ride along inside a bundle approved for something else.
+  `protocol_sink` output, every launcher coin's parent MUST be a coin the bundle spends, every eve
+  coin's parent MUST be a launcher coin the bundle spends, and every launcher coin MUST be the parent of
+  an eve coin the bundle spends. Without those edges an unrelated launcher/eve pair could ride along
+  inside a bundle approved for something else, or a launcher could be spent into a lineage the bundle
+  never accounts for and the summary never names.
+
+  A mint's OWNER MUST be pinned structurally, not by display: a WALLET-SIGNED coin MUST assert the
+  launcher's `CREATE_COIN_ANNOUNCEMENT`. The launcher announces `sha256tree` of its own solution, and
+  that solution is `(eve_puzzle_hash, amount, key_value_list)` — so the assertion makes the signature
+  commit to which eve coin, hence which owner, the launcher produces. Without it the unsigned launcher
+  is re-solvable AFTER signing to a different eve while the launcher id, and so the approved
+  `"mint nft1…"` sentence, is unchanged; a disclosure-only remedy is defeated by this, because the
+  disclosure would derive from the same malleable solution.
 
   Every OTHER NFT spend stays refused — a metadata update, an owner assignment / DID link, an offer
   settlement lock, and a melt.
@@ -463,10 +480,17 @@ Used by dig-app. The subscriber + identity provider + signer.
   **Naming (normative).** An NFT transfer re-homes the singleton's lone mojo to itself and nets ~0 XCH,
   so it is expressible in neither the output set nor the fee. Every NFT action MUST therefore be named
   in `SpendEffect::nft_operations` and in `TransactionSummary::nft_operations` as a canonical
-  `"transfer nft1…"` / `"mint nft1…"` string keyed on the NFT's permanent LAUNCHER id, rendered by the
-  single function the confirm screen also uses so the reviewed sentence and the compared sentence
-  cannot drift. The signer MUST compare that set as a sorted multiset and refuse a bundle whose NFT
-  actions the reviewed summary does not name, exactly as it does for destroyed singletons.
+  `"transfer nft1… to xch1…"` / `"mint nft1…"` string keyed on the NFT's permanent LAUNCHER id,
+  rendered by the single function the confirm screen also uses so the reviewed sentence and the
+  compared sentence cannot drift. The signer MUST compare that set as a sorted multiset and refuse a
+  bundle whose NFT actions the reviewed summary does not name, exactly as it does for destroyed
+  singletons.
+
+  A TRANSFER MUST additionally name its DESTINATION — the p2 puzzle hash from the SIGNED list, rendered
+  as an address. A transfer's entire effect is a change of owner, so naming only the NFT would let an
+  engine substitute its own destination for the one the person chose while the fee, the recipient
+  multiset and the NFT sentence all stayed identical, and the person would approve a transfer to the
+  attacker. The named owner MUST be the owner the signature commits to.
 
 - **Terminal singleton MELT (profile deletion, dig_ecosystem#3068).** A coin spend whose puzzle is the
   singleton top layer (`SINGLETON_TOP_LAYER_V1_1_HASH`), reached only AFTER the option-singleton and

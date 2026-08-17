@@ -3752,13 +3752,18 @@ pub(crate) mod singleton_melt_tests {
         ctx.take()
     }
 
-    /// A real NFT MINT whose funding coin does NOT assert the launcher's coin announcement.
+    /// A real NFT MINT whose funding coin asserts the WRONG coin announcement.
     ///
-    /// Built from the canonical sdk mint and then stripped of exactly that one condition, so the
-    /// fixture differs from an honest mint in the single fact under test. Everything else — the
-    /// funding coin, the launcher, the eve spend, conservation — is byte-identical to the mint the
-    /// gate admits.
-    fn nft_mint_without_the_launcher_announcement() -> Vec<CoinSpend> {
+    /// Built from the canonical sdk mint, with the launcher's announcement assertion REPLACED — not
+    /// deleted — by an assertion over a different announcement id. Deleting it would have proved
+    /// nothing about this edge: the MR-6 offer-binding pass counts ANY `AssertCoinAnnouncement` on a
+    /// coin that commits value to a protocol sink, and the funding coin commits its mojo to the
+    /// launcher, so a stripped bundle is refused by MR-6 before the launcher edge is ever consulted.
+    /// Replacing it keeps that control TRUE — the bundle still carries an assertion, MR-6 is still
+    /// satisfied, conservation is untouched, the funding coin, launcher and eve spends are otherwise
+    /// byte-identical — so the ONLY thing that can refuse this bundle is the launcher-specific
+    /// binding under test.
+    fn nft_mint_asserting_the_wrong_launcher_announcement() -> Vec<CoinSpend> {
         use chia_puzzle_types::nft::NftMetadata;
         use chia_wallet_sdk::driver::{Launcher, NftMint, StandardLayer};
 
@@ -3772,13 +3777,19 @@ pub(crate) mod singleton_melt_tests {
         let (mint_conditions, _nft) = launcher
             .mint_nft(&mut ctx, &mint)
             .expect("the canonical sdk NFT mint builder");
-        let stripped = Conditions::new().extend(
-            mint_conditions
-                .into_iter()
-                .filter(|condition| !matches!(condition, Condition::AssertCoinAnnouncement(_))),
-        );
+        let redirected = Conditions::new().extend(mint_conditions.into_iter().map(|condition| {
+            match condition {
+                Condition::AssertCoinAnnouncement(_) => {
+                    chia_wallet_sdk::types::conditions::AssertCoinAnnouncement::new(Bytes32::new(
+                        [0x9a; 32],
+                    ))
+                    .into()
+                }
+                other => other,
+            }
+        }));
         StandardLayer::new(owner_pk())
-            .spend(&mut ctx, funding, stripped)
+            .spend(&mut ctx, funding, redirected)
             .expect("the funding coin spends under the standard layer");
         ctx.take()
     }
@@ -3985,7 +3996,7 @@ pub(crate) mod singleton_melt_tests {
         );
     }
 
-    /// A mint whose funding coin does not assert the launcher's announcement is refused.
+    /// A mint whose signed coin asserts an announcement OTHER than the launcher's is refused.
     ///
     /// The launcher spend is UNSIGNED and its solution carries the eve puzzle hash, so without a
     /// signature-committed assertion over that solution's tree hash the launcher can be re-solved
@@ -3993,9 +4004,13 @@ pub(crate) mod singleton_melt_tests {
     /// the `"mint nft1…"` sentence the person approved, is unchanged. A fix that merely DISPLAYED the
     /// mint's owner would be defeated by this, because the display would be derived from the same
     /// malleable solution; only the structural binding closes it.
+    ///
+    /// The wrong-announcement fixture, rather than a stripped one, is what makes this test see the
+    /// edge under test instead of the MR-6 offer binding next door — see
+    /// [`nft_mint_asserting_the_wrong_launcher_announcement`].
     #[test]
-    fn a_mint_whose_launcher_announcement_is_unasserted_is_refused() {
-        let error = analyze(&nft_mint_without_the_launcher_announcement())
+    fn a_mint_asserting_the_wrong_launcher_announcement_is_refused() {
+        let error = analyze(&nft_mint_asserting_the_wrong_launcher_announcement())
             .expect_err("an unpinned launcher leaves the minted NFT's owner malleable");
         assert!(
             error.to_string().contains("re-solvable after signing"),
