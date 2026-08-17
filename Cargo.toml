@@ -144,6 +144,13 @@ chia-sdk-test = "0.34"
 # Test-only: expands a 24-word recovery phrase to the 64-byte HD seed so the money path can be pinned
 # against the address a STANDARD Chia wallet (Sage) shows for those exact words (dig_ecosystem #1759).
 bip39 = "2.0"
+# Test-only, and deliberately the REAL builders: the singleton-melt admission below is proven against
+# the melt spends dig-account will actually ask this gate to verify — a DIG store singleton
+# (`dig_merkle::melt`) and a DID singleton (`dig_did::melt`), whose inner layer stacks differ. A
+# hand-built singleton fixture would prove only that the arm accepts the fixture. Both are level-10
+# crates, strictly below this one, and both are test-only edges.
+dig-merkle = "0.6"
+dig-did = "0.7"
 
 [package.metadata.docs.rs]
 all-features = true

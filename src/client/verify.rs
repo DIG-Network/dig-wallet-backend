@@ -63,7 +63,9 @@ use chia_protocol::{Bytes32, CoinSpend};
 use chia_wallet_sdk::driver::{
     Cat, Layer, OptionContract, P2OneOfManyLayer, Puzzle, SettlementLayer, StandardLayer,
 };
-use chia_wallet_sdk::puzzles::{SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH};
+use chia_wallet_sdk::puzzles::{
+    SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH, SINGLETON_TOP_LAYER_V1_1_HASH,
+};
 use chia_wallet_sdk::types::{run_puzzle, Condition};
 use chia_wallet_sdk::utils::Address as Bech32Address;
 use clvm_traits::FromClvm;
@@ -151,6 +153,15 @@ struct SpendLedger {
     protocol_sink: Vec<DecodedOutput>,
     /// The explicit `RESERVE_FEE` total (the strict-path fee).
     fee: u64,
+    /// Mojos DESTROYED by a terminal singleton melt (dig_ecosystem#3068).
+    ///
+    /// A melted singleton's amount enters the spend and leaves it via no `CREATE_COIN` at all — the
+    /// `MELT_SINGLETON` magic condition occupies the one odd-amount output slot the puzzle permits,
+    /// so the mojo is unrecoverable by construction and consensus absorbs it as an implicit fee.
+    /// Tracked separately from [`fee`](Self::fee) so strict conservation still holds over every OTHER
+    /// coin in the bundle: the melted total is an explicitly accounted sink, never a relaxation of
+    /// the equality.
+    melted: u64,
     /// XCH value entering the spend (standard / settlement / option-singleton coin amounts).
     xch_in: u64,
     /// XCH value leaving the spend via `CREATE_COIN`.
@@ -172,6 +183,7 @@ impl SpendLedger {
             outputs: Vec::new(),
             protocol_sink: Vec::new(),
             fee: 0,
+            melted: 0,
             xch_in: 0,
             xch_out: 0,
             cat_in: BTreeMap::new(),
@@ -242,13 +254,26 @@ pub fn analyze(coin_spends: &[CoinSpend]) -> WalletResult<SpendEffect> {
         })?
     } else {
         let xch_out_plus_fee = accumulate(ledger.xch_out, ledger.fee, "XCH output + fee total")?;
-        if ledger.xch_in != xch_out_plus_fee {
+        // A melted singleton's mojo is a THIRD accounted destination beside outputs and the explicit
+        // fee: it is destroyed rather than paid to a puzzle hash, so the equality must name it or a
+        // legitimate melt reads as a value leak. Naming it here — instead of switching the bundle to
+        // implicit-fee mode — keeps the strict equality binding on every other coin in the same
+        // bundle, so the coin paying a melt's network fee is still held to full conservation.
+        let accounted = accumulate(
+            xch_out_plus_fee,
+            ledger.melted,
+            "XCH output + fee + melted total",
+        )?;
+        if ledger.xch_in != accounted {
             return Err(reject(format!(
-                "XCH value not conserved: in {} != out+fee {xch_out_plus_fee}",
+                "XCH value not conserved: in {} != out+fee+melted {accounted}",
                 ledger.xch_in
             )));
         }
-        ledger.fee
+        // The destroyed mojos ARE a fee — consensus hands them to the farmer exactly as a
+        // `RESERVE_FEE` does — so the reviewed figure must include them rather than silently
+        // omitting value the human is spending.
+        accumulate(ledger.fee, ledger.melted, "reported fee")?
     };
     // Conservation is checked in BOTH directions over the union of assets seen as inputs or outputs:
     // an output whose asset was never an input is a mint from thin air; an input asset with no (or a
@@ -355,6 +380,14 @@ fn account_coin(
              not consensus-forced, so a compromised engine could strip it after the wallet funds \
              the strike (deferred to #2245); refusing to sign",
         ));
+    }
+
+    // A TERMINAL singleton spend — the profile-deletion path (dig_ecosystem#3068). Reached only
+    // AFTER the option arms above, so an option singleton is still judged by its own, stricter rules
+    // and this arm can never be used to launder an option exercise. Any singleton spend that is not
+    // a melt is refused inside the helper.
+    if is_singleton_puzzle(puzzle) {
+        return account_singleton_melt(ledger, allocator, spend, puzzle_ptr, solution_ptr);
     }
 
     // A standard-layer XCH coin: its run conditions carry the XCH outputs + the fee.
@@ -583,6 +616,105 @@ fn account_option_transfer(
             );
         }
     }
+    Ok(())
+}
+
+/// True when `puzzle` is the singleton top layer, whatever inner puzzle it wraps.
+///
+/// Deliberately shallow: the DID layer and the DataLayer metadata layers are DIG types this crate
+/// does not and must not know, and a melt's admissibility does not depend on which of them is
+/// inside. What is checked instead is the CLVM the coin actually commits to — see
+/// [`account_singleton_melt`].
+fn is_singleton_puzzle(puzzle: Puzzle) -> bool {
+    puzzle
+        .as_curried()
+        .is_some_and(|curried| curried.mod_hash == SINGLETON_TOP_LAYER_V1_1_HASH.into())
+}
+
+/// Account a TERMINAL singleton spend — a melt — and refuse every other singleton spend fail-closed
+/// (dig_ecosystem#3068).
+///
+/// # Why this arm exists
+///
+/// Deleting a DIG profile ends both of its singletons: the DID and the dig-store. Until this arm,
+/// [`analyze`] refused every singleton spend at the dispatch's closing arm, so no melt could ever be
+/// authorized and a profile could not be deleted at all.
+///
+/// # Why admitting it is safe, and why ONLY a melt is admitted
+///
+/// The conditions are taken from RUNNING the coin's own committed puzzle against its own solution,
+/// so they are what consensus will do, not what a builder claims. A spend admitted here therefore
+/// provably creates NO coin at all and reserves no explicit fee. It has no destination, so there is
+/// nothing an attacker could redirect and nothing a human needs to review beyond the destruction
+/// itself.
+///
+/// **The admission test is the ABSENCE of any `CREATE_COIN`, not the presence of `MELT_SINGLETON`.**
+/// That is not a weaker check, it is the only expressible one: the singleton top layer CONSUMES the
+/// `(51 () -113)` magic condition while morphing its inner puzzle's output, so a melt's outer
+/// condition list contains no melt marker to look for — measured, it is `ASSERT_MY_AMOUNT`,
+/// `ASSERT_MY_PARENT_ID` and the owner's lone `AGG_SIG_ME`, and nothing else. A RECREATING spend, by
+/// contrast, always leaves the morphed odd-amount `CREATE_COIN` of its successor. So "creates
+/// nothing" is exactly "the lineage ends here", read off the same program consensus will run.
+///
+/// Every other singleton spend stays refused, and that distinction is the whole guard: an ordinary
+/// store UPDATE or a DID TRANSFER recreates the singleton under a new owner puzzle hash, which is a
+/// transfer of the profile's identity. Admitting the singleton CLASS would have made those signable
+/// as a side effect. `a_singleton_spend_that_recreates_the_singleton_is_still_refused` holds that
+/// line.
+///
+/// The signature rules are the crate's usual ones: at most one `AGG_SIG_ME`, and no non-`ME` agg-sig
+/// family, which could otherwise smuggle an authorization for a different coin into a spend the
+/// human approved as a deletion.
+///
+/// # The destroyed mojo is not recoverable, and that is not a defect
+///
+/// `(51 () -113)` occupies the one odd-amount `CREATE_COIN` a singleton may emit, so a melt that also
+/// returned the mojo is unexpressible under the puzzle. It is accounted as an implicit fee, which is
+/// what consensus does with it.
+fn account_singleton_melt(
+    ledger: &mut SpendLedger,
+    allocator: &mut Allocator,
+    spend: &CoinSpend,
+    puzzle_ptr: clvmr::NodePtr,
+    solution_ptr: clvmr::NodePtr,
+) -> WalletResult<()> {
+    let conditions = run_conditions(allocator, puzzle_ptr, solution_ptr)?;
+
+    let mut agg_sig_me = 0usize;
+    for condition in &conditions {
+        reject_unexpected_agg_sig(condition)?;
+        if condition.as_agg_sig_me().is_some() {
+            agg_sig_me += 1;
+            if agg_sig_me > 1 {
+                return Err(reject(
+                    "more than one AGG_SIG_ME condition in a singleton melt (possible blank-check \
+                     laundering)",
+                ));
+            }
+        }
+        // THE admission test. Nothing created means the lineage ends here — see the note above on
+        // why this, and not the `MELT_SINGLETON` marker, is what the wrapper leaves observable.
+        if condition.as_create_coin().is_some() {
+            return Err(reject(
+                "singleton spend creates a coin, so it is not a melt; only a TERMINAL singleton \
+                 spend is signable (an update or transfer re-homes the singleton, which is a \
+                 change of ownership no melt confirmation covers); refusing to sign",
+            ));
+        }
+        if let Some(reserve) = condition.as_reserve_fee() {
+            if reserve.amount > 0 {
+                return Err(reject(
+                    "singleton melt reserves an explicit fee it has no coin to pay it from; \
+                     refusing to sign",
+                ));
+            }
+        }
+    }
+
+    // The melted coin's amount both enters the spend and is destroyed by it. Recording both sides
+    // keeps the bundle's conservation equality exact rather than merely tolerant.
+    ledger.xch_in = accumulate(ledger.xch_in, spend.coin.amount, "XCH input total")?;
+    ledger.melted = accumulate(ledger.melted, spend.coin.amount, "melted total")?;
     Ok(())
 }
 
@@ -1933,5 +2065,207 @@ mod tests {
         )));
         assert!(!is_protocol_sink_hash(Bytes32::new([0x00; 32])));
         assert!(!is_protocol_sink_hash(wallet_ph()));
+    }
+}
+
+/// **Singleton melt admission** (dig_ecosystem#3068) — the profile-deletion path.
+///
+/// Deleting a DIG profile terminally spends its two singletons, the DID and the dig-store. Both melt
+/// spends are built here by the CANONICAL crates, so what these tests put in front of [`analyze`] is
+/// byte-for-byte what dig-account will ask it to verify.
+///
+/// Two singleton kinds, deliberately: their inner layer stacks differ (a `DidLayer` versus the
+/// DataLayer metadata layers), so a fixture of only one would prove the arm accepts that one stack.
+#[cfg(test)]
+mod singleton_melt_tests {
+    use super::*;
+    use chia_protocol::Coin;
+    use chia_puzzle_types::standard::StandardArgs;
+    use chia_wallet_sdk::driver::SpendContext;
+
+    /// A non-infinity public key with no secret behind it — enough to curry a standard puzzle and to
+    /// own a singleton, and never a key this crate could sign with.
+    fn owner_pk() -> chia_bls::PublicKey {
+        let mut g = [0u8; 48];
+        for (i, b) in [
+            0x97u8, 0xf1, 0xd3, 0xa7, 0x31, 0x97, 0xd7, 0x94, 0x26, 0x95, 0x63, 0x8c, 0x4f, 0xa9,
+            0xac, 0x0f, 0xc3, 0x68, 0x8c, 0x4f, 0x97, 0x74, 0xb9, 0x05, 0xa1, 0x4e, 0x3a, 0x3f,
+            0x17, 0x1b, 0xac, 0x58, 0x6c, 0x55, 0xe8, 0x3f, 0xf9, 0x7a, 0x1a, 0xef, 0xfb, 0x3a,
+            0xf0, 0x0a, 0xdb, 0x22, 0xc6, 0xbb,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            g[i] = b;
+        }
+        chia_bls::PublicKey::from_bytes(&g).expect("valid G1 generator")
+    }
+
+    fn owner_ph() -> Bytes32 {
+        Bytes32::from(StandardArgs::curry_tree_hash(owner_pk()).to_bytes())
+    }
+
+    /// A real DIG store singleton melt, built by `dig_merkle::melt`.
+    fn store_melt() -> Vec<CoinSpend> {
+        let store = dig_merkle::mint_datastore(
+            Coin::new(Bytes32::new([0x11; 32]), owner_ph(), 1),
+            dig_merkle::Owner::Standard(owner_pk()),
+            Bytes32::new([0x5a; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph(),
+            vec![],
+            0,
+        )
+        .expect("the canonical store mint builder")
+        .child
+        .expect("a mint yields the eve store");
+
+        dig_merkle::melt(&store, dig_merkle::Owner::Standard(owner_pk()))
+            .expect("the canonical store melt builder")
+            .coin_spends
+    }
+
+    /// A real DID singleton melt, built by `dig_did::melt`.
+    fn did_melt() -> Vec<CoinSpend> {
+        let mut ctx = SpendContext::new();
+        let did = dig_did::create_simple_did(
+            &mut ctx,
+            Coin::new(Bytes32::new([0x22; 32]), owner_ph(), 1),
+            dig_did::Owner::Standard(owner_pk()),
+        )
+        .expect("the canonical DID launch builder")
+        .child
+        .expect("a launch yields the settled DID");
+
+        dig_did::melt(&mut ctx, did, dig_did::Owner::Standard(owner_pk()))
+            .expect("the canonical DID melt builder")
+            .coin_spends
+    }
+
+    /// A store melt is ACCOUNTED, not refused: the singleton's mojo enters, nothing leaves, and the
+    /// destroyed amount is reported as the implicit fee.
+    #[test]
+    fn a_store_singleton_melt_is_accounted_with_its_mojo_as_the_implicit_fee() {
+        let effect = analyze(&store_melt()).expect("a terminal store melt must be verifiable");
+        assert!(
+            effect.outputs.is_empty() && effect.protocol_sink.is_empty(),
+            "a melt creates no coin, so nothing may be reported as leaving"
+        );
+        assert_eq!(
+            effect.fee, 1,
+            "the singleton's mojo is destroyed, and the only honest place to report it is the fee"
+        );
+    }
+
+    /// The same, for a DID singleton — a different inner layer stack through the same arm.
+    #[test]
+    fn a_did_singleton_melt_is_accounted_with_its_mojo_as_the_implicit_fee() {
+        let effect = analyze(&did_melt()).expect("a terminal DID melt must be verifiable");
+        assert!(effect.outputs.is_empty() && effect.protocol_sink.is_empty());
+        assert_eq!(effect.fee, 1);
+    }
+
+    /// A melt does not travel alone: dig-account pays its network fee from an ordinary wallet coin in
+    /// the SAME bundle. Both legs must account together, and the reported fee must name every mojo
+    /// the person is spending — the explicit reserve AND the destroyed singleton.
+    #[test]
+    fn a_melt_bundled_with_its_fee_paying_coin_accounts_both_legs() {
+        let mut spends = store_melt();
+        spends.extend(fee_paying_coin(1_000, 900, 100));
+
+        let effect = analyze(&spends).expect("a melt beside its fee payer must be verifiable");
+        assert_eq!(
+            effect.fee, 101,
+            "100 reserved plus the 1 destroyed mojo — a fee that omitted the melt would understate \
+             what the person spends"
+        );
+    }
+
+    /// **The abuse test for the widened conservation.** Admitting a melt added a third accounted
+    /// destination to the value equality; this proves it did not become a hole.
+    ///
+    /// The fee-paying coin in this bundle leaks 500 mojos — it neither creates them as an output nor
+    /// reserves them as a fee. Were the melt switched to the implicit-fee mode the option path uses
+    /// (`fee = in - out`), the whole bundle would stop being held to the equality and this leak would
+    /// be silently reported as a fee. It is refused instead, and the ONLY difference between this
+    /// test and the one above is the leak.
+    #[test]
+    fn a_melt_does_not_excuse_a_value_leak_elsewhere_in_the_bundle() {
+        let mut spends = store_melt();
+        spends.extend(fee_paying_coin(1_000, 400, 100));
+
+        let err = analyze(&spends)
+            .expect_err("a melt in the bundle must not relax conservation for any other coin");
+        assert!(
+            err.message.contains("not conserved"),
+            "the refusal must be the conservation one, not an incidental parse failure: {}",
+            err.message
+        );
+    }
+
+    /// An ordinary standard-layer coin of `amount` that returns `change` to the wallet and reserves
+    /// `fee`. When `amount != change + fee` the coin LEAKS the difference, which is how the abuse
+    /// test above is built from the same helper as its control.
+    fn fee_paying_coin(amount: u64, change: u64, fee: u64) -> Vec<CoinSpend> {
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::driver::StandardLayer;
+        use chia_wallet_sdk::types::Conditions;
+
+        let mut ctx = SpendContext::new();
+        StandardLayer::new(owner_pk())
+            .spend(
+                &mut ctx,
+                Coin::new(Bytes32::new([0x44; 32]), owner_ph(), amount),
+                Conditions::new()
+                    .create_coin(owner_ph(), change, Memos::None)
+                    .reserve_fee(fee),
+            )
+            .expect("a standard fee-paying spend");
+        ctx.take()
+    }
+
+    /// **The control that makes the two tests above load-bearing.** A singleton spend that does NOT
+    /// melt — the store's ordinary root UPDATE, which recreates the singleton — is still refused.
+    ///
+    /// Without this, admitting "a singleton spend" and admitting "a TERMINAL singleton spend" are
+    /// indistinguishable, and the arm could have opened the whole singleton class to signing: an
+    /// update re-homes the store to a new owner, so waving it through is a transfer of the profile's
+    /// identity that no human reviewed.
+    #[test]
+    fn a_singleton_spend_that_recreates_the_singleton_is_still_refused() {
+        let store = dig_merkle::mint_datastore(
+            Coin::new(Bytes32::new([0x33; 32]), owner_ph(), 1),
+            dig_merkle::Owner::Standard(owner_pk()),
+            Bytes32::new([0x5a; 32]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            owner_ph(),
+            vec![],
+            0,
+        )
+        .expect("the canonical store mint builder")
+        .child
+        .expect("a mint yields the eve store");
+
+        let updated = dig_merkle::update_root(
+            &store,
+            dig_merkle::Owner::Standard(owner_pk()),
+            dig_merkle::DigDataStoreMetadata {
+                root_hash: Bytes32::new([0x77; 32]),
+                ..Default::default()
+            },
+        )
+        .expect("the canonical store update builder");
+
+        let err = analyze(&updated.coin_spends)
+            .expect_err("only a TERMINAL singleton spend is admissible; an update is not");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
     }
 }
