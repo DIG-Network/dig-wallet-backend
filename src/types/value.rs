@@ -125,6 +125,20 @@ pub struct TransactionSummary {
     /// an absent field means "this spend destroys nothing", which the gate then holds it to.
     #[serde(default)]
     pub melted_singletons: Vec<String>,
+    /// One canonical description per NFT lifecycle action the spend performs — `"transfer nft1…"`
+    /// / `"mint nft1…"` (dig_ecosystem#3077).
+    ///
+    /// An NFT action is nearly free in mojos: a transfer moves the singleton's lone mojo to itself
+    /// and nets ~0 XCH. So, exactly like a melt, it is expressible in neither
+    /// [`outputs`](Self::outputs) nor [`fee`](Self::fee), and a person shown only those would
+    /// confirm a dust movement while an NFT changed hands. Naming the action here is what lets the
+    /// confirm screen say what is happening and the signing gate refuse a bundle whose NFT action
+    /// the reviewed summary never mentioned.
+    ///
+    /// Additive (`#[serde(default)]`) so older wire payloads still deserialize — an absent field
+    /// means "this spend touches no NFT", which the gate then holds it to.
+    #[serde(default)]
+    pub nft_operations: Vec<String>,
 }
 
 impl TransactionSummary {
@@ -138,6 +152,7 @@ impl TransactionSummary {
             received: Vec::new(),
             fee,
             melted_singletons: Vec::new(),
+            nft_operations: Vec::new(),
         }
     }
 }
@@ -195,6 +210,7 @@ mod tests {
     fn records_round_trip() {
         let summary = TransactionSummary {
             melted_singletons: Vec::new(),
+            nft_operations: Vec::new(),
             received: vec![],
             outputs: vec![SpendOutput {
                 address: Address("xch1abc".into()),

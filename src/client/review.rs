@@ -40,6 +40,14 @@ pub struct HumanReadableSummary {
     /// [`lines`](Self::lines), never taken from an engine claim, and the signing gate refuses any
     /// spend whose destroyed set differs from the reviewed one.
     pub melt_lines: Vec<String>,
+    /// One line per NFT lifecycle action the spend performs (dig_ecosystem#3077). Empty for every
+    /// spend that touches no NFT.
+    ///
+    /// An NFT transfer nets ~0 XCH, so without its own lines it is invisible on the confirm screen:
+    /// a person would see a one-mojo movement and approve an NFT changing hands. Re-derived from the
+    /// coin spends like [`lines`](Self::lines), never taken from an engine claim, and the signing
+    /// gate refuses any spend whose NFT actions differ from the reviewed ones.
+    pub nft_lines: Vec<String>,
     /// The fee, rendered.
     pub fee_line: String,
     /// The number of coin spends the transaction contains.
@@ -161,10 +169,27 @@ pub(crate) fn render(
         .map(|coin_id| format!("Permanently DESTROY singleton {coin_id} — this cannot be undone"))
         .collect();
 
+    // Rendered from `summary` (the re-derived view) for the same reason the melt lines are: an NFT
+    // action is fully re-derivable from the coin spends, so an engine claim is never consulted.
+    let nft_lines = summary
+        .nft_operations
+        .iter()
+        .map(|operation| {
+            let mut line = operation.clone();
+            if let Some(rest) = line.strip_prefix("transfer ") {
+                line = format!("Transfer NFT {rest} — it leaves this wallet");
+            } else if let Some(rest) = line.strip_prefix("mint ") {
+                line = format!("Mint NFT {rest}");
+            }
+            line
+        })
+        .collect();
+
     HumanReadableSummary {
         lines,
         receive_lines,
         melt_lines,
+        nft_lines,
         fee_line: format!("Fee {} XCH", render_amount(summary.fee, true)),
         coin_spend_count: unsigned.coin_spends.len(),
         required_signature_count: unsigned.required_signatures.len(),
@@ -199,6 +224,7 @@ mod tests {
             required_signatures: vec![],
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 outputs,
                 received: vec![],
                 fee,

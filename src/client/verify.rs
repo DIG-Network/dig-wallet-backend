@@ -1430,6 +1430,7 @@ pub fn derive_summary(coin_spends: &[CoinSpend]) -> WalletResult<TransactionSumm
         &effect.protocol_sink,
         effect.fee,
         &effect.melted_singletons,
+        &effect.nft_operations,
     )
 }
 
@@ -1448,6 +1449,7 @@ pub fn summarize_egress(
     protocol_sink: &[DecodedOutput],
     fee: u64,
     melted_singletons: &[Bytes32],
+    nft_operations: &[NftOperation],
 ) -> WalletResult<TransactionSummary> {
     let mut outputs = egress
         .iter()
@@ -1486,6 +1488,14 @@ pub fn summarize_egress(
         // Destruction is egress of a kind no address can express, so it travels as its own field
         // rather than as an output line the recipient gate would then have to except.
         melted_singletons: melted_singletons.iter().map(hex::encode).collect(),
+        // An NFT action is worth ~0 mojos, so like destruction it travels as its own field rather
+        // than as an output line the recipient gate would then have to except. Rendered through
+        // `NftOperation::describe` — the SAME function the confirm screen uses — so the sentence a
+        // human approves and the sentence the gate compares can never drift apart.
+        nft_operations: nft_operations
+            .iter()
+            .map(|operation| operation.describe())
+            .collect::<WalletResult<Vec<_>>>()?,
     })
 }
 
@@ -3575,7 +3585,10 @@ pub(crate) mod singleton_melt_tests {
 
     /// The coin spends of a real NFT TRANSFER: one NFT singleton spend re-homing the NFT to
     /// [`nft_recipient_ph`] under the owner's standard layer.
-    fn nft_transfer() -> Vec<CoinSpend> {
+    ///
+    /// `pub(crate)` so the signer's review-gate tests transfer a REAL NFT through the real sdk
+    /// builder rather than a second, drifting copy of this fixture.
+    pub(crate) fn nft_transfer() -> Vec<CoinSpend> {
         use chia_wallet_sdk::driver::StandardLayer;
 
         let (mut ctx, nft, _mint_spends) = nft_mint_parts();

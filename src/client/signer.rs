@@ -63,6 +63,10 @@ struct OwnedSplit {
     /// has no destination to own, and destroying a singleton this wallet does NOT control is if
     /// anything more alarming, so every melt is carried through to the review gate.
     melted_singletons: Vec<Bytes32>,
+    /// Every NFT lifecycle action the bundle performs (dig_ecosystem#3077). Ownership-independent,
+    /// exactly like [`melted_singletons`](Self::melted_singletons): an NFT action is an act on a
+    /// lineage, not value returning home, so no key-ownership split applies to it.
+    nft_operations: Vec<verify::NftOperation>,
 }
 
 /// The Chia mainnet genesis challenge — the AGG_SIG_ME additional data every mainnet spend
@@ -322,6 +326,9 @@ impl LocalSigner {
             protocol_sink: effect.protocol_sink,
             fee: effect.fee,
             melted_singletons: effect.melted_singletons,
+            // Ownership-independent for the same reason a melt is: an NFT action names a lineage,
+            // not value returning home, so there is no key-ownership split to apply.
+            nft_operations: effect.nft_operations,
         }
     }
 
@@ -339,6 +346,7 @@ impl LocalSigner {
             &split.protocol_sink,
             split.fee,
             &split.melted_singletons,
+            &split.nft_operations,
         )
     }
 
@@ -418,6 +426,23 @@ impl LocalSigner {
         reviewed_melts.sort();
         if derived_melts != reviewed_melts {
             return Err(mismatch("destroyed singletons"));
+        }
+
+        // An NFT action is the other effect no output line can express: a transfer nets ~0 XCH, so
+        // an NFT slipped into an ordinary send moves neither the recipient set nor the fee by
+        // anything a person would notice (dig_ecosystem#3077). Compared as its own sorted multiset,
+        // so a bundle that transfers or mints an NFT the human's summary never named is refused —
+        // the same shape the melt comparison above takes, and for the same reason.
+        let mut derived_nfts = split
+            .nft_operations
+            .iter()
+            .map(|operation| operation.describe())
+            .collect::<WalletResult<Vec<_>>>()?;
+        let mut reviewed_nfts = claimed.nft_operations.clone();
+        derived_nfts.sort();
+        reviewed_nfts.sort();
+        if derived_nfts != reviewed_nfts {
+            return Err(mismatch("NFT operations"));
         }
 
         // The recipient set: derived recipients (real puzzle hashes) vs the claimed outputs carrying a
@@ -749,6 +774,7 @@ mod tests {
     fn empty_summary() -> TransactionSummary {
         TransactionSummary {
             melted_singletons: Vec::new(),
+            nft_operations: Vec::new(),
             received: vec![],
             outputs: vec![],
             fee: Amount(0),
@@ -1435,6 +1461,7 @@ mod tests {
             }],
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 received: vec![],
                 outputs: vec![SpendOutput {
                     address: crate::types::Address("xch1whatever".into()),
@@ -1489,6 +1516,7 @@ mod tests {
             required_signatures: vec![],
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 received: vec![],
                 outputs: vec![],
                 fee: Amount(0),
@@ -1598,6 +1626,7 @@ mod tests {
             required_signatures: vec![],
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 received: vec![],
                 outputs: vec![],
                 fee: Amount(0),
@@ -2146,6 +2175,7 @@ mod tests {
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 received: vec![],
                 outputs: vec![SpendOutput {
                     address: xch_addr(honest),
@@ -2168,6 +2198,7 @@ mod tests {
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 received: vec![],
                 outputs: vec![
                     SpendOutput {
@@ -2552,6 +2583,7 @@ mod tests {
                 // the dishonest claim too — which is the whole reason destruction needs a field.
                 fee: Amount(1),
                 melted_singletons,
+                nft_operations: Vec::new(),
             },
         };
 
@@ -2585,6 +2617,119 @@ mod tests {
             .expect("the SAME bundle, with the destruction named, must pass the review gate");
     }
 
+    /// An NFT transfer slipped into an ordinary send must be REFUSED unless the reviewed summary
+    /// names it (dig_ecosystem#3077) — the melt lesson, carried to the effect that is even harder
+    /// to see.
+    ///
+    /// A melt at least moves the fee by a mojo. An NFT transfer moves the singleton's lone mojo to
+    /// ITSELF, so it nets ~0 XCH: the recipient set is unchanged, the fee is unchanged, and every
+    /// comparison this gate made before the `nft_operations` field existed is satisfied by the
+    /// dishonest claim. Only naming the act can catch it.
+    ///
+    /// The control matters as much as the refusal: the SAME bundle, with the NFT named, must PASS.
+    /// Without it a gate that refused every NFT bundle outright would look identical here, and the
+    /// feature would be unusable while the test stayed green.
+    #[test]
+    fn refuses_an_nft_transfer_the_summary_never_named_3077() {
+        use crate::types::SpendOutput;
+
+        let recipient = Bytes32::new([0x6c; 32]);
+        let (signer, mut coin_spends) =
+            wallet_xch_spend("nft-hidden", 50_000, &[(recipient, 50_000, false)], false);
+
+        let transfer = crate::client::verify::singleton_melt_tests::nft_transfer();
+        let effect = crate::client::verify::analyze(&transfer)
+            .expect("the NFT transfer fixture is independently verifiable");
+        // The re-homed singleton IS an ordinary non-owned output, so an attacker can list it as a
+        // one-mojo send line and satisfy the recipient comparison exactly. Doing so here is what
+        // isolates the property under test: with the dust line present, `nft_operations` is the ONLY
+        // comparison that can still tell the two summaries apart.
+        let dust_line = SpendOutput {
+            address: xch_addr(effect.outputs[0].puzzle_hash),
+            amount: Amount(effect.outputs[0].amount),
+            asset_id: None,
+        };
+        let named = effect
+            .nft_operations
+            .iter()
+            .map(|operation| {
+                operation
+                    .describe()
+                    .expect("an NFT operation describes itself")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(named.len(), 1, "the fixture transfers exactly one NFT");
+        coin_spends.extend(transfer);
+
+        let send_line = SpendOutput {
+            address: xch_addr(recipient),
+            amount: Amount(50_000),
+            asset_id: None,
+        };
+        let unsigned = |nft_operations: Vec<String>| UnsignedSpend {
+            coin_spends: coin_spends.clone(),
+            required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
+            summary: TransactionSummary {
+                outputs: vec![send_line.clone(), dust_line.clone()],
+                received: vec![],
+                // The re-home is listed as a dust send line above and the fee is unchanged, so
+                // every pre-existing comparison passes on this claim.
+                fee: Amount(0),
+                melted_singletons: Vec::new(),
+                nft_operations,
+            },
+        };
+
+        let err = signer
+            .verify_before_signing(&unsigned(Vec::new()))
+            .expect_err("a spend that transfers an NFT the summary never named must be refused");
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+        assert!(
+            err.message.contains("NFT operations"),
+            "the refusal must name the unreviewed NFT action, not an incidental mismatch: {}",
+            err.message
+        );
+
+        // The control: the re-homed NFT is owned by the fixture's foreign key, so this is asserted
+        // at the REVIEW gate — signing would fail for want of a key, which would say nothing about
+        // whether a NAMED transfer is accepted.
+        signer
+            .verify_before_signing(&unsigned(named))
+            .expect("the SAME bundle, with the NFT transfer named, must pass the review gate");
+    }
+
+    /// The confirm screen must SHOW the NFT action, not merely refuse an unnamed one: a gate whose
+    /// only remedy is a line the renderer never draws moves the lie from the signer to the screen.
+    #[test]
+    fn the_confirm_screen_renders_an_nft_transfer_line_3077() {
+        let summary = TransactionSummary {
+            outputs: Vec::new(),
+            received: Vec::new(),
+            fee: Amount(0),
+            melted_singletons: Vec::new(),
+            nft_operations: vec!["transfer nft1abc".to_string()],
+        };
+        let unsigned = UnsignedSpend {
+            coin_spends: Vec::new(),
+            required_signatures: Vec::new(),
+            summary: summary.clone(),
+        };
+
+        let rendered = crate::client::review::render(&unsigned, &summary, true);
+        assert_eq!(rendered.nft_lines.len(), 1);
+        assert!(
+            rendered.nft_lines[0].contains("nft1abc")
+                && rendered.nft_lines[0].to_lowercase().contains("transfer"),
+            "the confirm line must name the NFT and the act: {}",
+            rendered.nft_lines[0]
+        );
+        assert!(
+            !rendered.nft_lines[0].contains("mojo"),
+            "an NFT action must never be shown to a person as a dust amount: {}",
+            rendered.nft_lines[0]
+        );
+    }
+
     /// The confirm screen must SHOW the destruction, not merely refuse an unnamed one: a gate whose
     /// only remedy is a line the renderer never draws moves the lie from the signer to the screen.
     #[test]
@@ -2599,6 +2744,7 @@ mod tests {
                 received: vec![],
                 fee: Amount(1),
                 melted_singletons: vec!["ab".repeat(32)],
+                nft_operations: Vec::new(),
             },
         };
 
@@ -2809,6 +2955,7 @@ mod tests {
             required_signatures: vec![],
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 received: vec![],
                 outputs: vec![SpendOutput {
                     address: Address("xch1attacker".into()),
@@ -2872,6 +3019,7 @@ mod tests {
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 received: vec![],
                 outputs: vec![SpendOutput {
                     address: crate::types::Address(String::new()),
@@ -2897,6 +3045,7 @@ mod tests {
             required_signatures: signer2.required_signatures_from(&real_spends).unwrap(),
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 received: vec![],
                 outputs: vec![SpendOutput {
                     address: crate::types::Address(String::new()),
@@ -2944,6 +3093,7 @@ mod tests {
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 received: vec![],
                 outputs: vec![SpendOutput {
                     address: crate::types::Address(String::new()),
@@ -2965,6 +3115,7 @@ mod tests {
             required_signatures: signer.required_signatures_from(&coin_spends).unwrap(),
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 received: vec![],
                 outputs: vec![
                     SpendOutput {
@@ -2998,6 +3149,7 @@ mod tests {
 
         let sink_summary = || TransactionSummary {
             melted_singletons: Vec::new(),
+            nft_operations: Vec::new(),
             received: vec![],
             outputs: vec![SpendOutput {
                 address: crate::types::Address(String::new()),
@@ -3073,6 +3225,7 @@ mod tests {
         let signer = canonical_mainnet_signer("mr8");
         let empty = TransactionSummary {
             melted_singletons: Vec::new(),
+            nft_operations: Vec::new(),
             received: vec![],
             outputs: vec![],
             fee: Amount(0),

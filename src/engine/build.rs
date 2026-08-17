@@ -224,6 +224,7 @@ impl SpendBuilder for SdkSpendBuilder {
             required_signatures,
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 outputs: vec![SpendOutput {
                     address: to,
                     amount: crate::types::Amount(amount),
@@ -294,6 +295,7 @@ impl SpendBuilder for SdkSpendBuilder {
             required_signatures,
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 outputs: vec![SpendOutput {
                     address: to,
                     amount,

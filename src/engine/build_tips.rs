@@ -230,6 +230,7 @@ impl SdkSpendBuilder {
             required_signatures,
             summary: TransactionSummary {
                 melted_singletons: Vec::new(),
+                nft_operations: Vec::new(),
                 outputs: vec![SpendOutput {
                     address: encode_address(recipient_ph)?,
                     amount,
