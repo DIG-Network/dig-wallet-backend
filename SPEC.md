@@ -466,8 +466,8 @@ Used by dig-app. The subscriber + identity provider + signer.
   OWNER; that destination MUST NOT be a structural (settlement / launcher) puzzle hash, and MUST be
   read from the inner list, where a structural-destination test is not vacuous.
 
-  Because no key binds these legs to the wallet, the binding is
-  structural and is enforced at the BUNDLE level: the bundle MUST create a launcher-destined
+  Because no key binds these legs to the wallet, the binding is structural and is enforced at the
+  BUNDLE level: the bundle MUST create a launcher-destined
   `protocol_sink` output, every launcher coin's parent MUST be a coin the bundle spends, every eve
   coin's parent MUST be a launcher coin the bundle spends, and every launcher coin MUST be the parent of
   an eve coin the bundle spends. Without those edges an unrelated launcher/eve pair could ride along
@@ -493,9 +493,8 @@ Used by dig-app. The subscriber + identity provider + signer.
   so it is expressible in neither the output set nor the fee. Every NFT action MUST therefore be named
   in `SpendEffect::nft_operations` and in `TransactionSummary::nft_operations` as a canonical
   `"transfer nft1… to xch1…"` / `"mint nft1… owned by xch1…"` string keyed on the NFT's permanent
-  LAUNCHER id,
-  rendered by the single function the confirm screen also uses so the reviewed sentence and the
-  compared sentence cannot drift. The signer MUST compare that set as a sorted multiset and refuse a
+  LAUNCHER id, rendered by the single function the confirm screen also uses so the reviewed sentence and
+  the compared sentence cannot drift. The signer MUST compare that set as a sorted multiset and refuse a
   bundle whose NFT actions the reviewed summary does not name, exactly as it does for destroyed
   singletons.
 
