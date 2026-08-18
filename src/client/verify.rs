@@ -832,13 +832,14 @@ fn account_nft_spend(
     solution_ptr: clvmr::NodePtr,
 ) -> WalletResult<()> {
     match nft.proof {
+        // The eve arm deliberately does NOT receive `p2_solution`: its conditions come from the
+        // eve puzzle's own quote, and a solution it cannot see is a solution it cannot trust.
         Proof::Eve(_) => account_nft_eve_mint(
             ledger,
             allocator,
             spend,
             nft,
             p2_puzzle,
-            p2_solution,
             puzzle_ptr,
             solution_ptr,
         ),
@@ -910,7 +911,7 @@ fn account_nft_transfer(
     //
     // This list is also the artifact the signature commits to, so it is the right one on both
     // counts.
-    for condition in &committed.conditions {
+    for condition in committed.conditions.conditions() {
         reject_unexpected_agg_sig(condition)?;
         reject_non_rehome_condition(condition, RehomeClass::NftSigned)?;
     }
@@ -965,6 +966,66 @@ fn account_nft_transfer(
     Ok(())
 }
 
+/// Conditions a CLVM puzzle fixes for EVERY solution, and the only way to obtain them.
+///
+/// A puzzle's conditions are authorized by a signature (the standard layer signs
+/// `sha256tree(delegated_puzzle)`) or by lineage (an eve singleton's launcher pins its puzzle hash)
+/// — in both cases the commitment covers the PUZZLE and never its SOLUTION. So conditions read by
+/// RUNNING a puzzle against a caller-supplied solution are only as trustworthy as that solution is,
+/// which is to say not at all: the same commitment then covers two spends that do different things,
+/// and the one shown for review need not be the one submitted.
+///
+/// The canonical quote form `(q . conditions)` removes the solution from the answer entirely. This
+/// module is what makes that proof unskippable: [`QuotedConditions`]'s field is private to it and
+/// its only constructor performs the proof, so no caller can hold one without having proven it.
+mod immalleable {
+    use super::{reject, Condition, FromClvm, WalletResult};
+    use clvmr::{Allocator, NodePtr};
+
+    /// The condition list a QUOTED puzzle commits to, for every solution.
+    pub(super) struct QuotedConditions(Vec<Condition>);
+
+    impl QuotedConditions {
+        /// Prove `puzzle` is the canonical quote form and decode what it commits to.
+        ///
+        /// `what` names the puzzle in the arm's own vocabulary, so a refusal reads as the act the
+        /// person attempted. Fail-closed: anything that is not a bare quote is refused BEFORE its
+        /// conditions are looked at, because a malleable puzzle's conditions describe only the
+        /// solution it happened to be handed.
+        pub(super) fn prove(
+            allocator: &Allocator,
+            puzzle: NodePtr,
+            what: &str,
+        ) -> WalletResult<Self> {
+            // A quote is a pair whose first element is the atom `1`.
+            let clvmr::SExp::Pair(quote_op, quoted) = allocator.sexp(puzzle) else {
+                return Err(reject(format!(
+                    "{what} is not quote-form (not a pair), so its conditions come from a solution \
+                     nothing commits to; refusing to sign"
+                )));
+            };
+            if allocator.small_number(quote_op) != Some(1) {
+                return Err(reject(format!(
+                    "{what} is not the canonical quote form, so its conditions come from a \
+                     solution nothing commits to; refusing to sign"
+                )));
+            }
+            Ok(Self(
+                Vec::<Condition>::from_clvm(allocator, quoted).map_err(|e| {
+                    reject(format!("undecodable quoted conditions in {what}: {e:?}"))
+                })?,
+            ))
+        }
+
+        /// The conditions the quote commits to.
+        pub(super) fn conditions(&self) -> &[Condition] {
+            &self.0
+        }
+    }
+}
+
+use immalleable::QuotedConditions;
+
 /// The p2 puzzle hash an NFT spend hands the singleton to — the NEW OWNER — read from the arm's
 /// INNER condition list, and refused when it is a structural puzzle hash (#3077).
 ///
@@ -986,10 +1047,24 @@ fn account_nft_transfer(
 /// unable to drift: a property added here cannot reach one arm without reaching the other
 /// (dig_ecosystem#3103 removes the remaining possibility at the type level).
 ///
+/// # Why it takes a proven type, not a condition slice
+///
+/// Both lists must ALSO be immalleable — fixed by the puzzle rather than by a solution — or the
+/// destination read here is one nobody committed to. That proof used to live only in the transfer
+/// arm's [`committed_standard_spend`], which bundled TWO guarantees (prove quote-form, THEN extract
+/// conditions) and had only its second half factored out to be shared; the mint arm took the shared
+/// half and silently went without the other, so its owner came from an unsigned solution. Requiring
+/// a [`QuotedConditions`] — a type no arm can construct except by proving the quote — makes taking
+/// one guarantee without the other unrepresentable rather than merely discouraged.
+///
 /// `what` names the arm so a refusal reads as the act the person attempted, never as a generic one.
-fn inner_rehome_destination(inner: &[Condition], what: &str) -> WalletResult<Bytes32> {
+fn inner_rehome_destination(inner: &QuotedConditions, what: &str) -> WalletResult<Bytes32> {
     let mut destination = None;
-    for create in inner.iter().filter_map(Condition::as_create_coin) {
+    for create in inner
+        .conditions()
+        .iter()
+        .filter_map(Condition::as_create_coin)
+    {
         if destination.is_some() {
             return Err(reject(format!(
                 "{what}'s inner puzzle emits more than one CREATE_COIN (undisclosed extra \
@@ -1052,16 +1127,18 @@ fn account_nft_eve_mint(
     spend: &CoinSpend,
     nft: Nft,
     p2_puzzle: Puzzle,
-    p2_solution: clvmr::NodePtr,
     puzzle_ptr: clvmr::NodePtr,
     solution_ptr: clvmr::NodePtr,
 ) -> WalletResult<()> {
-    // The eve's INNER list, where the owner is still in the clear. Judged in full rather than only
-    // read from: the ownership layer CONSUMES a `TransferNft` while re-emitting the rest, so a
+    // The eve's INNER list, where the owner is still in the clear. Taken from the PUZZLE's own
+    // quote rather than by running it against `p2_solution`, because that solution carries no
+    // signature: see the malleability section above. Judged in full rather than only read from,
+    // because the ownership layer CONSUMES a `TransferNft` while re-emitting the rest, so a
     // condition the outer allowlist cannot see would otherwise ride along here.
-    let inner = run_conditions(allocator, p2_puzzle.ptr(), p2_solution)?;
-    reject_any_agg_sig_in(&inner, "an NFT mint's eve spend")?;
-    for condition in &inner {
+    let inner =
+        QuotedConditions::prove(allocator, p2_puzzle.ptr(), "an NFT mint's eve inner puzzle")?;
+    reject_any_agg_sig_in(inner.conditions(), "an NFT mint's eve spend")?;
+    for condition in inner.conditions() {
         reject_non_rehome_condition(condition, RehomeClass::NftEve)?;
     }
     let owner = inner_rehome_destination(&inner, "an NFT mint")?;
@@ -1947,7 +2024,7 @@ struct CommittedStandardSpend {
     /// `sha256tree(delegated_puzzle)` — the exact message the coin's sole `AGG_SIG_ME` must carry.
     message: [u8; 32],
     /// The conditions the quoted delegated puzzle commits to, for every solution.
-    conditions: Vec<Condition>,
+    conditions: QuotedConditions,
 }
 
 /// Prove a standard-layer solution's delegated puzzle is the canonical QUOTE form and return what it
@@ -1967,22 +2044,13 @@ fn committed_standard_spend(
 ) -> WalletResult<CommittedStandardSpend> {
     let solution = StandardLayer::parse_solution(allocator, standard_solution)
         .map_err(|e| reject(format!("malformed standard-layer solution: {e:?}")))?;
-    // A quote is a pair whose first element is the atom `1`.
-    let clvmr::SExp::Pair(quote_op, quoted_conditions) = allocator.sexp(solution.delegated_puzzle)
-    else {
-        return Err(reject(
-            "delegated puzzle is not quote-form (not a pair) — signature would not commit to outputs",
-        ));
-    };
-    if allocator.small_number(quote_op) != Some(1) {
-        return Err(reject(
-            "delegated puzzle is not the canonical quote form — signature would not commit to outputs",
-        ));
-    }
     Ok(CommittedStandardSpend {
         message: tree_hash(allocator, solution.delegated_puzzle).to_bytes(),
-        conditions: Vec::<Condition>::from_clvm(allocator, quoted_conditions)
-            .map_err(|e| reject(format!("undecodable signed delegated conditions: {e:?}")))?,
+        conditions: QuotedConditions::prove(
+            allocator,
+            solution.delegated_puzzle,
+            "the delegated puzzle",
+        )?,
     })
 }
 
