@@ -4125,6 +4125,55 @@ pub(crate) mod singleton_melt_tests {
         );
     }
 
+    /// The same canonical sdk eve mint, but with the eve's p2 puzzle replaced by the CLVM IDENTITY
+    /// program `1` — a puzzle that returns whatever SOLUTION it is handed as its condition list.
+    ///
+    /// Built from the launcher UP rather than rewritten afterwards, which is the whole point: the
+    /// launcher's solution carries this eve's puzzle hash and the funding coin's signature commits
+    /// to that launcher solution, so every binding in the bundle is honest and consistent. The ONLY
+    /// anomaly is that the eve's conditions — and therefore the OWNER — live in a solution no
+    /// signature covers. Rewriting a canonical mint after the fact could not express this: it would
+    /// break the launcher binding and be refused for a neighbouring reason.
+    fn nft_mint_with_solution_malleable_eve(owner: Bytes32) -> Vec<CoinSpend> {
+        use chia_puzzle_types::nft::NftMetadata;
+        use chia_wallet_sdk::driver::{Launcher, NftMint, Spend, StandardLayer};
+
+        let mut ctx = SpendContext::new();
+        let funding = nft_funding_coin();
+        let metadata = ctx
+            .alloc_hashed(&NftMetadata::default())
+            .expect("the default NFT metadata allocates");
+        // `1` is the identity program: solution-malleable by construction.
+        let identity = ctx.alloc(&1).expect("the identity program allocates");
+        let p2_puzzle_hash: Bytes32 = ctx.tree_hash(identity).into();
+
+        // Every parameter but the p2 puzzle comes from the canonical mint builder, so the fixture
+        // cannot drift from the honest one it mirrors.
+        let honest = NftMint::new(metadata, owner, 300, None);
+        let (mint_conditions, eve) = Launcher::new(funding.coin_id(), 1)
+            .mint_eve_nft(
+                &mut ctx,
+                p2_puzzle_hash,
+                honest.metadata,
+                honest.metadata_updater_puzzle_hash,
+                honest.royalty_puzzle_hash,
+                honest.royalty_basis_points,
+            )
+            .expect("the canonical sdk eve-mint builder");
+
+        let hint = ctx.hint(owner).expect("an owner hint allocates");
+        let eve_conditions = Conditions::new().create_coin(owner, 1, hint);
+        let eve_solution = ctx
+            .alloc(&eve_conditions)
+            .expect("the eve condition list allocates");
+        eve.spend(&mut ctx, Spend::new(identity, eve_solution))
+            .expect("the eve singleton spends under its identity p2");
+        StandardLayer::new(owner_pk())
+            .spend(&mut ctx, funding, mint_conditions)
+            .expect("the funding coin spends under the standard layer");
+        ctx.take()
+    }
+
     /// A mint that settles the new NFT onto the offer SETTLEMENT puzzle is refused.
     ///
     /// The mint arm's counterpart to
@@ -4139,6 +4188,54 @@ pub(crate) mod singleton_melt_tests {
         assert!(
             error.to_string().contains("structural puzzle hash"),
             "the refusal must name the structural destination: {error}"
+        );
+    }
+
+    /// A mint whose eve p2 puzzle is SOLUTION-MALLEABLE is refused outright (F7).
+    ///
+    /// The eve spend carries no signature, and the only signed leg of a mint is the funding coin —
+    /// whose spend is BYTE-IDENTICAL whatever the eve's solution says. So when the eve's p2 puzzle
+    /// reads its conditions from its solution, one signature covers two bundles that mint the same
+    /// `nft1…` to DIFFERENT owners: the engine shows the honest one, the person signs, and the
+    /// submitted bundle swaps the eve solution. Disclosure cannot close this — the disclosed owner
+    /// is read from the same malleable solution — and neither can the launcher binding, which pins
+    /// the eve's PUZZLE HASH, upstream of its solution.
+    ///
+    /// The gate therefore refuses the SHAPE, exactly as the transfer arm refuses a non-quote
+    /// delegated puzzle: a mint's owner must be fixed by the eve puzzle itself.
+    #[test]
+    fn a_mint_whose_eve_puzzle_is_solution_malleable_is_refused() {
+        let error = analyze(&nft_mint_with_solution_malleable_eve(owner_ph())).expect_err(
+            "an eve whose conditions come from an unsigned solution leaves the minted NFT's owner              malleable after signing",
+        );
+        assert!(
+            error.to_string().contains("quote-form"),
+            "the refusal must name the malleability it closes, not a neighbouring binding: {error}"
+        );
+    }
+
+    /// The malleable-eve fixture differs from the honest one ONLY in the eve's p2 shape.
+    ///
+    /// Without this control the refusal above could be produced by a malformed bundle — a broken
+    /// launcher binding, a foreign lineage — and the test would pass while the property under test
+    /// went unexercised. The signed funding spend being byte-identical across the two fixtures is
+    /// also the fact that makes F7 exploitable, so asserting it here is not incidental.
+    #[test]
+    fn the_malleable_eve_fixture_is_otherwise_an_honest_mint() {
+        let signed = |spends: Vec<CoinSpend>| {
+            spends
+                .into_iter()
+                .find(|spend| spend.coin == nft_funding_coin())
+                .expect("every mint fixture spends the same funding coin")
+        };
+        assert_eq!(
+            signed(nft_mint_with_solution_malleable_eve(owner_ph())).puzzle_reveal,
+            signed(nft_mint()).puzzle_reveal,
+            "both fixtures must spend the same funding coin under the same puzzle"
+        );
+        assert!(
+            analyze(&nft_mint()).is_ok(),
+            "the honest mint this fixture mirrors must still be admitted"
         );
     }
 
