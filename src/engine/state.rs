@@ -467,6 +467,7 @@ mod tests {
                 confirmed_height: Some(11),
                 summary: TransactionSummary {
                     melted_singletons: Vec::new(),
+                    nft_operations: Vec::new(),
                     received: vec![],
                     outputs: vec![SpendOutput {
                         address: Address("xch1".into()),
