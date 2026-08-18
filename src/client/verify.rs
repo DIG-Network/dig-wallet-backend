@@ -4234,7 +4234,9 @@ pub(crate) mod singleton_melt_tests {
         let eve_solution = ctx
             .alloc(&eve_conditions)
             .expect("the eve condition list allocates");
-        eve.spend(&mut ctx, Spend::new(identity, eve_solution))
+        // The settled child is unused: the fixture is the SPENDS, not the resulting NFT.
+        let _child = eve
+            .spend(&mut ctx, Spend::new(identity, eve_solution))
             .expect("the eve singleton spends under its identity p2");
         StandardLayer::new(owner_pk())
             .spend(&mut ctx, funding, mint_conditions)

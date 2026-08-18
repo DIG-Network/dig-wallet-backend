@@ -461,10 +461,18 @@ Used by dig-app. The subscriber + identity provider + signer.
   default-DENY allowlist (the launcher alone may CREATE its coin announcement). Each MUST emit exactly
   one odd-amount `CREATE_COIN`.
 
-  The eve spend's INNER quoted conditions MUST be judged, exactly as a transfer's signed list is, and
-  for the same reason: the outer list is morphed. Its odd-amount `CREATE_COIN` names the new NFT's
-  OWNER; that destination MUST NOT be a structural (settlement / launcher) puzzle hash, and MUST be
-  read from the inner list, where a structural-destination test is not vacuous.
+  The eve spend's INNER conditions MUST be judged, exactly as a transfer's signed list is, and for the
+  same reason: the outer list is morphed. They MUST be taken from the eve p2 puzzle's own canonical
+  QUOTE form `(q . conditions)`, and an eve p2 puzzle that is not quote-form MUST be refused before its
+  conditions are read. Running the p2 puzzle against the eve SOLUTION is forbidden: the eve leg carries
+  no signature and the mint's one signed leg is byte-identical across eve solutions, so a
+  solution-malleable eve p2 lets a single signature cover both the bundle shown for review and one
+  minting the same launcher id to a different owner. The launcher binding does not close this — it pins
+  the eve's puzzle HASH, upstream of its solution.
+
+  The quoted odd-amount `CREATE_COIN` names the new NFT's OWNER; that destination MUST NOT be a
+  structural (settlement / launcher) puzzle hash, and MUST be read from the inner list, where a
+  structural-destination test is not vacuous.
 
   Because no key binds these legs to the wallet, the binding is structural and is enforced at the
   BUNDLE level: the bundle MUST create a launcher-destined
@@ -509,7 +517,10 @@ Used by dig-app. The subscriber + identity provider + signer.
     reviewed fact, including the announcement binding above, and the person pays to mint an NFT that
     belongs to the attacker.
 
-  The named owner MUST be the one the admitted spend actually settles the singleton onto.
+  The named owner MUST be the one the SPEND'S OWN COMMITMENT fixes — the signature for a transfer, the
+  eve puzzle's quote for a mint — and never one a solution could still change after review. On both
+  arms the destination is therefore read from an immalleable condition list, and an arm whose list is
+  not immalleable MUST be refused rather than named.
 
 - **Terminal singleton MELT (profile deletion, dig_ecosystem#3068).** A coin spend whose puzzle is the
   singleton top layer (`SINGLETON_TOP_LAYER_V1_1_HASH`), reached only AFTER the option-singleton and
