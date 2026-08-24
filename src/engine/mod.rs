@@ -29,6 +29,7 @@ pub mod offer_state;
 pub mod persist;
 pub mod selection;
 pub mod signer;
+pub mod singleton;
 pub mod state;
 pub mod sync;
 #[cfg(test)]
@@ -48,6 +49,7 @@ pub use selection::{
     select_for_consolidation, select_for_spend, SelectionOutcome, DEFAULT_COIN_CAP,
 };
 pub use signer::RemoteSigner;
+pub use singleton::{reconstruct_from_parent_spend, HydratedSingletons};
 pub use state::{CoinChange, InMemoryWalletStore, WalletStore};
 pub use sync::{order_dial_candidates, ChainFallback, PeerCoinSource, SyncConfig, SyncEngine};
 
