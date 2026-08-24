@@ -7,25 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.30.0] - 2026-08-24
 
 ### Features
-- **engine:** Consume `dig-did` as the canonical DID surface — launch, transfer, parent-spend
-  hydration, lineage proof and `did:chia:` resolution, re-exported through an `engine::did` facade
-  so consumers need no direct `dig-did` dependency (#40)
-- **engine:** Consume `dig-nft` as the canonical NFT surface — mint, bulk mint, transfer, transfer
-  with metadata and metadata update, through an `engine::nft` facade (#41)
-- **engine:** Reconstruct NFTs, DIDs and CATs from a parent coin spend
-  (`engine::singleton::reconstruct_from_parent_spend`), composing the canonical drivers and skipping
-  rather than failing on an unparseable candidate (#42)
-- **engine:** Asset visibility, refresh requests, the HD watch window, and the peer/network book
-  (`engine::actions`) (#44)
-- **engine:** `PeerSpendSource` — a spend-bearing sync source — and
-  `SyncEngine::sync_spends_from_peer`, which drives BOTH memo-hint indexing and singleton hydration
-  from the sync path rather than from a caller (#48)
-
-### Tests
-- **key-isolation:** Guard the engine DEPENDENCY GRAPH, not just engine source. The existing source
-  scan cannot see a secret-key crate added to the `engine` feature list whose types are never spelled
-  in engine source; `tests/engine_dependency_isolation.rs` asserts that property over the resolved
-  dependency set, with a positive control so the detector cannot go vacuous (#47)
+- **engine:** Eco#1533 batch — key-isolation dep guard, DID/NFT surfaces, singleton hydration (#49)
 
 ## [0.29.1] - 2026-08-24
 
