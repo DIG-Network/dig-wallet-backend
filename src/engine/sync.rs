@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use chia_protocol::CoinSpend;
+
 use crate::types::value::Puzzlehash;
 use crate::types::{
     CoinRecord, Cursor, IdentityRef, SyncLifecycle, WalletErrorCode, WalletEvent, WalletResult,
@@ -66,6 +68,41 @@ pub fn order_dial_candidates(candidates: &[SocketAddr], ipv6_first: bool) -> Vec
 pub trait PeerCoinSource: Send + Sync {
     /// Fetch the current coin states for the given puzzle hashes (subscribing to future updates).
     async fn coin_states(&self, puzzle_hashes: &[Puzzlehash]) -> WalletResult<Vec<CoinRecord>>;
+}
+
+/// A live peer source of the coin SPENDS behind those coin states (#48).
+///
+/// # Why this is a second trait and not a wider [`PeerCoinSource`]
+///
+/// A `CoinRecord` says a coin exists; it cannot say what the coin IS. Memo hints live in the memos
+/// of a `CREATE_COIN` condition, and a singleton's identity lives in its parent's puzzle reveal —
+/// both of which exist only inside a `CoinSpend`. So the hint index (#48) and singleton hydration
+/// (#42) are blocked on the same structural fact, and both are unblocked by the same source.
+///
+/// [`PeerCoinSource`] has external implementors, so widening it would break every one of them for a
+/// capability most do not have — the two reads are different peer requests (`request_puzzle_state`
+/// versus `request_puzzle_solution`), not two halves of one. A separate trait is additive: an
+/// implementor adopts it when it can serve spends, and until then the coin-state path is unaffected.
+#[async_trait]
+pub trait PeerSpendSource: Send + Sync {
+    /// Fetch the coin spends relevant to the given puzzle hashes.
+    async fn coin_spends(&self, puzzle_hashes: &[Puzzlehash]) -> WalletResult<Vec<CoinSpend>>;
+}
+
+/// What one pass over a batch of spends produced.
+///
+/// Reported rather than discarded because "nothing was discoverable" and "nothing was looked at"
+/// are different outcomes that a bare `Ok(())` would render identical.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpendSyncOutcome {
+    /// How many spends were processed.
+    pub spends: usize,
+    /// How many coins became discoverable by memo hint.
+    pub hinted_coins: usize,
+    /// How many NFTs, DIDs and CATs were hydrated into the store.
+    pub assets: usize,
+    /// How many candidate singletons were recognised but could not be parsed.
+    pub skipped: usize,
 }
 
 /// A point-read fallback source (chia-query / coinset), used only while syncing or for reads not
@@ -218,6 +255,67 @@ impl SyncEngine {
         let changed = self.ingest(identity, records);
         self.mark_synced(identity);
         Ok(changed)
+    }
+
+    /// Sync from a spend-bearing peer source: index every memo hint the spends announce, and
+    /// hydrate every NFT, DID and CAT they create (#48, #42).
+    ///
+    /// This is the PRODUCTION driver of both. Before it existed, the hint index and the singleton
+    /// reconstruction were correct but had no caller on the sync path, because the only source the
+    /// loop had ([`PeerCoinSource`]) returns coin records and a record carries neither memos nor a
+    /// puzzle reveal.
+    ///
+    /// A spend whose hints cannot be read, or whose singletons cannot be reconstructed, is COUNTED
+    /// and passed over rather than aborting the batch: a wallet syncs from a chain containing
+    /// everything, so one unreadable spend among thousands must not stop the rest from being
+    /// discovered.
+    pub async fn sync_spends_from_peer(
+        &self,
+        identity: &IdentityRef,
+        puzzle_hashes: &[Puzzlehash],
+        peer: &dyn PeerSpendSource,
+    ) -> WalletResult<SpendSyncOutcome> {
+        let spends = peer.coin_spends(puzzle_hashes).await?;
+        let mut outcome = SpendSyncOutcome {
+            spends: spends.len(),
+            ..SpendSyncOutcome::default()
+        };
+
+        for spend in &spends {
+            match self.store.index_hints_from_spend(identity.wallet_id, spend) {
+                Ok(indexed) => outcome.hinted_coins += indexed,
+                Err(_) => outcome.skipped += 1,
+            }
+            match super::singleton::reconstruct_from_parent_spend(spend) {
+                Ok(hydrated) => {
+                    let written = self.absorb(identity, hydrated, &mut outcome);
+                    outcome.assets += written;
+                }
+                Err(_) => outcome.skipped += 1,
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Write hydrated assets into the store, returning how many were written.
+    fn absorb(
+        &self,
+        identity: &IdentityRef,
+        hydrated: super::singleton::HydratedSingletons,
+        outcome: &mut SpendSyncOutcome,
+    ) -> usize {
+        outcome.skipped += hydrated.skipped;
+        let written = hydrated.dids.len() + hydrated.nfts.len() + hydrated.cats.len();
+        for did in hydrated.dids {
+            self.store.upsert_did(identity.wallet_id, did);
+        }
+        for nft in hydrated.nfts {
+            self.store.upsert_nft(identity.wallet_id, nft);
+        }
+        for cat in hydrated.cats {
+            self.store.upsert_cat(identity.wallet_id, cat);
+        }
+        written
     }
 
     /// Refresh a set of coins, preferring the peer but falling back to the point-read source when

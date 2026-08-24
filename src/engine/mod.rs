@@ -60,7 +60,10 @@ pub use selection::{
 pub use signer::RemoteSigner;
 pub use singleton::{reconstruct_from_parent_spend, HydratedSingletons};
 pub use state::{CoinChange, InMemoryWalletStore, WalletStore};
-pub use sync::{order_dial_candidates, ChainFallback, PeerCoinSource, SyncConfig, SyncEngine};
+pub use sync::{
+    order_dial_candidates, ChainFallback, PeerCoinSource, PeerSpendSource, SpendSyncOutcome,
+    SyncConfig, SyncEngine,
+};
 
 use crate::types::Network;
 
