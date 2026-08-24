@@ -17,39 +17,55 @@
 //! that defines `SecretKey` is a non-optional dependency and is always linked). The private key
 //! lives only behind [`signer::RemoteSigner`], implemented client-side.
 
+pub mod actions;
 pub mod broadcast;
 pub mod build;
 pub mod build_extended;
 pub mod build_offer;
 pub mod build_options;
 pub mod build_tips;
+pub mod did;
 pub mod events;
 pub mod hints;
+pub mod nft;
 pub mod offer_state;
 pub mod persist;
 pub mod selection;
 pub mod signer;
+pub mod singleton;
 pub mod state;
 pub mod sync;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use actions::{AssetActions, AssetKind, DerivationWindow, NetworkBook, PeerEntry, Visibility};
 pub use broadcast::{Broadcaster, MempoolBroadcaster, MempoolClient, MempoolStatus};
 pub use build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
 pub use build_extended::ExtendedSpendBuilder;
 pub use build_offer::OfferBuilder;
 pub use build_options::OptionBuilder;
 pub use build_tips::TipBuilder;
+pub use did::{
+    hydrate_did, launch_did, prove_did_lineage, resolve_did_xch_address, transfer_did, DidOperation,
+};
 pub use events::{DeltaLog, EventSink, PersistentEventLog, DEFAULT_HISTORY_CAPACITY};
 pub use hints::{hints_from_coin_spend, HintIndex};
+pub use nft::{
+    bulk_mint_nfts, mint_nft, transfer_nft, transfer_nft_with_metadata, update_nft_metadata,
+    NftOperation,
+};
 pub use offer_state::{PendingOffers, PENDING_TTL};
 pub use persist::{SqliteDeltaLog, SqliteWalletStore};
 pub use selection::{
     select_for_consolidation, select_for_spend, SelectionOutcome, DEFAULT_COIN_CAP,
 };
 pub use signer::RemoteSigner;
+pub use singleton::{reconstruct_from_parent_spend, HydratedSingletons};
 pub use state::{CoinChange, InMemoryWalletStore, WalletStore};
-pub use sync::{order_dial_candidates, ChainFallback, PeerCoinSource, SyncConfig, SyncEngine};
+pub use sync::{
+    order_dial_candidates, ChainFallback, PeerCoinSource, PeerSpendSource, SpendSyncOutcome,
+    SyncConfig, SyncEngine,
+};
 
 use crate::types::Network;
 

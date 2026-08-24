@@ -3644,11 +3644,10 @@ pub(crate) mod singleton_melt_tests {
     /// Mint an NFT through the CANONICAL chia-wallet-sdk drivers (`Launcher::mint_nft`), returning
     /// the settled NFT plus the coin spends the mint consists of.
     ///
-    /// dig-nft is deliberately NOT used: it is published at 0.1.0 against chia-protocol 0.26 /
-    /// chia-wallet-sdk 0.30, so its `CoinSpend` is a DIFFERENT type from the 0.36.1 one this gate
-    /// parses — the fixture could not be handed to `analyze` at all. The sdk drivers used here are
-    /// the same ones dig-nft itself wraps and the same ones this module parses with, so nothing is
-    /// hand-rolled.
+    /// The sdk drivers used here are the same ones `dig-nft` itself wraps and the same ones this
+    /// module parses with, so nothing is hand-rolled. (An earlier note here said `dig-nft` could not
+    /// be used because it sat on chia-protocol 0.26; that was true of 0.1.0 only. 0.2.0 is on this
+    /// crate's line and IS consumed, by `engine::nft`.)
     fn nft_mint_parts() -> (SpendContext, chia_wallet_sdk::driver::Nft, Vec<CoinSpend>) {
         nft_mint_parts_owned_by(owner_ph())
     }
