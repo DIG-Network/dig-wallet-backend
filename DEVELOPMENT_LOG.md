@@ -164,3 +164,5 @@ cross-seam summary-reconciliation gap the client verify cannot close alone. Mint
 at the signer; the reconciliation decision is tracked in #2243.
 
 <!-- lane: NFT custody-gate arm (dig_ecosystem #3077) -->
+
+<!-- lane: loop/1533-wallet-batch (WIP) -->
