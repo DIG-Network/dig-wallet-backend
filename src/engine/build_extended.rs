@@ -92,6 +92,14 @@ impl ExtendedSpendBuilder for SdkSpendBuilder {
         let total: u64 = selected.iter().map(|c| c.amount).sum();
         let change_amount = total - target;
 
+        // The change coin shares the lead coin's parent with every leg, so it participates in the
+        // collision check: a leg paying the change address the exact change amount would collide.
+        let mut created = destinations.clone();
+        if change_amount > 0 {
+            created.push((change_ph, change_amount));
+        }
+        ensure_distinct_created_coins(selected[0].coin_id(), &created)?;
+
         let mut ctx = SpendContext::new();
         let mut conditions = Conditions::new();
         for (puzzle_hash, amount) in &destinations {
@@ -161,8 +169,14 @@ impl ExtendedSpendBuilder for SdkSpendBuilder {
             ));
         }
 
-        let mut ctx = SpendContext::new();
         let cat_change = cat_total - payout;
+        let mut created = destinations.clone();
+        if cat_change > 0 {
+            created.push((change_ph, cat_change));
+        }
+        ensure_distinct_created_coins(cats[0].coin.coin_id(), &created)?;
+
+        let mut ctx = SpendContext::new();
         let cat_spends =
             self.cat_ring_paying(&mut ctx, &cats, &destinations, change_ph, cat_change)?;
         Cat::spend_all(&mut ctx, &cat_spends)
@@ -245,35 +259,30 @@ impl ExtendedSpendBuilder for SdkSpendBuilder {
         // needs would leave the wallet with a dust-sized set, which is the opposite of the intent.
         let selected = largest_spendable(&coins)?;
         let total = selected.amount;
-        let divisible =
-            total
-                .checked_sub(fee)
-                .filter(|d| *d >= parts)
-                .ok_or_else(|| {
-                    WalletError::new(
-                WalletErrorCode::InsufficientFunds,
-                format!("{total} mojos cannot pay a {fee} mojo fee and still split {parts} ways"),
-            )
-                })?;
-
-        // Integer division leaves a remainder; it goes to the FIRST coin rather than being lost,
-        // which is what keeps conservation exact.
-        let each = divisible / parts;
-        let remainder = divisible % parts;
+        let divisible = total
+            .checked_sub(fee)
+            .ok_or_else(|| under_funded_split(total, fee, parts))?;
+        let amounts = staggered_amounts(divisible, parts)
+            .ok_or_else(|| under_funded_split(total, fee, parts))?;
 
         let mut ctx = SpendContext::new();
         let mut conditions = Conditions::new();
-        for index in 0..parts {
-            let amount = if index == 0 { each + remainder } else { each };
-            conditions = conditions.create_coin(change_ph, amount, Memos::None);
+        for amount in &amounts {
+            conditions = conditions.create_coin(change_ph, *amount, Memos::None);
         }
         if fee > 0 {
             conditions = conditions.reserve_fee(fee);
         }
+
+        // Structural, not belt-and-braces: `staggered_amounts` is what makes these distinct, and
+        // this is the check that would catch it silently ceasing to.
+        let created: Vec<(Bytes32, u64)> = amounts.iter().map(|a| (change_ph, *a)).collect();
+        ensure_distinct_created_coins(selected.coin_id(), &created)?;
+
         self.spend_standard(&mut ctx, selected, conditions)?;
         let coin_spends = ctx.take();
 
-        assert_conserved(total, divisible, fee)?;
+        assert_conserved(total, amounts.iter().sum(), fee)?;
         self.finish_self_directed(coin_spends, fee)
     }
 }
@@ -384,6 +393,75 @@ fn total_of(legs: &[SendLeg]) -> WalletResult<u64> {
     })
 }
 
+/// The per-coin amounts a split of `divisible` into `parts` produces, or `None` when `divisible`
+/// is too small.
+///
+/// # Why the amounts are STAGGERED rather than equal
+/// A coin id is `sha256(parent_coin_id ‖ puzzle_hash ‖ amount)`. Every output of a split shares one
+/// parent and one puzzle hash, so **equal amounts produce byte-identical coin ids** and the spend is
+/// rejected as creating duplicate coins — it can never be broadcast. Splitting into `n` equal parts
+/// is therefore not merely inelegant, it does not work.
+///
+/// So the amounts are made pairwise distinct by construction: `base, base+1, …, base+(parts-1)`,
+/// with any indivisible remainder added to the LAST (already-largest) coin so the sequence stays
+/// strictly increasing and no two entries can collide. The sum is exactly `divisible` — the
+/// remainder is kept, never dropped into the farmer reward.
+///
+/// The minimum viable `divisible` is thus `parts + parts*(parts-1)/2`, not `parts`.
+fn staggered_amounts(divisible: u64, parts: u64) -> Option<Vec<u64>> {
+    // The cost of making the sequence strictly increasing: 0 + 1 + … + (parts-1).
+    let stagger = parts.checked_mul(parts.checked_sub(1)?)? / 2;
+    let floor = parts.checked_add(stagger)?;
+    if divisible < floor {
+        return None;
+    }
+    let spread = divisible - stagger;
+    let base = spread / parts;
+    let remainder = spread % parts;
+
+    let mut amounts: Vec<u64> = (0..parts).map(|index| base + index).collect();
+    // The last entry is already the largest, so adding the remainder there cannot make it equal to
+    // any other. Adding it to the FIRST entry could: a remainder of exactly 1 would collide with
+    // the second.
+    *amounts.last_mut().expect("parts >= 2") += remainder;
+    Some(amounts)
+}
+
+/// The error a split too small to produce `parts` distinct coins fails with.
+fn under_funded_split(total: u64, fee: u64, parts: u64) -> WalletError {
+    WalletError::new(
+        WalletErrorCode::InsufficientFunds,
+        format!(
+            "{total} mojos cannot pay a {fee} mojo fee and still split into {parts} coins with \
+             distinct ids"
+        ),
+    )
+}
+
+/// Fail closed when a spend would create two coins with the SAME id.
+///
+/// A coin id is `sha256(parent_coin_id ‖ puzzle_hash ‖ amount)`, so two created coins sharing one
+/// parent collide whenever their `(puzzle_hash, amount)` pair matches. Chia rejects such a spend
+/// outright, and it is a whole CLASS of bug rather than one call site: a split into equal parts, a
+/// multi-send listing one address twice for the same amount, and a change coin that happens to
+/// match a payment leg all reach it by different routes. Every builder that creates more than one
+/// coin from a single parent runs this check.
+///
+/// `InvalidInput` rather than `SpendValidationFailed`: the caller asked for something that cannot
+/// exist, and the remedy is to change the request.
+fn ensure_distinct_created_coins(parent: Bytes32, created: &[(Bytes32, u64)]) -> WalletResult<()> {
+    let mut seen = std::collections::HashSet::with_capacity(created.len());
+    for (puzzle_hash, amount) in created {
+        if !seen.insert(Coin::new(parent, *puzzle_hash, *amount).coin_id()) {
+            return Err(WalletError::invalid_input(format!(
+                "this spend would create two coins with the same id ({amount} mojos to the same \
+                 address); vary the amount or send them separately"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The wallet's largest spendable coin — the one a split reshapes.
 fn largest_spendable(coins: &[Coin]) -> WalletResult<Coin> {
     coins
@@ -444,6 +522,27 @@ mod tests {
     /// builder to grade its own homework, and would keep passing if the built spend and the
     /// summary drifted apart.
     fn created_coins(spend: &UnsignedSpend) -> Vec<(Bytes32, u64)> {
+        created_coin_objects(spend)
+            .into_iter()
+            .map(|coin| (coin.puzzle_hash, coin.amount))
+            .collect()
+    }
+
+    /// The ids of every coin the spend creates.
+    ///
+    /// A `(puzzle_hash, amount)` pair is NOT an identity: a coin id is
+    /// `sha256(parent ‖ puzzle_hash ‖ amount)`, so two outputs of one parent with equal pairs are
+    /// the SAME coin and the spend is unbroadcastable. A test that only ever compares amounts
+    /// cannot see that, which is exactly how the equal-parts split defect passed its own suite.
+    fn created_coin_ids(spend: &UnsignedSpend) -> Vec<Bytes32> {
+        created_coin_objects(spend)
+            .iter()
+            .map(|coin| coin.coin_id())
+            .collect()
+    }
+
+    /// Every coin the spend creates, as a real [`Coin`] carrying its true parent.
+    fn created_coin_objects(spend: &UnsignedSpend) -> Vec<Coin> {
         use chia_wallet_sdk::types::Condition;
         use clvmr::Allocator;
 
@@ -465,7 +564,11 @@ mod tests {
                 clvm_traits::FromClvm::from_clvm(&allocator, output).unwrap();
             for condition in conditions {
                 if let Some(create) = condition.into_create_coin() {
-                    created.push((create.puzzle_hash, create.amount));
+                    created.push(Coin::new(
+                        coin_spend.coin.coin_id(),
+                        create.puzzle_hash,
+                        create.amount,
+                    ));
                 }
             }
         }
@@ -692,7 +795,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(created_coins(&spend), vec![(wallet_puzzle_hash(), 250); 4]);
+        // 1000 split 4 ways, staggered so no two coins collide: 248+249+250+253 = 1000.
+        let amounts: Vec<u64> = created_coins(&spend).iter().map(|(_, a)| *a).collect();
+        assert_eq!(amounts, vec![248, 249, 250, 253]);
+        assert_eq!(amounts.iter().sum::<u64>(), 1_000);
     }
 
     /// An indivisible remainder must be KEPT, on the first coin. Dropping it would silently burn
@@ -708,7 +814,9 @@ mod tests {
             .await
             .unwrap();
         let amounts: Vec<u64> = created_coins(&spend).iter().map(|(_, a)| *a).collect();
-        assert_eq!(amounts, vec![253, 250, 250, 250]);
+        // The remainder lands on the LAST (already-largest) coin. Putting it on the first could
+        // make it equal the second whenever the remainder is exactly 1 — a collision.
+        assert_eq!(amounts, vec![249, 250, 251, 253]);
         assert_eq!(amounts.iter().sum::<u64>(), 1_003);
     }
 
@@ -766,5 +874,220 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, WalletErrorCode::InsufficientFunds);
+    }
+
+    // --- coin-id distinctness: the property, not the amounts ----------------------------------
+
+    /// Assert every coin a spend creates has a DISTINCT id, reporting how many collided.
+    fn assert_created_coins_are_distinct(spend: &UnsignedSpend, what: &str) {
+        let ids = created_coin_ids(spend);
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "{what}: only {} distinct ids of {} created coins - this spend cannot be broadcast",
+            unique.len(),
+            ids.len()
+        );
+    }
+
+    /// `parts >= 3` collided ALWAYS under the equal-parts implementation (1 distinct id of 4).
+    #[tokio::test]
+    async fn a_split_creates_coins_with_distinct_ids() {
+        for parts in [2u32, 3, 4, 7] {
+            let spend = builder(vec![wallet_coin(10_000, 1)])
+                .build_split_xch(SplitXchRequest {
+                    identity: identity(),
+                    parts,
+                    fee: Amount(0),
+                })
+                .await
+                .unwrap();
+            assert_eq!(created_coin_ids(&spend).len(), parts as usize);
+            assert_created_coins_are_distinct(&spend, &format!("split into {parts}"));
+        }
+    }
+
+    /// `parts == 2` collided only on an EVEN divisible amount, so an odd-amount fixture alone
+    /// would have missed it. Both parities are exercised.
+    #[tokio::test]
+    async fn a_two_way_split_is_distinct_for_both_parities() {
+        for total in [1_000u64, 1_001] {
+            let spend = builder(vec![wallet_coin(total, 1)])
+                .build_split_xch(SplitXchRequest {
+                    identity: identity(),
+                    parts: 2,
+                    fee: Amount(0),
+                })
+                .await
+                .unwrap();
+            assert_created_coins_are_distinct(&spend, &format!("two-way split of {total}"));
+            let amounts: Vec<u64> = created_coins(&spend).iter().map(|(_, a)| *a).collect();
+            assert_eq!(amounts.iter().sum::<u64>(), total, "every mojo kept");
+        }
+    }
+
+    /// The remainder must survive the staggering, for every remainder class.
+    #[tokio::test]
+    async fn a_split_keeps_every_mojo_for_every_remainder() {
+        for total in 1_000u64..1_012 {
+            let spend = builder(vec![wallet_coin(total, 1)])
+                .build_split_xch(SplitXchRequest {
+                    identity: identity(),
+                    parts: 4,
+                    fee: Amount(3),
+                })
+                .await
+                .unwrap();
+            let amounts: Vec<u64> = created_coins(&spend).iter().map(|(_, a)| *a).collect();
+            assert_eq!(amounts.iter().sum::<u64>(), total - 3, "total {total}");
+            assert_created_coins_are_distinct(&spend, &format!("split of {total}"));
+        }
+    }
+
+    /// A split too small to give each coin a DISTINCT amount is refused rather than built into an
+    /// unbroadcastable spend. 4 ways needs at least 4 + (0+1+2+3) = 10 mojos, not 4.
+    #[tokio::test]
+    async fn a_split_below_the_distinctness_floor_is_refused() {
+        for total in [4u64, 9] {
+            let err = builder(vec![wallet_coin(total, 1)])
+                .build_split_xch(SplitXchRequest {
+                    identity: identity(),
+                    parts: 4,
+                    fee: Amount(0),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                WalletErrorCode::InsufficientFunds,
+                "total {total}"
+            );
+        }
+        // At the floor exactly it must SUCCEED - a bound tested only from below confirms itself.
+        let spend = builder(vec![wallet_coin(10, 1)])
+            .build_split_xch(SplitXchRequest {
+                identity: identity(),
+                parts: 4,
+                fee: Amount(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            created_coins(&spend)
+                .iter()
+                .map(|(_, a)| *a)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_created_coins_are_distinct(&spend, "split at the floor");
+    }
+
+    #[tokio::test]
+    async fn a_multi_send_creates_coins_with_distinct_ids() {
+        let spend = builder(vec![wallet_coin(1_000, 1)])
+            .build_multi_send_xch(multi(vec![leg(7, 100), leg(8, 250), leg(9, 30)], 5))
+            .await
+            .unwrap();
+        assert_created_coins_are_distinct(&spend, "multi-send");
+    }
+
+    /// The same collision class reached from the multi-send side: two legs naming one address for
+    /// one amount are ONE coin, not two, so the payee would receive half what was authorised.
+    #[tokio::test]
+    async fn a_multi_send_with_two_identical_legs_is_refused() {
+        let err = builder(vec![wallet_coin(1_000, 1)])
+            .build_multi_send_xch(multi(vec![leg(7, 100), leg(7, 100)], 0))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::InvalidInput);
+    }
+
+    /// Same address with DIFFERENT amounts is legitimate and must still build - the guard rejects
+    /// colliding ids, not repeated addresses. The control for the test above.
+    #[tokio::test]
+    async fn a_multi_send_may_pay_one_address_twice_with_different_amounts() {
+        let spend = builder(vec![wallet_coin(1_000, 1)])
+            .build_multi_send_xch(multi(vec![leg(7, 100), leg(7, 101)], 0))
+            .await
+            .unwrap();
+        assert_created_coins_are_distinct(&spend, "same address, different amounts");
+        assert_eq!(spend.summary.outputs.len(), 2);
+    }
+
+    /// The change coin shares the parent every leg descends from, so it collides too: 1000 in with
+    /// one leg of 500 and no fee leaves change of exactly 500 to the same wallet address.
+    #[tokio::test]
+    async fn a_multi_send_whose_change_would_collide_with_a_leg_is_refused() {
+        let wallet_address = Address(
+            Bech32Address::new(wallet_puzzle_hash(), "xch".into())
+                .encode()
+                .unwrap(),
+        );
+        let err = builder(vec![wallet_coin(1_000, 1)])
+            .build_multi_send_xch(multi(
+                vec![SendLeg {
+                    to: wallet_address,
+                    amount: Amount(500),
+                }],
+                0,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn a_cat_multi_send_creates_coins_with_distinct_ids() {
+        let cat = issued_cat(1_000);
+        let spend = builder_with_cats(vec![wallet_coin(500, 1)], vec![cat])
+            .build_multi_send_cat(MultiSendCatRequest {
+                identity: identity(),
+                asset_id: AssetId("tail".into()),
+                legs: vec![leg(7, 100), leg(8, 250)],
+                fee: Amount(0),
+            })
+            .await
+            .unwrap();
+        assert_created_coins_are_distinct(&spend, "cat multi-send");
+    }
+
+    #[tokio::test]
+    async fn a_cat_multi_send_with_two_identical_legs_is_refused() {
+        let cat = issued_cat(1_000);
+        let err = builder_with_cats(vec![wallet_coin(500, 1)], vec![cat])
+            .build_multi_send_cat(MultiSendCatRequest {
+                identity: identity(),
+                asset_id: AssetId("tail".into()),
+                legs: vec![leg(7, 100), leg(7, 100)],
+                fee: Amount(0),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn staggered_amounts_are_strictly_increasing_and_sum_exactly() {
+        for parts in 2u64..12 {
+            for divisible in (parts + parts * (parts - 1) / 2)..(parts * 40) {
+                let amounts = staggered_amounts(divisible, parts)
+                    .unwrap_or_else(|| panic!("{divisible} over {parts} should be splittable"));
+                assert_eq!(amounts.len(), parts as usize);
+                assert_eq!(amounts.iter().sum::<u64>(), divisible);
+                assert!(
+                    amounts.windows(2).all(|w| w[0] < w[1]),
+                    "not strictly increasing: {amounts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn staggered_amounts_refuses_below_the_floor() {
+        assert!(staggered_amounts(9, 4).is_none());
+        assert!(staggered_amounts(10, 4).is_some());
+        assert!(staggered_amounts(2, 2).is_none());
+        assert!(staggered_amounts(3, 2).is_some());
     }
 }

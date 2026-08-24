@@ -408,9 +408,20 @@ trait it calls), any HD seed.
   puzzle hash, worth the selected total minus the fee. Fewer than two spendable coins is
   `InvalidInput`; a total that cannot also cover the fee is `InsufficientFunds`.
 - **`build_split_xch(SplitXchRequest)`** MUST produce exactly `parts` output coins at the change
-  puzzle hash. `parts < 2` is `InvalidInput`. Where the divisible value is not a multiple of
-  `parts`, the remainder MUST be added to the FIRST output coin — it MUST NOT be dropped, because a
-  dropped remainder becomes farmer reward the caller never consented to.
+  puzzle hash, and **their amounts MUST be pairwise distinct**. A coin id is
+  `sha256(parent_coin_id ‖ puzzle_hash ‖ amount)`, so outputs of one parent at one puzzle hash with
+  equal amounts are the SAME coin and the spend is rejected as creating duplicates — an equal-parts
+  split is unbroadcastable, not merely inelegant. Amounts are therefore staggered
+  `base, base+1, …, base+(parts-1)`, and any indivisible remainder MUST be added to the LAST
+  (already-largest) coin so the sequence stays strictly increasing; adding it to the first would
+  collide with the second whenever the remainder is exactly 1. The remainder MUST NOT be dropped,
+  because a dropped remainder becomes farmer reward the caller never consented to. `parts < 2` is
+  `InvalidInput`; a value below the distinctness floor `parts + parts*(parts-1)/2` is
+  `InsufficientFunds`.
+- **Every builder that creates more than one coin from a single parent MUST fail closed on a coin-id
+  collision**, as `InvalidInput`. This is one class reached by several routes: an equal-parts split,
+  a multi-send naming the same address twice for the same amount, and a change coin whose
+  `(puzzle_hash, amount)` matches a payment leg. The change coin participates in the check.
 - A combine and a split are **self-directed**: they pay no third party. Their `TransactionSummary`
   MUST therefore list NO `outputs` and NO `received`, only the `fee` — the fee is the entirety of
   what the user is consenting to. The client signer re-derives the true value flow independently
@@ -439,8 +450,17 @@ the network indistinguishable; indexing only memo2 loses whether the coin is a l
 - `coins_by_all_hints(&[])` MUST match nothing. An unconstrained conjunctive query is a caller
   mistake, and returning the whole index would hand back the full coin set to a caller that
   constrained on none of it.
+- **`engine::hints::hints_from_coin_spend(&CoinSpend)`** is the PRODUCER: hints live in the memos of
+  a `CREATE_COIN` condition, which exist only inside a spend. It returns each created coin, keyed on
+  the real coin id the chain will assign, with the hints it was announced under. A created coin with
+  no memos is skipped; a spend whose output is not a condition list is an ERROR, so a caller can
+  distinguish "announced no hints" from "unreadable".
 - **`InMemoryWalletStore`** owns one `HintIndex` per `WalletId` and exposes `index_coin_hints`,
-  `coins_by_hint`, `coins_by_all_hints`, `hints_for_coin`. A hint query MUST resolve only to coins
+  `index_hints_from_spend` (the production spend-to-index path), `coins_by_hint`,
+  `coins_by_all_hints`, `hints_for_coin`.
+- The wallet sync loop is fed `CoinRecord`s by a `PeerCoinSource` and never sees a spend, so it
+  cannot populate the index. Driving `index_hints_from_spend` from a spend-bearing source is
+  out of scope here and tracked separately. A hint query MUST resolve only to coins
   the store still holds.
 - **`rollback_to` MUST withdraw the hints of every coin the reorg forgot.** A coin the winning chain
   never created MUST stop being discoverable, or a hint query keeps resolving to a coin that does

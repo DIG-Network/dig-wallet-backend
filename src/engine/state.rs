@@ -21,6 +21,8 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use chia_protocol::CoinSpend;
+
 use super::hints::HintIndex;
 use crate::types::{
     Amount, Balance, CatRecord, CoinRecord, DidRecord, Hint, IdentityRef, NftRecord, SyncLifecycle,
@@ -290,6 +292,26 @@ impl InMemoryWalletStore {
     /// Every hint `coin_id` was announced under.
     pub fn hints_for_coin(&self, wallet_id: WalletId, coin_id: &str) -> Vec<Hint> {
         self.with_wallet(wallet_id, |state| state.hints.hints_for(coin_id))
+    }
+
+    /// Index every hinted coin an already-built spend creates (#45).
+    ///
+    /// This is the PRODUCTION path from a spend to the hint index: memos exist only inside a
+    /// spend, and a caller holding one drives discovery with a single call. Returns how many coins
+    /// were indexed, so a caller can tell a spend that hinted nothing from one it failed to read.
+    pub fn index_hints_from_spend(
+        &self,
+        wallet_id: WalletId,
+        coin_spend: &CoinSpend,
+    ) -> WalletResult<usize> {
+        let extracted = super::hints::hints_from_coin_spend(coin_spend)?;
+        let count = extracted.len();
+        self.with_wallet(wallet_id, |state| {
+            for (coin_id, hints) in extracted {
+                state.hints.index(coin_id, hints);
+            }
+        });
+        Ok(count)
     }
 }
 
@@ -685,5 +707,71 @@ mod tests {
             store.hints_for_coin(WalletId(1), "mine"),
             vec![launcher_hint(), owner_hint()]
         );
+    }
+
+    /// The PRODUCTION path: a real spend goes in, and the coins it hinted come back out of the
+    /// query layer. Without this, the index has only test-only writers and the query half is
+    /// correct over data nothing fills.
+    #[tokio::test]
+    async fn a_real_spend_populates_the_index_through_the_store() {
+        use crate::engine::build_extended::ExtendedSpendBuilder;
+        use crate::engine::test_support::{builder, wallet_coin};
+        use crate::types::{MultiSendXchRequest, SendLeg};
+        use chia_wallet_sdk::utils::Address as Bech32Address;
+
+        let payee = chia_protocol::Bytes32::new([7u8; 32]);
+        let spend = builder(vec![wallet_coin(1_000, 1)])
+            .build_multi_send_xch(MultiSendXchRequest {
+                identity: identity(1),
+                legs: vec![SendLeg {
+                    to: Address(Bech32Address::new(payee, "xch".into()).encode().unwrap()),
+                    amount: Amount(100),
+                }],
+                fee: Amount(0),
+            })
+            .await
+            .unwrap();
+
+        let store = InMemoryWalletStore::new();
+        let wallet = WalletId(1);
+        let mut indexed = 0;
+        for coin_spend in &spend.coin_spends {
+            indexed += store.index_hints_from_spend(wallet, coin_spend).unwrap();
+        }
+        assert_eq!(indexed, 1, "the hinted payee coin should have been indexed");
+
+        // The payee coin is now discoverable by the hint the spend announced it under.
+        let hint = Hint::from_bytes(payee);
+        let found = store.coins_by_hint(wallet, &hint);
+        assert!(
+            found.is_empty(),
+            "the coin is indexed but not yet tracked, so it must not resolve to a record"
+        );
+
+        // Once the coin is tracked, the same query resolves it - proving the index key is the
+        // real coin id the chain will assign, not something only this test agrees on.
+        let coin_id = store.hints_for_coin(wallet, "").len();
+        assert_eq!(coin_id, 0);
+        let expected_id = hex::encode(
+            chia_protocol::Coin::new(spend.coin_spends[0].coin.coin_id(), payee, 100).coin_id(),
+        );
+        assert_eq!(
+            store.hints_for_coin(wallet, &expected_id),
+            vec![hint.clone()]
+        );
+
+        store.apply_coin_state(
+            wallet,
+            CoinRecord {
+                coin_id: expected_id.clone(),
+                puzzle_hash: Puzzlehash(hex::encode(payee)),
+                amount: Amount(100),
+                created_height: Some(5),
+                spent_height: None,
+            },
+        );
+        let found = store.coins_by_hint(wallet, &hint);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].coin_id, expected_id);
     }
 }

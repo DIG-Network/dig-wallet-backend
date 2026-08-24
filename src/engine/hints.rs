@@ -20,7 +20,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::types::Hint;
+use chia_protocol::{Bytes, Coin, CoinSpend};
+use chia_puzzle_types::Memos;
+use chia_wallet_sdk::types::Condition;
+use clvm_traits::{FromClvm, ToClvm};
+use clvmr::Allocator;
+
+use crate::types::{Hint, WalletError, WalletErrorCode, WalletResult};
 
 /// A position-free, many-to-many index of coin id to the hints the coin was announced under.
 ///
@@ -132,6 +138,77 @@ impl HintIndex {
     pub fn is_empty(&self) -> bool {
         self.by_coin.is_empty()
     }
+}
+
+/// Extract, from an already-built [`CoinSpend`], every coin it creates together with the memo
+/// hints that coin was announced under (#45).
+///
+/// # Why this is a separate, public function
+/// Hints live in the memos of a `CREATE_COIN` condition, which exist ONLY inside a spend. The
+/// wallet sync loop is fed [`crate::types::CoinRecord`]s by a `PeerCoinSource` and never sees a
+/// spend, so nothing on that path can populate the index. This is the producer that CAN, exposed
+/// so a caller holding real spends (a block/spend scanner, or the singleton reconstruction of
+/// <https://github.com/DIG-Network/dig-wallet-backend/issues/42>) drives it.
+///
+/// A DIG store launcher announces two memos, so a returned entry commonly carries two hints and
+/// their ORDER is preserved but never relied upon (`Hint` is position-free by design).
+///
+/// Conditions that are not `CREATE_COIN`, and created coins with no memos, are skipped rather than
+/// erroring: a spend is allowed to do other things, and a coin with no hints is simply not
+/// discoverable by hint.
+///
+/// Returns an error only when the spend does not run — a puzzle/solution pair that cannot be
+/// evaluated is not something to index silently.
+pub fn hints_from_coin_spend(coin_spend: &CoinSpend) -> WalletResult<Vec<(String, Vec<Hint>)>> {
+    let mut allocator = Allocator::new();
+    let puzzle = coin_spend
+        .puzzle_reveal
+        .to_clvm(&mut allocator)
+        .map_err(|e| hint_parse_failed(format!("puzzle reveal: {e:?}")))?;
+    let solution = coin_spend
+        .solution
+        .to_clvm(&mut allocator)
+        .map_err(|e| hint_parse_failed(format!("solution: {e:?}")))?;
+    let output = clvmr::run_program(
+        &mut allocator,
+        &clvmr::ChiaDialect::new(0),
+        puzzle,
+        solution,
+        u64::MAX,
+    )
+    .map_err(|e| hint_parse_failed(format!("puzzle did not run: {e:?}")))?
+    .1;
+    let conditions: Vec<Condition> = FromClvm::from_clvm(&allocator, output)
+        .map_err(|e| hint_parse_failed(format!("conditions: {e:?}")))?;
+
+    let parent = coin_spend.coin.coin_id();
+    let mut indexed = Vec::new();
+    for condition in conditions {
+        let Some(create) = condition.into_create_coin() else {
+            continue;
+        };
+        let Memos::Some(memos) = create.memos else {
+            continue;
+        };
+        let Ok(values) = <Vec<Bytes>>::from_clvm(&allocator, memos) else {
+            // A memo structure that is not a flat list is legal CLVM and simply carries no hints.
+            continue;
+        };
+        if values.is_empty() {
+            continue;
+        }
+        let coin_id = Coin::new(parent, create.puzzle_hash, create.amount).coin_id();
+        indexed.push((
+            hex::encode(coin_id),
+            values.iter().map(Hint::from_bytes).collect(),
+        ));
+    }
+    Ok(indexed)
+}
+
+/// Shorthand for a hint-extraction failure.
+fn hint_parse_failed(message: impl Into<String>) -> WalletError {
+    WalletError::new(WalletErrorCode::SpendValidationFailed, message)
 }
 
 #[cfg(test)]
@@ -250,5 +327,110 @@ mod tests {
         let mut index = populated();
         index.forget("nope");
         assert_eq!(index.len(), 3);
+    }
+
+    // --- extraction from a REAL spend (#45 producer) --------------------------------------------
+
+    /// Build a genuine multi-destination spend with our own builder and read its hints back.
+    ///
+    /// Deliberately NOT a hand-assembled `CoinSpend`: a fixture built by the test would only prove
+    /// the extractor agrees with the test, whereas this proves it agrees with what the shipped
+    /// builders actually emit. `build_multi_send_xch` hints every leg to its destination.
+    async fn real_multi_send_spend() -> crate::types::UnsignedSpend {
+        use crate::engine::build_extended::ExtendedSpendBuilder;
+        use crate::engine::test_support::{builder, wallet_coin};
+        use crate::types::{Address, Amount, IdentityRef, MultiSendXchRequest, SendLeg, WalletId};
+        use chia_wallet_sdk::utils::Address as Bech32Address;
+
+        let address = |seed: u8| {
+            Address(
+                Bech32Address::new(chia_protocol::Bytes32::new([seed; 32]), "xch".into())
+                    .encode()
+                    .unwrap(),
+            )
+        };
+        builder(vec![wallet_coin(1_000, 1)])
+            .build_multi_send_xch(MultiSendXchRequest {
+                identity: IdentityRef::new(WalletId(1)),
+                legs: vec![
+                    SendLeg {
+                        to: address(7),
+                        amount: Amount(100),
+                    },
+                    SendLeg {
+                        to: address(8),
+                        amount: Amount(250),
+                    },
+                ],
+                fee: Amount(0),
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn extraction_reads_the_hints_a_real_built_spend_carries() {
+        let spend = real_multi_send_spend().await;
+        let extracted: Vec<_> = spend
+            .coin_spends
+            .iter()
+            .flat_map(|cs| hints_from_coin_spend(cs).unwrap())
+            .collect();
+
+        // Two hinted legs; the change coin carries `Memos::None` and so is not discoverable.
+        assert_eq!(extracted.len(), 2);
+        let hints: Vec<Hint> = extracted.iter().flat_map(|(_, h)| h.clone()).collect();
+        assert!(hints.contains(&Hint::from_bytes([7u8; 32])));
+        assert!(hints.contains(&Hint::from_bytes([8u8; 32])));
+    }
+
+    /// The extracted key must be the coin id the chain will assign, not the puzzle hash — an
+    /// index keyed on anything else resolves to nothing when a caller looks a real coin up.
+    #[tokio::test]
+    async fn extraction_keys_each_entry_on_the_real_coin_id() {
+        let spend = real_multi_send_spend().await;
+        let lead = &spend.coin_spends[0];
+        let expected = hex::encode(
+            chia_protocol::Coin::new(
+                lead.coin.coin_id(),
+                chia_protocol::Bytes32::new([7u8; 32]),
+                100,
+            )
+            .coin_id(),
+        );
+        let extracted = hints_from_coin_spend(lead).unwrap();
+        assert!(
+            extracted.iter().any(|(coin_id, _)| coin_id == &expected),
+            "no entry keyed on the real coin id: {extracted:?}"
+        );
+    }
+
+    /// A spend whose output is not a condition list is an error, not a silent empty index — a
+    /// caller must be able to tell "this coin announced no hints" from "this spend was unreadable".
+    #[test]
+    fn extraction_refuses_a_spend_whose_output_is_not_conditions() {
+        use chia_protocol::{Bytes32, Coin, CoinSpend, Program};
+        // Puzzle `1` is the identity path, so the output is the solution verbatim: a bare atom,
+        // which cannot decode as a list of conditions.
+        let broken = CoinSpend::new(
+            Coin::new(Bytes32::new([1; 32]), Bytes32::new([2; 32]), 1),
+            Program::from(vec![0x01]),
+            Program::from(vec![0x05]),
+        );
+        let err = hints_from_coin_spend(&broken).unwrap_err();
+        assert_eq!(err.code, WalletErrorCode::SpendValidationFailed);
+    }
+
+    /// The control for the test above: a spend that runs and legitimately creates nothing yields
+    /// an EMPTY index, not an error.
+    #[test]
+    fn extraction_of_a_spend_with_no_created_coins_is_empty_not_an_error() {
+        use chia_protocol::{Bytes32, Coin, CoinSpend, Program};
+        let empty = CoinSpend::new(
+            Coin::new(Bytes32::new([1; 32]), Bytes32::new([2; 32]), 1),
+            Program::from(vec![0x01]),
+            Program::from(vec![0x80]),
+        );
+        assert!(hints_from_coin_spend(&empty).unwrap().is_empty());
     }
 }

@@ -41,7 +41,7 @@ pub use build_offer::OfferBuilder;
 pub use build_options::OptionBuilder;
 pub use build_tips::TipBuilder;
 pub use events::{DeltaLog, EventSink, PersistentEventLog, DEFAULT_HISTORY_CAPACITY};
-pub use hints::HintIndex;
+pub use hints::{hints_from_coin_spend, HintIndex};
 pub use offer_state::{PendingOffers, PENDING_TTL};
 pub use persist::{SqliteDeltaLog, SqliteWalletStore};
 pub use selection::{
