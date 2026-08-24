@@ -35,7 +35,10 @@ pub use options::{
     ExerciseOptionRequest, MintOptionRequest, MintedOption, OptionHandle, OptionOnChainState,
     OptionStrike, TransferOptionRequest, WireCoin,
 };
-pub use request::{SendCatRequest, SendXchRequest};
+pub use request::{
+    CombineXchRequest, MultiSendCatRequest, MultiSendXchRequest, SendCatRequest, SendLeg,
+    SendXchRequest, SplitXchRequest,
+};
 pub use spend::{RequiredSignature, SignedBundle, UnsignedSpend};
 pub use tips::{
     AutoTipOutcome, AutoTipPolicy, AutoTipRequest, CapReason, TipDecision, TipLedger, TipMode,

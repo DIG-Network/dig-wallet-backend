@@ -19,6 +19,7 @@
 
 pub mod broadcast;
 pub mod build;
+pub mod build_extended;
 pub mod build_offer;
 pub mod build_options;
 pub mod build_tips;
@@ -30,9 +31,12 @@ pub mod selection;
 pub mod signer;
 pub mod state;
 pub mod sync;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use broadcast::{Broadcaster, MempoolBroadcaster, MempoolClient, MempoolStatus};
 pub use build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
+pub use build_extended::ExtendedSpendBuilder;
 pub use build_offer::OfferBuilder;
 pub use build_options::OptionBuilder;
 pub use build_tips::TipBuilder;
