@@ -17,6 +17,7 @@
 //! that defines `SecretKey` is a non-optional dependency and is always linked). The private key
 //! lives only behind [`signer::RemoteSigner`], implemented client-side.
 
+pub mod actions;
 pub mod broadcast;
 pub mod build;
 pub mod build_extended;
@@ -37,6 +38,7 @@ pub mod sync;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use actions::{AssetActions, AssetKind, DerivationWindow, NetworkBook, PeerEntry, Visibility};
 pub use broadcast::{Broadcaster, MempoolBroadcaster, MempoolClient, MempoolStatus};
 pub use build::{SdkSpendBuilder, SpendBuilder, SpendInputs};
 pub use build_extended::ExtendedSpendBuilder;

@@ -88,8 +88,9 @@ pub fn transfer_did(
         did.coin.amount,
         chia_puzzle_types::Memos::None,
     );
-    let child = dig_did::spend_did_with_conditions(&mut ctx, did, Owner::Standard(owner_key), conditions)
-        .map_err(|e| did_failed("transfer", e))?;
+    let child =
+        dig_did::spend_did_with_conditions(&mut ctx, did, Owner::Standard(owner_key), conditions)
+            .map_err(|e| did_failed("transfer", e))?;
     Ok(DidOperation {
         coin_spends: ctx.take(),
         child: Some(child),
@@ -147,15 +148,12 @@ pub fn resolve_did_xch_address<S: ChainSource>(
             .map_err(|e| did_failed("resolve", e))?;
     resolved
         .map(|address| {
-            address
-                .encode()
-                .map(Address)
-                .map_err(|e| {
-                    WalletError::new(
-                        WalletErrorCode::SpendValidationFailed,
-                        format!("DID resolve produced an unencodable address: {e}"),
-                    )
-                })
+            address.encode().map(Address).map_err(|e| {
+                WalletError::new(
+                    WalletErrorCode::SpendValidationFailed,
+                    format!("DID resolve produced an unencodable address: {e}"),
+                )
+            })
         })
         .transpose()
 }

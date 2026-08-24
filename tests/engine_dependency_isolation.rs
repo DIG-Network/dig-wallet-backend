@@ -161,7 +161,8 @@ fn direct_engine_dependencies() -> Vec<(String, PathBuf)> {
         if !wanted.contains(id) {
             continue;
         }
-        let manifest_path = PathBuf::from(package["manifest_path"].as_str().expect("manifest_path"));
+        let manifest_path =
+            PathBuf::from(package["manifest_path"].as_str().expect("manifest_path"));
         let root = manifest_path
             .parent()
             .expect("manifest has a parent dir")

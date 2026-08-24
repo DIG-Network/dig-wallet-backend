@@ -63,7 +63,11 @@ impl SpendInputs for OneCoinWallet {
         Ok(vec![self.coin])
     }
 
-    fn spendable_cat(&self, _identity: &IdentityRef, _asset_id: &AssetId) -> WalletResult<Vec<Cat>> {
+    fn spendable_cat(
+        &self,
+        _identity: &IdentityRef,
+        _asset_id: &AssetId,
+    ) -> WalletResult<Vec<Cat>> {
         Ok(Vec::new())
     }
 
@@ -128,9 +132,8 @@ fn engine(store: Arc<InMemoryWalletStore>) -> SyncEngine {
 async fn a_coin_arriving_through_sync_becomes_discoverable_by_its_hint() {
     let payee = Bytes32::new([7u8; 32]);
     let spends = hinted_payment(payee).await;
-    let expected_coin_id = hex::encode(
-        chia_protocol::Coin::new(spends[0].coin.coin_id(), payee, 100).coin_id(),
-    );
+    let expected_coin_id =
+        hex::encode(chia_protocol::Coin::new(spends[0].coin.coin_id(), payee, 100).coin_id());
 
     let store = Arc::new(InMemoryWalletStore::new());
     let outcome = engine(Arc::clone(&store))

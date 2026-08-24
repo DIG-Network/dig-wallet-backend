@@ -66,9 +66,14 @@ pub fn mint_nft(
     spec: &MintSpec,
 ) -> WalletResult<NftOperation> {
     let mut ctx = SpendContext::new();
-    dig_nft::mint(&mut ctx, &dig_nft::Owner::Standard(owner_key), funding_coin, spec)
-        .map(NftOperation::from)
-        .map_err(|e| nft_failed("mint", e))
+    dig_nft::mint(
+        &mut ctx,
+        &dig_nft::Owner::Standard(owner_key),
+        funding_coin,
+        spec,
+    )
+    .map(NftOperation::from)
+    .map_err(|e| nft_failed("mint", e))
 }
 
 /// Mint several NFTs from ONE funding coin, in a single operation.

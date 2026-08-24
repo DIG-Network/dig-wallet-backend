@@ -171,9 +171,7 @@ fn hydrate_cats(
     for cat in children {
         let asset_id = AssetId(hex::encode(cat.info.asset_id));
         match out.cats.iter_mut().find(|c| c.asset_id == asset_id) {
-            Some(existing) => {
-                existing.balance = Amount(existing.balance.mojos() + cat.coin.amount)
-            }
+            Some(existing) => existing.balance = Amount(existing.balance.mojos() + cat.coin.amount),
             None => out.cats.push(CatRecord {
                 asset_id,
                 balance: Amount(cat.coin.amount),
@@ -233,4 +231,183 @@ fn first_data_uri(allocator: &Allocator, metadata: HashedPtr) -> Option<String> 
 /// Shorthand for a spend that could not be evaluated at all.
 fn unparseable(message: impl Into<String>) -> WalletError {
     WalletError::new(WalletErrorCode::SpendValidationFailed, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chia_bls::PublicKey;
+    use chia_puzzle_types::standard::StandardArgs;
+    use chia_wallet_sdk::driver::SpendContext;
+    use chia_wallet_sdk::types::Conditions;
+
+    /// The BLS12-381 G1 generator: a valid, non-infinity public key with no secret counterpart.
+    fn owner_pk() -> PublicKey {
+        const G1_GENERATOR: [u8; 48] = [
+            0x97, 0xf1, 0xd3, 0xa7, 0x31, 0x97, 0xd7, 0x94, 0x26, 0x95, 0x63, 0x8c, 0x4f, 0xa9,
+            0xac, 0x0f, 0xc3, 0x68, 0x8c, 0x4f, 0x97, 0x74, 0xb9, 0x05, 0xa1, 0x4e, 0x3a, 0x3f,
+            0x17, 0x1b, 0xac, 0x58, 0x6c, 0x55, 0xe8, 0x3f, 0xf9, 0x7a, 0x1a, 0xef, 0xfb, 0x3a,
+            0xf0, 0x0a, 0xdb, 0x22, 0xc6, 0xbb,
+        ];
+        PublicKey::from_bytes(&G1_GENERATOR).expect("the G1 generator is a valid public key")
+    }
+
+    fn owner_ph() -> chia_protocol::Bytes32 {
+        chia_protocol::Bytes32::from(StandardArgs::curry_tree_hash(owner_pk()).to_bytes())
+    }
+
+    /// The spend in `spends` that created `child` — the PARENT this module reconstructs from.
+    ///
+    /// Selected by matching the child's `parent_coin_info` rather than by taking a fixed index,
+    /// because an index would silently point at the wrong spend the moment a builder reorders its
+    /// output, and the test would then prove something about a different spend.
+    fn parent_of(spends: &[CoinSpend], child: chia_protocol::Coin) -> CoinSpend {
+        spends
+            .iter()
+            .find(|spend| spend.coin.coin_id() == child.parent_coin_info)
+            .expect("the child's parent must be among the spends that created it")
+            .clone()
+    }
+
+    /// A REAL DID launch, built by the canonical `dig-did` builder.
+    fn did_launch() -> (Vec<CoinSpend>, dig_did::Did) {
+        let mut ctx = SpendContext::new();
+        let launch = dig_did::create_simple_did(
+            &mut ctx,
+            Coin::new(chia_protocol::Bytes32::new([0x22; 32]), owner_ph(), 1),
+            dig_did::Owner::Standard(owner_pk()),
+        )
+        .expect("the canonical DID launch builder");
+        let did = launch.child.expect("a launch yields the settled DID");
+        (launch.coin_spends, did)
+    }
+
+    /// A REAL NFT mint, built by the canonical `dig-nft` builder.
+    fn nft_mint() -> (Vec<CoinSpend>, dig_nft::Nft) {
+        let mut ctx = SpendContext::new();
+        let metadata = ctx
+            .alloc(&chia_puzzle_types::nft::NftMetadata::default())
+            .expect("the default NFT metadata allocates");
+        let metadata = ctx.serialize(&metadata).expect("metadata serializes");
+        let mint = dig_nft::mint(
+            &mut ctx,
+            &dig_nft::Owner::Standard(owner_pk()),
+            Coin::new(chia_protocol::Bytes32::new([0x44; 32]), owner_ph(), 1),
+            &dig_nft::MintSpec::new(metadata, owner_ph()),
+        )
+        .expect("the canonical NFT mint builder");
+        let nft = *mint.children.first().expect("a mint yields one NFT");
+        (mint.coin_spends, nft)
+    }
+
+    /// An ordinary standard-layer payment — the CONTROL.
+    ///
+    /// Without it, a hydrator that returned every coin it saw as a DID would pass the two positive
+    /// tests below: each has exactly one singleton to find, so neither can tell "recognised the
+    /// singleton" from "called everything a singleton".
+    fn ordinary_payment() -> CoinSpend {
+        let mut ctx = SpendContext::new();
+        let funding = Coin::new(chia_protocol::Bytes32::new([0x66; 32]), owner_ph(), 1_000);
+        chia_wallet_sdk::driver::StandardLayer::new(owner_pk())
+            .spend(
+                &mut ctx,
+                funding,
+                Conditions::new().create_coin(
+                    chia_protocol::Bytes32::new([0x77; 32]),
+                    900,
+                    chia_puzzle_types::Memos::None,
+                ),
+            )
+            .expect("the standard layer spends the funding coin");
+        ctx.take().pop().expect("one coin spend")
+    }
+
+    #[test]
+    fn a_real_did_launch_hydrates_the_did_it_created() {
+        let (spends, did) = did_launch();
+        let hydrated = reconstruct_from_parent_spend(&parent_of(&spends, did.coin))
+            .expect("a real DID parent spend runs");
+
+        assert_eq!(
+            hydrated
+                .dids
+                .iter()
+                .map(|d| d.launcher_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![hex::encode(did.info.launcher_id).as_str()],
+            "the hydrated DID must be the one the builder actually created"
+        );
+        assert_eq!(hydrated.skipped, 0);
+    }
+
+    #[test]
+    fn a_real_nft_mint_hydrates_the_nft_it_created() {
+        let (spends, nft) = nft_mint();
+        let hydrated = reconstruct_from_parent_spend(&parent_of(&spends, nft.coin))
+            .expect("a real NFT parent spend runs");
+
+        assert_eq!(
+            hydrated
+                .nfts
+                .iter()
+                .map(|n| n.launcher_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![hex::encode(nft.info.launcher_id).as_str()],
+            "the hydrated NFT must be the one the builder actually created"
+        );
+    }
+
+    /// The control: an ordinary payment is not a singleton of any family.
+    #[test]
+    fn an_ordinary_payment_hydrates_nothing_and_skips_nothing() {
+        let hydrated =
+            reconstruct_from_parent_spend(&ordinary_payment()).expect("an ordinary spend runs");
+
+        assert!(
+            hydrated.is_empty(),
+            "an ordinary payment must not be reported as an NFT, DID or CAT: {hydrated:?}"
+        );
+        assert_eq!(
+            hydrated.skipped, 0,
+            "a spend that is simply not a singleton is not a SKIP — skipped counts recognised-but-unparseable"
+        );
+    }
+
+    /// A DID launch must not also be reported as an NFT, and vice versa. Two positive tests run in
+    /// isolation cannot see a hydrator that files every singleton under every family.
+    #[test]
+    fn each_family_claims_only_its_own_singleton() {
+        let (did_spends, did) = did_launch();
+        let did_hydrated =
+            reconstruct_from_parent_spend(&parent_of(&did_spends, did.coin)).unwrap();
+        assert!(did_hydrated.nfts.is_empty(), "a DID is not an NFT");
+        assert!(did_hydrated.cats.is_empty(), "a DID is not a CAT");
+
+        let (nft_spends, nft) = nft_mint();
+        let nft_hydrated =
+            reconstruct_from_parent_spend(&parent_of(&nft_spends, nft.coin)).unwrap();
+        assert!(nft_hydrated.dids.is_empty(), "an NFT is not a DID");
+        assert!(nft_hydrated.cats.is_empty(), "an NFT is not a CAT");
+    }
+
+    /// A spend whose puzzle cannot be EVALUATED is the ONE error this returns — the caller handed
+    /// over something that is not a spend, and reporting an empty hydration for it would be a lie.
+    ///
+    /// The fixture is deliberately malformed CLVM (`0xff` opens a cons pair and then ends), not the
+    /// nil program: nil is a perfectly legal puzzle that RUNS and yields no conditions, so an empty
+    /// hydration for it is the correct answer rather than a failure. Using nil here would have
+    /// asserted an error the code is right not to raise.
+    #[test]
+    fn a_spend_that_does_not_run_is_an_error_not_an_empty_result() {
+        let malformed = chia_protocol::Program::new(vec![0xff].into());
+        let broken = CoinSpend::new(
+            Coin::new(chia_protocol::Bytes32::new([0x88; 32]), owner_ph(), 1),
+            malformed.clone(),
+            malformed,
+        );
+        assert!(
+            reconstruct_from_parent_spend(&broken).is_err(),
+            "a puzzle that cannot produce conditions must surface as an error"
+        );
+    }
 }

@@ -188,6 +188,40 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   surface (`apply_coin_state` → `CoinChange`, `rollback_to`, `set_peak`, `set_sync_status`,
   `upsert_*`, `record_transaction`) is engine-internal — the sync loop drives it; the client seam
   sees only the read trait over IPC.
+- **`engine::did`** — the DID surface, composed from `dig-did` (the canonical DID expert crate) and
+  re-exported so consumers depend on this crate alone. `launch_did(funding_coin, owner_key)` builds
+  an unsigned DID launch (the funding coin becomes the DID in full and MUST carry an odd amount, or
+  no singleton is created); `transfer_did` recreates the singleton under a new inner puzzle hash;
+  `hydrate_did` reconstructs the DID a parent spend created, failing closed rather than fabricating a
+  lineage proof or owner hint; `prove_did_lineage` proves a coin descends from a DID, bounded by
+  `MAX_LINEAGE_DEPTH`; `resolve_did_xch_address` resolves a `did:chia:` string to its CURRENT owner's
+  address, returning `None` when the DID has no resolvable owner (an answer, not a failure). Every
+  operation is key-free and unsigned (§1.4).
+- **`engine::nft`** — the NFT surface, composed from `dig-nft`: `mint_nft`, `bulk_mint_nfts`,
+  `transfer_nft`, `transfer_nft_with_metadata`, `update_nft_metadata`. Each returns an
+  `NftOperation { coin_spends, children, did_conditions }`. When `did_conditions` is non-empty the
+  attributed owner DID's own spend MUST emit them in the SAME bundle — a bundle that omits them does
+  not mint an unattributed NFT, it fails. The default metadata updater only PREPENDS URIs; an update
+  can never rewrite or remove one.
+- **`engine::singleton::reconstruct_from_parent_spend(parent) -> HydratedSingletons`** — hydrates the
+  NFTs, DIDs and CATs a parent spend creates, by composing the canonical drivers (`Nft::parse_child`,
+  `dig_did::hydrate_did_from_parent_spend`, `Cat::parse_children`). CAT children are aggregated per
+  asset id, because `CatRecord` is a per-asset balance rather than a per-coin row. A candidate that is
+  recognised but will not parse is COUNTED in `skipped` and passed over; the ONLY error returned is a
+  spend that does not run at all.
+- **`engine::actions`** — housekeeping state, held beside the coin store because none of it is chain
+  state and a reorg rollback must not erase it. `AssetActions` carries per-`(AssetKind, id)`
+  `Visibility` (an unknown asset is VISIBLE, so newly-discovered incoming value is never silently
+  omitted; hiding is a display decision and never stops tracking or spending) and idempotent refresh
+  requests (`resync_cat` / `redownload_nft` record INTENT — the engine is network-free, so the sync
+  loop performs the read and calls `clear_refresh`). `DerivationWindow` is the HD WATCH WINDOW — a
+  count of addresses to subscribe to, not a key and not a derivation — and widens saturatingly, since
+  a wrap to zero would make the wallet report an empty balance for coins it still owns. `NetworkBook`
+  holds the peer registry, the preferred peer, the selected network and the delta-sync policy: peers
+  are returned IPv6-first (§5.2) however they were inserted, targeting an UNKNOWN peer is REFUSED,
+  removing the targeted peer clears the target, and selecting a network CLEARS the peer book because
+  a peer of another network answers about a different chain. Peer DISCOVERY is deliberately absent —
+  it belongs to `dig-pex`/`dig-dht`.
 - **`engine::persist::SqliteWalletStore`** — the persistent (SQLite) backing for the same read +
   mutation surface as `InMemoryWalletStore`; a drop-in whose coin/CAT/NFT/DID/transaction/sync state
   survives a process restart. It classifies a coin update with the SAME rule as the in-memory
@@ -928,6 +962,16 @@ only for catch-up" contract. #979 Subscription adopts this exact pattern.
   local-first and falls to the point-read source for out-of-DB reads; `sync_with_fallback` prefers
   the peer and routes to the fallback only on a `transport` failure. `order_dial_candidates` orders a
   peer's candidate addresses IPv6-first (§5.2).
+- **`PeerSpendSource`** is a SECOND, additive peer transport carrying `CoinSpend`s rather than
+  `CoinRecord`s. It exists because a coin record cannot express what a coin IS: memo hints live in the
+  memos of a `CREATE_COIN` condition and a singleton's identity lives in its parent's puzzle reveal,
+  both of which exist only inside a spend. It is a separate trait rather than a widening of
+  `PeerCoinSource` because the two are different peer requests and `PeerCoinSource` has external
+  implementors. `SyncEngine::sync_spends_from_peer` drives it, indexing every memo hint (§3e) and
+  hydrating every NFT/DID/CAT the spends create (`engine::singleton`) into the store, and returns a
+  `SpendSyncOutcome { spends, hinted_coins, assets, skipped }`. A spend whose hints or singletons
+  cannot be read is COUNTED and passed over — one unreadable spend among thousands MUST NOT stop the
+  rest from being discovered.
 
 ---
 
@@ -995,6 +1039,26 @@ All of the following live behind the `client` seam and NEVER in the engine:
 ---
 
 ## 9. Conformance + golden vectors; security properties
+
+The key-isolation invariant (§1.4) is enforced by TWO complementary, independent checks, and both
+MUST pass:
+
+1. **Source** (`tests/key_isolation.rs`) — no identifier naming secret key or seed material appears
+   anywhere under `src/engine` or `src/types`. This catches a secret type the engine NAMES, including
+   one reached through an alias or a re-export.
+2. **Dependency graph** (`tests/engine_dependency_isolation.rs`) — no dependency the `engine` feature
+   activates exposes secret-key material on its public surface, except an explicitly justified
+   allow-list. This catches the case the source scan structurally CANNOT: a secret-key crate added to
+   the `engine` feature list whose types are never spelled in engine source. Such a change compiles,
+   leaves the source scan green, and leaves the standalone engine build green.
+
+The check is scoped to DIRECT dependencies. The full transitive engine graph already contains
+secret-key crates that cannot be removed (`chia-bls` via the protocol wire types, `bip39` via
+`chia-sdk-driver`, `rsa` via `chia-ssl`, `k256` via `clvmr`), so a whole-graph assertion would be red
+on an untouched tree and would be blanket-allowed rather than obeyed. It is expressed as a PROPERTY of
+each dependency's public surface rather than as a banned crate-name list, because a list only bans
+what someone thought to enumerate. A positive control asserts the allow-listed crates are still
+DETECTED, so a detector that silently found nothing cannot pass as a clean result.
 
 - **Amount always-string wire form:** round-trip vectors at `0`, `1`, `MAX_JS_SAFE_INTEGER`,
   `MAX_JS_SAFE_INTEGER + 1`, `u64::MAX` — every value serializes as a decimal string; a bare JSON
