@@ -138,6 +138,10 @@ this layer.**
 
 - `SendXchRequest { identity, to, amount, fee }`, `SendCatRequest { identity, asset_id, to, amount,
   fee }` — pure data both seams import (client sends them; engine consumes them).
+- `SendLeg { to, amount }` and the extended-send requests it composes (§3d):
+  `MultiSendXchRequest { identity, legs, fee }`, `MultiSendCatRequest { identity, asset_id, legs,
+  fee }`, `CombineXchRequest { identity, fee }`, `SplitXchRequest { identity, parts, fee }`.
+- `Hint` — a normalised lower-hex coin memo value used for dual-memo discovery (§3e).
 - Offer request/response types (the offers surface, §3c): `MakeOfferRequest`, `AssembleOfferRequest`,
   `TakeOfferRequest`, `FinalizeTakeRequest`, `CancelOfferRequest`, `CombineOffersRequest`,
   `SummarizeOfferRequest`, and the responses `PendingOfferBuild { build_id, unsigned }`,
@@ -177,7 +181,8 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
   EventSink)`.
 - **`EngineConfig { network, db_path, sync: SyncConfig }`**.
 - **`engine::state::WalletStore`** (read surface, all scoped to an `IdentityRef`): `balance`, `coins`,
-  `cats`, `nfts`, `dids`, `history`, `sync_status`. MUST NOT accept or return secret material.
+  `cats`, `nfts`, `dids`, `history`, `sync_status`. Hint-scoped discovery reads live on
+  `InMemoryWalletStore` directly (§3e), not on this trait. MUST NOT accept or return secret material.
   `InMemoryWalletStore` is the concrete backing (coins/CATs/NFTs/DIDs/history indexed per
   `WalletId`, balance derived from unspent coins, reorg rollback to a fork height). Its mutation
   surface (`apply_coin_state` → `CoinChange`, `rollback_to`, `set_peak`, `set_sync_status`,
@@ -383,6 +388,65 @@ Owns the running instance. Identity-parameterized; NEVER holds a private key; NE
 trait it calls), any HD seed.
 
 ---
+
+### 3d. Extended sends — multi-destination and coin reshaping (`engine::build_extended`)
+
+- **`engine::build_extended::ExtendedSpendBuilder`** — `build_multi_send_xch`,
+  `build_multi_send_cat`, `build_combine_xch`, `build_split_xch`. Implemented by `SdkSpendBuilder`.
+  It is a SEPARATE trait from `SpendBuilder` so an existing external implementor is unaffected
+  (additive, §5.1 spirit).
+- A *bulk* send is not a distinct operation: it is a multi-send whose legs were generated rather
+  than hand-listed, and MUST share the multi-send implementation.
+- **`build_multi_send_xch(MultiSendXchRequest)`** MUST create one coin per leg, each hinted to its
+  own destination puzzle hash, plus at most one change coin, plus the reserved fee. Every leg is
+  paid its own amount; paying only the first leg and returning the rest as change is NON-conformant.
+- **`build_multi_send_cat(MultiSendCatRequest)`** MUST pay every leg out of ONE CAT ring: the lead
+  CAT coin carries every recipient output and the CAT change, the remaining CAT coins carry empty
+  conditions. A farmer fee, when non-zero, is paid from XCH and bound to the ring with
+  `assert_concurrent_spend`.
+- **`build_combine_xch(CombineXchRequest)`** MUST produce EXACTLY ONE output coin, at the change
+  puzzle hash, worth the selected total minus the fee. Fewer than two spendable coins is
+  `InvalidInput`; a total that cannot also cover the fee is `InsufficientFunds`.
+- **`build_split_xch(SplitXchRequest)`** MUST produce exactly `parts` output coins at the change
+  puzzle hash. `parts < 2` is `InvalidInput`. Where the divisible value is not a multiple of
+  `parts`, the remainder MUST be added to the FIRST output coin — it MUST NOT be dropped, because a
+  dropped remainder becomes farmer reward the caller never consented to.
+- A combine and a split are **self-directed**: they pay no third party. Their `TransactionSummary`
+  MUST therefore list NO `outputs` and NO `received`, only the `fee` — the fee is the entirety of
+  what the user is consenting to. The client signer re-derives the true value flow independently
+  (§4), so the narrower summary hides nothing.
+- Every builder here keeps the same fail-closed guarantees as §3: exact value conservation
+  (inputs = outputs + fee), a non-empty `required_signatures` set, no hand-rolled CLVM, and no key.
+- A leg with a zero amount MUST be REJECTED as `InvalidInput`, never silently dropped: dropping it
+  would build a spend that disagrees with the destination list the user reviewed. An empty leg list
+  is likewise `InvalidInput`.
+
+### 3e. Coin hints — dual-memo discovery (`engine::hints`)
+
+A traditional Chia wallet indexes a coin by its FIRST memo alone. DIG DataLayer store launcher coins
+carry two meaningful memos: **memo1**, the global launcher hint, and **memo2**, the per-owner hint
+`sha256(DIGSTORE_OWNER_HINT_DOMAIN ‖ owner_puzzle_hash)`. Indexing only memo1 makes every store in
+the network indistinguishable; indexing only memo2 loses whether the coin is a launcher at all.
+
+- **`types::Hint`** — a normalised lower-hex memo value. Normalisation MUST strip a `0x` prefix and
+  lower-case the body, so two spellings of one memo index to one key. A `Hint` carries NO memo
+  position.
+- **`engine::hints::HintIndex`** MUST index every hint a coin was announced under, regardless of
+  memo position, and MUST answer all three of: by memo1 alone, by memo2 alone
+  (`coins_by_hint`), and by both together (`coins_by_all_hints`). `coins_by_all_hints` is the
+  INTERSECTION; `coins_by_any_hint` is the union. Indexing is additive — re-observing a coin with a
+  further hint widens its entry.
+- `coins_by_all_hints(&[])` MUST match nothing. An unconstrained conjunctive query is a caller
+  mistake, and returning the whole index would hand back the full coin set to a caller that
+  constrained on none of it.
+- **`InMemoryWalletStore`** owns one `HintIndex` per `WalletId` and exposes `index_coin_hints`,
+  `coins_by_hint`, `coins_by_all_hints`, `hints_for_coin`. A hint query MUST resolve only to coins
+  the store still holds.
+- **`rollback_to` MUST withdraw the hints of every coin the reorg forgot.** A coin the winning chain
+  never created MUST stop being discoverable, or a hint query keeps resolving to a coin that does
+  not exist.
+- The index holds PUBLIC discovery material only — coin ids and memo hex. It MUST NOT hold key
+  material (§1.4).
 
 ## 4. CLIENT seam (`client`)
 
