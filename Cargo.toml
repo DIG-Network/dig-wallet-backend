@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet-backend"
-version = "0.29.0"
+version = "0.29.1"
 edition = "2021"
 rust-version = "1.81"
 description = "Canonical event-driven Chia wallet backend for the DIG Network. Exports two carefully-partitioned seams: an `engine` seam (imported by dig-node — the single running wallet instance: state, sync, unsigned-spend construction, event emission; identity-parameterized, never holds a private key) and a `client` seam (used by dig-app — the event subscriber, spend review/decode, the signing interface + identity provider that hold the key). Clean-room, chia-wallet-sdk-based. Replaces dig-l1-wallet."
@@ -76,7 +76,7 @@ dig-events-protocol = "0.1.2"
 # BOTH seams from this ONE constant makes signer == engine by construction — no drift, no
 # custody-break from a hand-copied hex diverging. `CHIA_L1_*` (Chia L1) is deliberately distinct
 # from `DIG_MAINNET`/`DIG_TESTNET` (the DIG L2 genesis), which MUST NOT be used for L1 signing.
-dig-constants = "0.10"
+dig-constants = "0.11"
 
 # --- seam-gated (async runtime for the event emitter + subscriber + sync loop) ---
 # `sync` = the broadcast channel the EventSink fans events out over. `rt`/`macros`/`time`
@@ -94,7 +94,7 @@ zeroize = { version = "1", optional = true }
 # crates.io forbids publishing a crate that has a git dependency; bls.rs there is byte-identical to
 # the git v0.4.0 tag this replaces). `default-features = false` + `bls` = just the key model, no
 # DID-resolve/network deps.
-dig-identity = { version = "0.6", default-features = false, features = ["bls"], optional = true }
+dig-identity = { version = "0.7", default-features = false, features = ["bls"], optional = true }
 # The CANONICAL Chia spend-driver constructors (StandardLayer, Cat, SpendContext, Conditions)
 # + the key-free RequiredSignature extractor. The engine builds every unsigned spend through
 # these (§4.1: never hand-rolled CLVM) and NEVER touches the sdk's `SecretKey` path. Default
@@ -149,7 +149,7 @@ bip39 = "2.0"
 # (`dig_merkle::melt`) and a DID singleton (`dig_did::melt`), whose inner layer stacks differ. A
 # hand-built singleton fixture would prove only that the arm accepts the fixture. Both are level-10
 # crates, strictly below this one, and both are test-only edges.
-dig-merkle = "0.6"
+dig-merkle = "0.8"
 dig-did = "0.7"
 
 [package.metadata.docs.rs]

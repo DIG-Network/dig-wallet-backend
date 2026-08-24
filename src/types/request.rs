@@ -38,6 +38,69 @@ pub struct SendCatRequest {
     pub fee: Amount,
 }
 
+/// One leg of a multi-output send: an address and the amount it receives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendLeg {
+    /// The destination address.
+    pub to: Address,
+    /// The amount that destination receives.
+    pub amount: Amount,
+}
+
+/// A request to pay an arbitrary set of XCH destinations in ONE spend.
+///
+/// The generalisation `bulk_xch_send` and `multi_send` both reduce to: a bulk send is a
+/// multi-send whose legs happen to be generated rather than hand-listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiSendXchRequest {
+    /// The paying identity (public material).
+    pub identity: IdentityRef,
+    /// The destinations, in payment order. Must be non-empty.
+    pub legs: Vec<SendLeg>,
+    /// The fee to pay the farmer.
+    pub fee: Amount,
+}
+
+/// A request to pay an arbitrary set of destinations of ONE CAT asset in one spend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiSendCatRequest {
+    /// The paying identity (public material).
+    pub identity: IdentityRef,
+    /// The CAT asset id.
+    pub asset_id: AssetId,
+    /// The destinations, in payment order. Must be non-empty.
+    pub legs: Vec<SendLeg>,
+    /// The fee to pay the farmer (paid in XCH).
+    pub fee: Amount,
+}
+
+/// A request to merge several of the wallet's own XCH coins into one.
+///
+/// Combining moves no value to a third party: every mojo not spent on the fee returns to the
+/// wallet as a single coin. This is what unblocks a later send that would otherwise fail the
+/// coin-count cap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CombineXchRequest {
+    /// The identity whose coins are merged (public material).
+    pub identity: IdentityRef,
+    /// The fee to pay the farmer.
+    pub fee: Amount,
+}
+
+/// A request to split the wallet's XCH into `parts` coins of its own.
+///
+/// The inverse of a combine: it raises the wallet's coin count so several spends can proceed
+/// concurrently. Value stays with the wallet apart from the fee.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitXchRequest {
+    /// The identity whose coins are split (public material).
+    pub identity: IdentityRef,
+    /// How many output coins to produce. Must be at least two.
+    pub parts: u32,
+    /// The fee to pay the farmer.
+    pub fee: Amount,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
