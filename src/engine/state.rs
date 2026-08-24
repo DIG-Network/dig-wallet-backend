@@ -21,8 +21,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use super::hints::HintIndex;
 use crate::types::{
-    Amount, Balance, CatRecord, CoinRecord, DidRecord, IdentityRef, NftRecord, SyncLifecycle,
+    Amount, Balance, CatRecord, CoinRecord, DidRecord, Hint, IdentityRef, NftRecord, SyncLifecycle,
     SyncStatus, TransactionRecord, WalletId, WalletResult,
 };
 
@@ -77,6 +78,9 @@ struct WalletState {
     cats: HashMap<String, CatRecord>,
     nfts: HashMap<String, NftRecord>,
     dids: HashMap<String, DidRecord>,
+    /// Coin discoverability by memo hint. Both of a DIG store launcher's memos are indexed,
+    /// separately and jointly (SPEC §3, `super::hints`).
+    hints: HintIndex,
     history: Vec<TransactionRecord>,
     /// The height the wallet has processed up to.
     peak_height: u32,
@@ -93,6 +97,7 @@ impl Default for WalletState {
             cats: HashMap::new(),
             nfts: HashMap::new(),
             dids: HashMap::new(),
+            hints: HintIndex::new(),
             history: Vec::new(),
             peak_height: 0,
             target_height: 0,
@@ -171,13 +176,20 @@ impl InMemoryWalletStore {
             let mut affected = Vec::new();
 
             // Forget coins created after the fork — they never existed on the winning chain.
+            let mut forgotten = Vec::new();
             state.coins.retain(|coin_id, coin| {
                 let created_after_fork = coin.created_height.is_some_and(|h| h > fork_height);
                 if created_after_fork {
                     affected.push(coin_id.clone());
+                    forgotten.push(coin_id.clone());
                 }
                 !created_after_fork
             });
+            // A coin the winning chain never created must also stop being DISCOVERABLE, or a
+            // hint query would keep resolving to a coin that no longer exists.
+            for coin_id in &forgotten {
+                state.hints.forget(coin_id);
+            }
 
             // Un-spend coins whose spend was undone by the reorg.
             for (coin_id, coin) in state.coins.iter_mut() {
@@ -242,6 +254,49 @@ impl InMemoryWalletStore {
     pub fn peak_height(&self, wallet_id: WalletId) -> u32 {
         self.with_wallet(wallet_id, |state| state.peak_height)
     }
+
+    /// Record the memo hints `coin_id` was announced under (#45).
+    ///
+    /// Every hint is indexed regardless of memo position, so a DIG store launcher is
+    /// discoverable by its global launcher hint, by its per-owner hint, and by the two together.
+    pub fn index_coin_hints(
+        &self,
+        wallet_id: WalletId,
+        coin_id: impl Into<String>,
+        hints: impl IntoIterator<Item = Hint>,
+    ) {
+        let coin_id = coin_id.into();
+        self.with_wallet(wallet_id, |state| state.hints.index(coin_id, hints));
+    }
+
+    /// The tracked coins announced under `hint`.
+    ///
+    /// Only coins the store still knows are returned — a hint whose coin was rolled back
+    /// resolves to nothing.
+    pub fn coins_by_hint(&self, wallet_id: WalletId, hint: &Hint) -> Vec<CoinRecord> {
+        self.with_wallet(wallet_id, |state| {
+            resolve(&state.coins, state.hints.coins_by_hint(hint))
+        })
+    }
+
+    /// The tracked coins announced under **every** hint in `hints` — the conjunctive query a
+    /// per-owner store-launcher lookup needs (launcher hint AND owner hint).
+    pub fn coins_by_all_hints(&self, wallet_id: WalletId, hints: &[Hint]) -> Vec<CoinRecord> {
+        self.with_wallet(wallet_id, |state| {
+            resolve(&state.coins, state.hints.coins_by_all_hints(hints))
+        })
+    }
+
+    /// Every hint `coin_id` was announced under.
+    pub fn hints_for_coin(&self, wallet_id: WalletId, coin_id: &str) -> Vec<Hint> {
+        self.with_wallet(wallet_id, |state| state.hints.hints_for(coin_id))
+    }
+}
+
+/// Resolve indexed coin ids to the coin records the store still holds, dropping any id whose
+/// record has gone (the index is a discovery aid, never a source of coin truth).
+fn resolve(coins: &HashMap<String, CoinRecord>, ids: Vec<String>) -> Vec<CoinRecord> {
+    ids.iter().filter_map(|id| coins.get(id).cloned()).collect()
 }
 
 /// Decide how an incoming coin-state update changes a (possibly-existing) coin.
@@ -531,6 +586,104 @@ mod tests {
         assert_eq!(
             store.balance(&identity(1)).await.unwrap().confirmed,
             Amount(100)
+        );
+    }
+
+    // --- dual-memo hint discovery (#45) -------------------------------------------------
+
+    fn launcher_hint() -> Hint {
+        Hint::new("11".repeat(32))
+    }
+
+    fn owner_hint() -> Hint {
+        Hint::new("22".repeat(32))
+    }
+
+    /// Two store launchers sharing the GLOBAL launcher hint but owned by different owners, plus
+    /// a coin carrying the owner hint in second position only. This is the shape that separates
+    /// a real dual-memo index from a first-memo-only one and from a union-not-intersection one.
+    fn store_with_two_launchers() -> InMemoryWalletStore {
+        let store = InMemoryWalletStore::new();
+        let wallet = WalletId(1);
+        let other_owner = Hint::new("33".repeat(32));
+
+        store.apply_coin_state(wallet, coin("mine", 1, Some(5), None));
+        store.index_coin_hints(wallet, "mine", [launcher_hint(), owner_hint()]);
+
+        store.apply_coin_state(wallet, coin("theirs", 2, Some(5), None));
+        store.index_coin_hints(wallet, "theirs", [launcher_hint(), other_owner]);
+
+        store.apply_coin_state(wallet, coin("unlaunched", 3, Some(5), None));
+        store.index_coin_hints(wallet, "unlaunched", [other_owner_first(), owner_hint()]);
+        store
+    }
+
+    fn other_owner_first() -> Hint {
+        Hint::new("44".repeat(32))
+    }
+
+    #[test]
+    fn the_global_launcher_hint_finds_every_launcher() {
+        let found = store_with_two_launchers().coins_by_hint(WalletId(1), &launcher_hint());
+        let ids: Vec<_> = found.iter().map(|c| c.coin_id.as_str()).collect();
+        assert_eq!(ids, vec!["mine", "theirs"]);
+    }
+
+    /// The owner hint sits in SECOND memo position on `unlaunched`, so a wallet that indexes only
+    /// memo[0] cannot see it here.
+    #[test]
+    fn the_owner_hint_finds_coins_carrying_it_in_either_position() {
+        let found = store_with_two_launchers().coins_by_hint(WalletId(1), &owner_hint());
+        let ids: Vec<_> = found.iter().map(|c| c.coin_id.as_str()).collect();
+        assert_eq!(ids, vec!["mine", "unlaunched"]);
+    }
+
+    /// The query the pair exists for: MY store launchers. A union would also return `theirs`
+    /// (another owner) and `unlaunched` (not a launcher).
+    #[test]
+    fn the_two_hints_together_find_only_this_owners_launcher() {
+        let found = store_with_two_launchers()
+            .coins_by_all_hints(WalletId(1), &[launcher_hint(), owner_hint()]);
+        let ids: Vec<_> = found.iter().map(|c| c.coin_id.as_str()).collect();
+        assert_eq!(ids, vec!["mine"]);
+    }
+
+    #[test]
+    fn hints_are_scoped_per_wallet() {
+        let store = store_with_two_launchers();
+        assert!(store
+            .coins_by_hint(WalletId(2), &launcher_hint())
+            .is_empty());
+    }
+
+    /// Drives the PRODUCTION rollback path: a reorg that forgets the coin must also make it
+    /// undiscoverable, or a hint query keeps resolving to a coin the winning chain never created.
+    #[test]
+    fn a_reorg_that_forgets_a_coin_also_withdraws_its_hints() {
+        let store = InMemoryWalletStore::new();
+        let wallet = WalletId(1);
+        store.apply_coin_state(wallet, coin("reorged", 1, Some(50), None));
+        store.index_coin_hints(wallet, "reorged", [launcher_hint(), owner_hint()]);
+        store.apply_coin_state(wallet, coin("survivor", 1, Some(10), None));
+        store.index_coin_hints(wallet, "survivor", [launcher_hint(), owner_hint()]);
+
+        store.rollback_to(wallet, 20);
+
+        assert!(store.hints_for_coin(wallet, "reorged").is_empty());
+        let ids: Vec<_> = store
+            .coins_by_all_hints(wallet, &[launcher_hint(), owner_hint()])
+            .iter()
+            .map(|c| c.coin_id.clone())
+            .collect();
+        assert_eq!(ids, vec!["survivor".to_string()]);
+    }
+
+    #[test]
+    fn hints_for_coin_reports_both_memos() {
+        let store = store_with_two_launchers();
+        assert_eq!(
+            store.hints_for_coin(WalletId(1), "mine"),
+            vec![launcher_hint(), owner_hint()]
         );
     }
 }

@@ -23,6 +23,7 @@ pub mod build_offer;
 pub mod build_options;
 pub mod build_tips;
 pub mod events;
+pub mod hints;
 pub mod offer_state;
 pub mod persist;
 pub mod selection;
@@ -36,6 +37,7 @@ pub use build_offer::OfferBuilder;
 pub use build_options::OptionBuilder;
 pub use build_tips::TipBuilder;
 pub use events::{DeltaLog, EventSink, PersistentEventLog, DEFAULT_HISTORY_CAPACITY};
+pub use hints::HintIndex;
 pub use offer_state::{PendingOffers, PENDING_TTL};
 pub use persist::{SqliteDeltaLog, SqliteWalletStore};
 pub use selection::{

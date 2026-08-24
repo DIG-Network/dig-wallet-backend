@@ -10,6 +10,7 @@
 //! ecosystem definition the engine emits against and dig-app subscribes against (#1067, #1072).
 
 pub mod error;
+pub mod hint;
 pub mod identity;
 pub mod offer;
 pub mod options;
@@ -23,6 +24,7 @@ pub use dig_events_protocol::{
     SyncLifecycle, SyncStatus, WalletEvent, WalletId,
 };
 pub use error::{WalletError, WalletErrorCode, WalletResult};
+pub use hint::Hint;
 pub use identity::{Did, IdentityRef};
 pub use offer::{
     AssembleOfferRequest, CancelOfferRequest, CombineOffersRequest, FinalizeTakeRequest,
