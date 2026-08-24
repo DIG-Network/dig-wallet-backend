@@ -30,7 +30,7 @@
 
 use chia_protocol::{Coin, CoinSpend};
 use chia_puzzle_types::nft::NftMetadata;
-use chia_wallet_sdk::driver::{Cat, Did, HashedPtr, Nft, Puzzle};
+use chia_wallet_sdk::driver::{Cat, HashedPtr, Nft, Puzzle};
 use chia_wallet_sdk::types::Condition;
 use clvm_traits::{FromClvm, ToClvm};
 use clvmr::{Allocator, NodePtr};
@@ -84,7 +84,7 @@ pub fn reconstruct_from_parent_spend(parent: &CoinSpend) -> WalletResult<Hydrate
 
     let mut out = HydratedSingletons::default();
     hydrate_nft(&mut allocator, parent, puzzle, solution, &mut out);
-    hydrate_dids(&mut allocator, parent, puzzle, solution, &mut out)?;
+    hydrate_dids(&mut allocator, parent, &mut out)?;
     hydrate_cats(&mut allocator, parent, puzzle, solution, &mut out);
     Ok(out)
 }
@@ -111,25 +111,37 @@ fn hydrate_nft(
     }
 }
 
-/// Ask the canonical DID driver about each odd-amount child this spend creates.
+/// Ask the canonical DID crate about each odd-amount child this spend creates.
 ///
-/// Unlike the NFT driver, `Did::parse_child` is told WHICH child to reconstruct, so the candidates
-/// have to be enumerated first. A singleton always carries an odd amount, which is what narrows the
+/// Routed through `dig-did` — the ecosystem's DID expert crate (#40) — rather than the raw sdk
+/// driver, so this crate holds no second opinion about what a DID is. `dig-did` is called directly
+/// instead of via [`super::did::hydrate_did`] because hydration here needs to tell its error
+/// variants apart: "not a DID" and "no successor coin" are ordinary facts about an ordinary spend,
+/// while a genuine parse failure is a skip worth counting. The facade flattens that distinction,
+/// which is right for a caller asking about one known DID and wrong for a scanner.
+///
+/// Unlike the NFT path, DID hydration is told WHICH child to reconstruct, so the candidates have to
+/// be enumerated first. A singleton always carries an odd amount, which is what narrows the
 /// created-coin set to the ones worth asking about.
 fn hydrate_dids(
     allocator: &mut Allocator,
     parent: &CoinSpend,
-    puzzle: Puzzle,
-    solution: NodePtr,
     out: &mut HydratedSingletons,
 ) -> WalletResult<()> {
     for child in odd_children(allocator, parent)? {
-        match Did::parse_child(allocator, parent.coin, puzzle, solution, child) {
-            Ok(Some(did)) => out.dids.push(DidRecord {
+        match dig_did::hydrate_did_from_parent_spend(
+            parent.coin,
+            &parent.puzzle_reveal,
+            &parent.solution,
+            child,
+        ) {
+            Ok(did) => out.dids.push(DidRecord {
                 launcher_id: hex::encode(did.info.launcher_id),
                 name: None,
             }),
-            Ok(None) => {}
+            // Not a DID at all, or a DID spend that created no successor: both are ordinary facts
+            // about an ordinary spend, not failures, so neither counts as a skip.
+            Err(dig_did::DidError::NotDid | dig_did::DidError::MissingLineage) => {}
             Err(_) => out.skipped += 1,
         }
     }

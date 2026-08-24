@@ -23,8 +23,10 @@ pub mod build_extended;
 pub mod build_offer;
 pub mod build_options;
 pub mod build_tips;
+pub mod did;
 pub mod events;
 pub mod hints;
+pub mod nft;
 pub mod offer_state;
 pub mod persist;
 pub mod selection;
@@ -41,8 +43,15 @@ pub use build_extended::ExtendedSpendBuilder;
 pub use build_offer::OfferBuilder;
 pub use build_options::OptionBuilder;
 pub use build_tips::TipBuilder;
+pub use did::{
+    hydrate_did, launch_did, prove_did_lineage, resolve_did_xch_address, transfer_did, DidOperation,
+};
 pub use events::{DeltaLog, EventSink, PersistentEventLog, DEFAULT_HISTORY_CAPACITY};
 pub use hints::{hints_from_coin_spend, HintIndex};
+pub use nft::{
+    bulk_mint_nfts, mint_nft, transfer_nft, transfer_nft_with_metadata, update_nft_metadata,
+    NftOperation,
+};
 pub use offer_state::{PendingOffers, PENDING_TTL};
 pub use persist::{SqliteDeltaLog, SqliteWalletStore};
 pub use selection::{
