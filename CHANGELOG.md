@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.31.0] - 2026-08-25
+
+### Chores
+- **deps:** Adopt the chia-wallet-sdk 0.36 builder family (#50)
+
 ## [0.30.0] - 2026-08-24
 
 ### Features
