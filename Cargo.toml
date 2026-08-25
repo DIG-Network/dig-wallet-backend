@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet-backend"
-version = "0.30.0"
+version = "0.31.0"
 edition = "2021"
 rust-version = "1.81"
 description = "Canonical event-driven Chia wallet backend for the DIG Network. Exports two carefully-partitioned seams: an `engine` seam (imported by dig-node — the single running wallet instance: state, sync, unsigned-spend construction, event emission; identity-parameterized, never holds a private key) and a `client` seam (used by dig-app — the event subscriber, spend review/decode, the signing interface + identity provider that hold the key). Clean-room, chia-wallet-sdk-based. Replaces dig-l1-wallet."
@@ -101,22 +101,22 @@ dig-identity = { version = "0.7", default-features = false, features = ["bls"], 
 # + the key-free RequiredSignature extractor. The engine builds every unsigned spend through
 # these (§4.1: never hand-rolled CLVM) and NEVER touches the sdk's `SecretKey` path. Default
 # features off so no peer-networking/TLS stack is pulled into the engine build.
-chia-wallet-sdk = { version = "0.34", default-features = false, optional = true }
+chia-wallet-sdk = { version = "0.36", default-features = false, optional = true }
 # The CANONICAL Chia covered-option (CHIP-0042) CoinSpend builders (create/exercise/clawback +
 # inspect). The engine composes these for the options suite (mint/transfer/exercise, #1123) —
 # NEVER re-implementing option CLVM (§4.1). Pure, key-free, network-free: it builds unsigned
 # spends and reports required signatures, never holding a key or signing (identity boundary #908).
 # Engine-seam only.
-dig-options = { version = "0.3", optional = true }
+dig-options = { version = "0.4", optional = true }
 # The CANONICAL DIG tipping expert crate: a pure, key-free CAT-payment builder for tips (incl. the
 # honest, capped, default-on auto-tip to the DIG treasury — the §6.0 $DIG North Star). The engine
 # composes `build_tip`/`build_tip_if_allowed`; it speaks `dig_cat` types that re-export
 # `chia_protocol`/`chia_wallet_sdk` (same 0.26/0.30 tree — no conversion). Engine-seam only.
-dig-tips = { version = "0.2", optional = true }
+dig-tips = { version = "0.3", optional = true }
 # The canonical CAT builder crate dig-tips wraps; the engine consumes its `CatError` taxonomy to map
 # a failed tip build into the wallet error catalogue. Its type re-exports (Coin/Cat/CoinSpend/Bytes32)
 # are `chia_protocol`/`chia_wallet_sdk`'s own (same 0.26/0.30 tree). Engine-seam only.
-dig-cat = { version = "0.2", optional = true }
+dig-cat = { version = "0.3", optional = true }
 # The CLVM allocator RequiredSignature::from_coin_spends threads its parse through.
 clvmr = { version = "0.16.2", optional = true }
 # The persistent (SQLite) backing for the engine state store + event delta log (#1118). `bundled`
@@ -131,7 +131,7 @@ rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 # reports required signatures, holding no key and never signing (identity boundary #908). Its
 # `make_assemble`/`take_combine` transform an ALREADY-SIGNED bundle + public data, so assembly runs
 # engine-side without any secret key. Engine-seam only.
-dig-offers = { version = "0.2", optional = true }
+dig-offers = { version = "0.3", optional = true }
 # `IndexMap<Bytes32, PublicKey>` is dig-offers' `owner_keys` input shape (a coin-puzzle-hash → key
 # map, order-preserving). Engine-seam only; used solely to hand keys to the offer builders.
 indexmap = { version = "2", optional = true }
@@ -141,12 +141,12 @@ indexmap = { version = "2", optional = true }
 # expensive kind to be wrong in (Appendix B). Pure, key-free, network-free: it builds unsigned spends
 # and reports required signatures, holding no key and never signing (identity boundary #908).
 # Engine-seam only.
-dig-did = { version = "0.7", optional = true }
+dig-did = { version = "0.8", optional = true }
 # The CANONICAL NFT expert crate (#41): mint/bulk-mint, transfer, metadata update, owner assignment
 # and royalty settlement, all CHIP-0025-correct. Supersedes porting sage/mint.rs by hand. Same chia
-# line as this crate (chia-protocol 0.36.1 / chia-wallet-sdk 0.34), so its `CoinSpend` IS this
+# line as this crate (chia-protocol 0.36.1 / chia-wallet-sdk 0.36), so its `CoinSpend` IS this
 # crate's. Pure and key-free, like dig-did. Engine-seam only.
-dig-nft = { version = "0.2", optional = true }
+dig-nft = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
@@ -154,7 +154,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 # Derives deterministic, hashed test seeds (never integer-literal keys — CodeQL-clean).
 sha2 = "0.10"
-chia-sdk-test = "0.34"
+chia-sdk-test = "0.36"
 # Test-only: expands a 24-word recovery phrase to the 64-byte HD seed so the money path can be pinned
 # against the address a STANDARD Chia wallet (Sage) shows for those exact words (dig_ecosystem #1759).
 bip39 = "2.0"
@@ -163,8 +163,8 @@ bip39 = "2.0"
 # (`dig_merkle::melt`) and a DID singleton (`dig_did::melt`), whose inner layer stacks differ. A
 # hand-built singleton fixture would prove only that the arm accepts the fixture. Both are level-10
 # crates, strictly below this one, and both are test-only edges.
-dig-merkle = "0.8"
-dig-did = "0.7"
+dig-merkle = "0.9"
+dig-did = "0.8"
 
 [package.metadata.docs.rs]
 all-features = true
